@@ -24,18 +24,18 @@ public final class WebAdminServerContent {
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
-                <title>Easy Handshake Validator</title>
+                <title>Easy Handshake Node</title>
                 <link rel="stylesheet" href="/style.css">
             </head>
             <body>
                 <header>
-                    <h1>Easy Handshake Validator</h1>
+                    <h1>Easy Handshake Node</h1>
                     <p class="subtitle">Local admin interface</p>
                 </header>
                 <main>
                     <div class="column">
                         <section class="card">
-                            <h2>Validator Node Status</h2>
+                            <h2>Node Status</h2>
                             <p>Uptime: <span id="uptime">Loading...</span></p>
                             <p>Block Height: <span id="block-height">Loading...</span></p>
                             <p>Chain Database: <span id="db-size">Loading...</span></p>
@@ -693,7 +693,7 @@ public final class WebAdminServerContent {
             }
 
             async function onStopNode() {
-                if (!confirm("Stop the validator node? This will shut it down gracefully.")) return;
+                if (!confirm("Stop the node? This will shut it down gracefully.")) return;
                 const message = document.getElementById("stop-message");
                 try {
                     const res = await fetch("/api/stop", { method: "POST" });
