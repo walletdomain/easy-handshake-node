@@ -1,5 +1,11 @@
 package handshake.validator;
 
+import java.awt.Desktop;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.net.URI;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.*;
 
 /**
@@ -26,6 +32,13 @@ import java.nio.file.*;
  */
 public class Main {
 
+    // Held for the entire process lifetime -- releasing (or garbage
+    // collecting) either of these would release the lock, so both are
+    // kept as static fields rather than local variables that could, in
+    // principle, become eligible for GC despite main() never returning.
+    private static RandomAccessFile instanceLockFile;
+    private static FileChannel instanceLockChannel;
+
     static void main(String[] args) throws Exception {
         System.out.println("╔══════════════════════════════════════╗");
         System.out.println("║   Easy Handshake Node  v0.1.0        ║");
@@ -38,6 +51,17 @@ public class Main {
         Files.createDirectories(Path.of(dataDir));
         System.out.println("[Main] Data directory: " + Path.of(dataDir).toAbsolutePath()
                 + (freshInstall ? " (fresh install)" : ""));
+
+        // ── 1b. Single-instance check ────────────────────────────────────────
+        // Deliberately before any slow or lockable resource (config,
+        // chain database) gets touched at all: if another instance is
+        // already running, this should be fast and clean -- just open a
+        // browser tab to the existing instance and exit quietly, not
+        // race the real instance for the database and fail with a raw
+        // lock-conflict exception. A dedicated lock file (not the
+        // database itself) keeps this check independent of anything
+        // else that could be slow to open.
+        acquireInstanceLockOrRedirectAndExit(dataDir);
 
         // ── 2. Configuration ──────────────────────────────────────────────────
         NodeConfig config = NodeConfig.load(dataDir);
@@ -92,6 +116,8 @@ public class Main {
         webAdmin.start();
         System.out.printf("[Main] Web admin: http://127.0.0.1:%d%n",
                 config.getWebAdminPort());
+        writePortFile(dataDir, config.getWebAdminPort());
+        openBrowser("http://localhost:" + config.getWebAdminPort());
 
         // ── 8. Chain sync ──────────────────────────────────────────────────────
         // (constructed before P2PServer since P2PServer hands off completed
@@ -155,17 +181,74 @@ public class Main {
      * "./.easy-handshake" if the jar's own location can't be determined
      * (e.g. running exploded classes from an IDE rather than a real jar).
      */
-    private static String defaultDataDir() {
+    /**
+     * Tries to acquire an exclusive lock on a small, dedicated lock file
+     * (not the database itself) as the very first thing this process
+     * does with the data directory. If another instance already holds
+     * it, this one is the "user double-clicked the exe while it was
+     * already running" case -- redirect to the existing instance's
+     * admin page and exit cleanly, rather than proceeding to race the
+     * real instance for the database and crash with a raw lock
+     * exception. If this DOES acquire the lock, it stays held (via the
+     * static fields above) for the rest of the process's life.
+     */
+    private static void acquireInstanceLockOrRedirectAndExit(String dataDir) throws IOException {
+        Path lockPath = Path.of(dataDir, "instance.lock");
+        instanceLockFile = new RandomAccessFile(lockPath.toFile(), "rw");
+        instanceLockChannel = instanceLockFile.getChannel();
+
+        FileLock lock;
         try {
-            Path jarPath = Path.of(
-                    Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
-            Path jarDir = Files.isDirectory(jarPath) ? jarPath : jarPath.getParent();
-            if (jarDir != null) {
-                return jarDir.resolve(".easy-handshake").toString();
+            lock = instanceLockChannel.tryLock();
+        } catch (Exception e) {
+            lock = null;
+        }
+
+        if (lock == null) {
+            int port = readPortFileOrDefault(dataDir);
+            System.out.println("[Main] Already running -- opening browser to "
+                    + "http://localhost:" + port + " and exiting.");
+            openBrowser("http://localhost:" + port);
+            System.exit(0);
+        }
+    }
+
+    /** Best-effort: not every environment supports this (a headless VPS,
+     *  for instance, which this same project also legitimately runs on)
+     *  -- fails gracefully with a plain printed URL rather than crashing
+     *  the whole startup over something this non-essential. */
+    private static void openBrowser(String url) {
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(new URI(url));
+                return;
             }
         } catch (Exception ignored) {
-            // Fall through to the relative default below.
+            // fall through to the manual-open message below
         }
-        return "./.easy-handshake";
+        System.out.println("[Main] Could not auto-open a browser -- please open manually: " + url);
+    }
+
+    private static int readPortFileOrDefault(String dataDir) {
+        try {
+            return Integer.parseInt(Files.readString(Path.of(dataDir, "webadmin.port")).trim());
+        } catch (Exception e) {
+            return 12080; // matches NodeConfig's own DEFAULT_WEB_ADMIN_PORT
+        }
+    }
+
+    private static void writePortFile(String dataDir, int port) throws IOException {
+        Files.writeString(Path.of(dataDir, "webadmin.port"), String.valueOf(port));
+    }
+
+    private static String defaultDataDir() {
+        // Previously resolved relative to the running jar/classes location
+        // (fine for development, where that's target/classes) -- but a
+        // packaged, user-installed distribution needs a location that's
+        // always writable regardless of where the app itself is
+        // installed, and that naturally separates data per user on a
+        // shared machine. The user's home directory is the standard,
+        // reliable choice for this on every platform this runs on.
+        return Path.of(System.getProperty("user.home"), ".easy-handshake").toString();
     }
 }
