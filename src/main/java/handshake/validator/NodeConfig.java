@@ -46,6 +46,7 @@ public class NodeConfig {
     private static final String DEFAULT_NETWORK      = "mainnet";
     private static final int    DEFAULT_P2P_PORT      = 44806;
     private static final int    DEFAULT_RPC_PORT      = 12037;
+    private static final int    DEFAULT_SOCKET_PORT   = 12040;
     private static final int    DEFAULT_WEB_ADMIN_PORT = 12080;
     private static final String DEFAULT_RPC_HOST      = "127.0.0.1";
     private static final String DEFAULT_API_KEY       = "";
@@ -74,6 +75,11 @@ public class NodeConfig {
     public String  getNetwork()     { return get("network",    DEFAULT_NETWORK); }
     public int     getP2pPort()     { return getInt("p2p.port",    DEFAULT_P2P_PORT); }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
+    /** Dedicated port for the Brontide-encrypted WebSocket event/call
+     *  server -- separate from RPC's port since Java's built-in HTTP
+     *  server has no clean way to intercept a raw socket for a
+     *  protocol-upgrade path alongside its own normal request handling. */
+    public int     getSocketPort()  { return getInt("socket.port", DEFAULT_SOCKET_PORT); }
     /** Always bound to the loopback interface only, regardless of this
      *  port's value -- there's no legitimate case for this admin
      *  interface to be reachable remotely, so making the bind address

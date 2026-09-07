@@ -5,21 +5,21 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Mempool — in-memory pool of unconfirmed transactions.
-    * <p>
+ * <p>
  * Responsibilities:
  *   - Accept and validate incoming transactions
  *   - Relay valid transactions to peers
  *   - Provide transaction data for RPC queries
  *   - Evict transactions when a block confirms them
  *   - Track fee rates for mining prioritization
-    * <p>
+ * <p>
  * Validation checks performed:
  *   - Basic structure (inputs, outputs, version)
  *   - No double-spends against UTXO set
  *   - No double-spends within mempool
  *   - Covenant type rules (basic sanity)
  *   - Minimum relay fee
-    * <p>
+ * <p>
  * Note: Full covenant validation (bad-txns-covenants) requires
  * name state lookups — that is done in CovenantValidator.
  */
@@ -82,6 +82,16 @@ public class Mempool {
 
     // Relay callback — called when a valid tx should be relayed to peers
     private RelayCallback relayCallback;
+
+    /** Separate from relayCallback (which is specifically for P2P
+     *  relay, excluding the sender): a plain "a transaction was just
+     *  accepted" notification, for the socket layer's mempool "tx"
+     *  event -- doesn't need an excludeIp concept at all, since every
+     *  connected socket client should hear about every accepted tx. */
+    private final List<java.util.function.Consumer<MempoolEntry>> txListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    public void addTxListener(java.util.function.Consumer<MempoolEntry> listener) {
+        txListeners.add(listener);
+    }
 
     /**
      * excludeIp is the peer that sent us this transaction (so we don't
@@ -226,6 +236,13 @@ public class Mempool {
         // only the peer we received this from (if any).
         if (relayCallback != null) {
             relayCallback.relay(txid, raw, excludeIp);
+        }
+
+        for (var listener : txListeners) {
+            try { listener.accept(entry); }
+            catch (Exception e) {
+                System.err.println("[Mempool] tx listener error: " + e.getMessage());
+            }
         }
 
         return txid;

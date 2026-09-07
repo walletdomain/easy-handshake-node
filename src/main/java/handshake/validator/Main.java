@@ -138,6 +138,12 @@ public class Main {
         // actually makes all of that real.
         Mempool mempool = new Mempool(db);
         webAdmin.setMempool(mempool);
+
+        // ── 8c. Node socket server (Brontide-over-WebSocket, Bloom-filtered) ────
+        NodeSocketServer socketServer = new NodeSocketServer(config, db, identity, sync);
+        socketServer.setMempool(mempool);
+        socketServer.registerWithRpc(rpc);
+        socketServer.start();
         sync.setMempool(mempool);
         rpc.setMempool(mempool);
         System.out.println("[Main] Mempool initialized.");
@@ -162,6 +168,7 @@ public class Main {
             p2p.stop();
             rpc.stop();
             webAdmin.stop();
+            socketServer.stop();
             db.commit();
             db.close();
             ConfigDB.get().commit();
