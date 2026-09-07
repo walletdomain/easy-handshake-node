@@ -9,7 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * ChainDB — persistent storage for the Handshake node node.
+ * ChainDB — persistent storage for the Handshake validator validator.
  * <p>
  * Stores:
  *   headers    height(long)     → raw 236-byte header
@@ -48,6 +48,8 @@ public class ChainDB {
     private static final String META_HEADER_TIP    = "header_tip";
     private static final String META_BLOCK_TIP     = "block_tip";
     private static final String META_GENESIS_HASH  = "genesis_hash";
+    private static final String META_URKEL_LIVE_ROOT      = "urkel_live_root";
+    private static final String META_URKEL_COMMITTED_ROOT = "urkel_committed_root";
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -64,6 +66,33 @@ public class ChainDB {
      *  whole chain (which would be up to 32 locator hashes x hundreds
      *  of thousands of headers per request). */
     private final MVMap<String, Long>      hashIndex;
+    /** Content-addressed Urkel tree node storage -- see UrkelNodeStore. */
+    private final MVMap<String, byte[]>    urkelNodes;
+
+    /** The Urkel name tree, tracking every name's tree-committed state
+     *  across blocks -- now persisted to disk (via urkelNodes) after
+     *  every block, not just at commit boundaries; see UrkelNameTree's
+     *  own class comment for why every-block persistence specifically
+     *  is what's needed for correctness across a restart. */
+    private final UrkelNameTree nameTree;
+
+    public UrkelNameTree getNameTree() { return nameTree; }
+
+    /** Call once per block, after every covenant in that block has
+     *  already been applied via getNameTree().applyNameState() --
+     *  persists any newly created tree nodes, then advances the
+     *  official committed root if this height lands on a real
+     *  interval boundary (see UrkelNameTree.maybeCommit()). Both root
+     *  pointers get written to meta immediately, not just held in
+     *  memory, so a restart at any point resumes from exactly here. */
+    public void persistNameTreeState(int height) {
+        nameTree.persistBlock();
+        meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
+
+        if (nameTree.maybeCommit(height)) {
+            meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
+        }
+    }
 
     private ChainDB(String path) {
         new File(path).getParentFile().mkdirs();
@@ -97,6 +126,12 @@ public class ChainDB {
         this.meta      = store.openMap("meta");
         this.peers     = store.openMap("peers");
         this.hashIndex = store.openMap("hashIndex");
+        this.urkelNodes = store.openMap("urkelNodes");
+
+        UrkelNodeStore nodeStore = new UrkelNodeStore(urkelNodes);
+        byte[] persistedLiveRoot = fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT));
+        byte[] persistedCommittedRoot = fromHexOrZero(meta.get(META_URKEL_COMMITTED_ROOT));
+        this.nameTree = new UrkelNameTree(nodeStore, persistedLiveRoot, persistedCommittedRoot);
     }
 
     public void close() {
@@ -534,5 +569,13 @@ public class ChainDB {
         for (int i = 0; i < b.length; i++)
             b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
         return b;
+    }
+
+    /** Like fromHex, but returns 32 zero bytes for null/empty rather
+     *  than a zero-length array -- what a freshly-initialized Urkel
+     *  root pointer needs on a genuinely fresh database. */
+    private static byte[] fromHexOrZero(String s) {
+        if (s == null || s.isEmpty()) return new byte[32];
+        return fromHex(s);
     }
 }

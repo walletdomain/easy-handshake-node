@@ -432,6 +432,10 @@ public final class WebAdminServerContent {
               "getnameinfo": { params: [
                 {name:"name", type:"string", required:true}
               ]},
+              "getnameproof": { params: [
+                {name:"name", type:"string", required:true},
+                {name:"root", type:"string", required:false}
+              ]},
               "getnameresource": { params: [
                 {name:"name", type:"string", required:true}
               ]},

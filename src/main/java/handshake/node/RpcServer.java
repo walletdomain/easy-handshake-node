@@ -16,10 +16,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * (hs-client, hsd-rpc CLI, block explorers) work without modification.
  * <p>
  * This is intentionally a lean, RPC-only server -- no web dashboard, no
- * HTML/JS serving, no TLS. The node's job is consensus, validation, and
+ * HTML/JS serving, no TLS. The validator's job is consensus, validation, and
  * storage; anything web-facing is a separate concern for a separate,
  * decoupled consumer (matching how the wallet was deliberately decoupled
- * from this project too) talking to the node purely over RPC.
+ * from this project too) talking to the validator purely over RPC.
  * <p>
  * Endpoint:
  *   POST /          — JSON-RPC method calls
@@ -159,6 +159,82 @@ public class RpcServer {
         }
     }
 
+    /**
+     * The single, authoritative list of every RPC method this server
+     * handles -- extracted programmatically from the actual dispatch()
+     * switch cases below, not hand-maintained separately. help() is
+     * generated FROM this array, specifically so it can't independently
+     * go stale the way it previously did (missing getnameresource,
+     * verifymessagewithname, getnameproof, and others, despite all of
+     * them being real, working methods).
+     *
+     * This array itself still needs a manual entry whenever a new case
+     * is added to dispatch() -- Java's switch doesn't support building
+     * case labels from a runtime array, so full elimination of that step
+     * isn't possible without replacing the switch with a method-name-to-
+     * handler map entirely (a much larger change touching all 53
+     * existing, working methods, not undertaken here). What this DOES
+     * fix is the actual, confirmed problem: help() drifting silently out
+     * of sync with reality. A test (see RpcMethodListTest, run manually,
+     * not part of the build) parses this file's real dispatch() cases
+     * and confirms this array matches them exactly in both directions.
+     */
+    private static final String[] RPC_METHODS = {
+            "addnode",
+            "clearbanned",
+            "createmultisig",
+            "createrawtransaction",
+            "decoderawtransaction",
+            "decodescript",
+            "disconnectnode",
+            "estimatefee",
+            "estimatesmartfee",
+            "getaddednodeinfo",
+            "getbestblockhash",
+            "getblock",
+            "getblockbyheight",
+            "getblockchaininfo",
+            "getblockcount",
+            "getblockhash",
+            "getblockheader",
+            "getchaintips",
+            "getconnectioncount",
+            "getdifficulty",
+            "getinfo",
+            "getmemoryinfo",
+            "getmempoolancestors",
+            "getmempooldescendants",
+            "getmempoolentry",
+            "getmempoolinfo",
+            "getnamebyhash",
+            "getnameinfo",
+            "getnameproof",
+            "getnameresource",
+            "getnames",
+            "getnettotals",
+            "getnetworkinfo",
+            "getpeerinfo",
+            "getrawmempool",
+            "getrawtransaction",
+            "gettxout",
+            "gettxoutproof",
+            "gettxoutsetinfo",
+            "help",
+            "listbanned",
+            "ping",
+            "prioritisetransaction",
+            "pruneblockchain",
+            "sendrawtransaction",
+            "setban",
+            "signmessagewithprivkey",
+            "stop",
+            "validateaddress",
+            "verifyblock",
+            "verifymessage",
+            "verifymessagewithname",
+            "verifytxoutproof"
+    };
+
     // ── Method dispatch ───────────────────────────────────────────────────────
 
     private String dispatch(String method, String params) throws RpcException {
@@ -198,6 +274,7 @@ public class RpcServer {
 
             // Names
             case "getnameinfo"     -> getNameInfo(params);
+            case "getnameproof"    -> getNameProof(params);
             case "getnameresource" -> getNameResource(params);
             case "getnamebyhash"   -> getNameByHash(params);
             case "getnames"        -> getNames();
@@ -282,7 +359,7 @@ public class RpcServer {
         }
         if (raw == null) {
             if (!config.indexTx()) throw new RpcException(-5,
-                    "No tx index — enable index.tx in node.conf");
+                    "No tx index — enable index.tx in validator.conf");
             throw new RpcException(-5, "Transaction not found: " + txid);
         }
         if (!verbose) return "\"" + hex(raw) + "\"";
@@ -421,7 +498,7 @@ public class RpcServer {
         String name = parseStringParam(params, 0);
         if (name == null || name.isEmpty())
             throw new RpcException(-8, "Name required");
-        byte[] nameHash = Blake2b.hash256(name.getBytes(StandardCharsets.US_ASCII));
+        byte[] nameHash = UrkelNameHash.hashName(name); // SHA3-256, confirmed against real hsd -- was incorrectly Blake2b
         ChainDB.NameEntry entry = db.getNameByHash(hex(nameHash));
         if (entry == null || entry.resourceData == null || entry.resourceData.length == 0) {
             return "{\"records\":[]}";
@@ -525,7 +602,7 @@ public class RpcServer {
         if (name == null || sigB64 == null || message == null)
             throw new RpcException(-1, "verifymessagewithname \"name\" \"signature\" \"message\"");
 
-        byte[] nameHash = Blake2b.hash256(name.getBytes(StandardCharsets.US_ASCII));
+        byte[] nameHash = UrkelNameHash.hashName(name); // SHA3-256, confirmed against real hsd -- was incorrectly Blake2b
         ChainDB.NameEntry entry = db.getNameByHash(hex(nameHash));
         if (entry == null || entry.ownerTxid == null)
             throw new RpcException(-1, "Cannot find the name owner.");
@@ -553,12 +630,108 @@ public class RpcServer {
         return "false";
     }
 
+    /**
+     * getnameproof "name" ("root") -- matches real hsd's own RPC
+     * exactly, confirmed directly from rpc.js's getNameProof: proves
+     * against the LAST COMMITTED root (real hsd uses
+     * this.chain.tip.treeRoot -- the header's own field, not a live,
+     * uncommitted tree), not the tree's current live state, since a
+     * proof only means anything if it's checkable against a root that
+     * genuinely exists in an already-mined header.
+     *
+     * The optional second argument (prove against a SPECIFIC historical
+     * root) isn't supported yet -- this tree is in-memory only and
+     * doesn't keep historical snapshots beyond the current committed
+     * one (see UrkelTree's own class comment), so a caller asking for
+     * anything other than the current committed root gets a clear
+     * error rather than a silently wrong answer.
+     */
+    private String getNameProof(String params) throws RpcException {
+        String name = parseStringParam(params, 0);
+        if (name == null || name.isEmpty())
+            throw new RpcException(-8, "getnameproof \"name\" (\"root\")");
+
+        String requestedRootHex = parseStringParam(params, 1);
+
+        byte[] nameHash = UrkelNameHash.hashName(name);
+        byte[] committedRoot = db.getNameTree().committedRoot();
+
+        if (requestedRootHex != null && !requestedRootHex.isEmpty()
+                && !requestedRootHex.equalsIgnoreCase(hex(committedRoot))) {
+            throw new RpcException(-8,
+                    "Proving against a specific historical root isn't supported yet -- "
+                            + "only the current committed root (" + hex(committedRoot) + ") can be proved against.");
+        }
+
+        int tipHeight = db.getHeaderTip();
+        byte[] tipHeader = tipHeight >= 0 ? db.getHeader(tipHeight) : null;
+        String tipHashHex = tipHeader != null ? hex(HeaderUtil.hash(tipHeader)) : hex(new byte[32]);
+
+        UrkelProof proof = db.getNameTree().proveCommitted(nameHash);
+
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"hash\":\"").append(tipHashHex).append("\",");
+        sb.append("\"height\":").append(tipHeight).append(",");
+        sb.append("\"root\":\"").append(hex(committedRoot)).append("\",");
+        sb.append("\"name\":\"").append(jsonEscape(name)).append("\",");
+        sb.append("\"key\":\"").append(hex(nameHash)).append("\",");
+        sb.append("\"proof\":").append(proofToJson(proof));
+        sb.append("}");
+
+        return "{\"result\":" + sb + "}";
+    }
+
+    /** Matches real Urkel's Proof.toJSON() exactly (confirmed directly
+     *  from proof.js): a "type" name, depth, the collected sibling
+     *  nodes as [prefixBitString, hashHex] pairs, and then only
+     *  whichever extra fields that proof TYPE actually carries --
+     *  matching JS's own behavior of omitting undefined fields rather
+     *  than serializing them as null. */
+    private String proofToJson(UrkelProof proof) {
+        String typeName = switch (proof.type) {
+            case UrkelProof.TYPE_DEADEND -> "TYPE_DEADEND";
+            case UrkelProof.TYPE_SHORT -> "TYPE_SHORT";
+            case UrkelProof.TYPE_COLLISION -> "TYPE_COLLISION";
+            case UrkelProof.TYPE_EXISTS -> "TYPE_EXISTS";
+            default -> "TYPE_UNKNOWN";
+        };
+
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"type\":\"").append(typeName).append("\",");
+        sb.append("\"depth\":").append(proof.depth).append(",");
+
+        sb.append("\"nodes\":[");
+        for (int i = 0; i < proof.nodes.size(); i++) {
+            if (i > 0) sb.append(",");
+            UrkelProof.ProofNode pn = proof.nodes.get(i);
+            sb.append("[\"").append(pn.prefix.toString()).append("\",\"").append(hex(pn.hash)).append("\"]");
+        }
+        sb.append("]");
+
+        switch (proof.type) {
+            case UrkelProof.TYPE_SHORT -> {
+                sb.append(",\"prefix\":\"").append(proof.prefix.toString()).append("\"");
+                sb.append(",\"left\":\"").append(hex(proof.left)).append("\"");
+                sb.append(",\"right\":\"").append(hex(proof.right)).append("\"");
+            }
+            case UrkelProof.TYPE_COLLISION -> {
+                sb.append(",\"key\":\"").append(hex(proof.key)).append("\"");
+                sb.append(",\"hash\":\"").append(hex(proof.hash)).append("\"");
+            }
+            case UrkelProof.TYPE_EXISTS -> sb.append(",\"value\":\"").append(hex(proof.value)).append("\"");
+            default -> { /* TYPE_DEADEND carries no extra fields */ }
+        }
+
+        sb.append("}");
+        return sb.toString();
+    }
+
     private String getNameInfo(String params) throws RpcException {
         String name = parseStringParam(params, 0);
         if (name == null || name.isEmpty())
             throw new RpcException(-8, "Name required");
         // Hash the name
-        byte[] nameHash = Blake2b.hash256(name.getBytes(StandardCharsets.US_ASCII));
+        byte[] nameHash = UrkelNameHash.hashName(name); // SHA3-256, confirmed against real hsd -- was incorrectly Blake2b
         ChainDB.NameEntry entry = db.getNameByHash(hex(nameHash));
         if (entry == null) {
             // Return empty/start info for names not yet in auction
@@ -730,7 +903,7 @@ public class RpcServer {
         return String.valueOf(tipHeader != null ? toDifficulty(HeaderUtil.bits(tipHeader)) : 0);
     }
 
-    /** Matches real hsd's toDifficulty() exactly (lib/node/rpc.js). */
+    /** Matches real hsd's toDifficulty() exactly (lib/validator/rpc.js). */
     private static double toDifficulty(int bits) {
         int shift = (bits >>> 24) & 0xff;
         double diff = 0x0000ffff / (double) (bits & 0x00ffffff);
@@ -923,7 +1096,7 @@ public class RpcServer {
         String addr = parseStringParam(params, 0);
         String cmd  = parseStringParam(params, 1);
         if (addr == null || cmd == null) throw new RpcException(-1,
-                "addnode \"node\" \"add|remove|onetry\"");
+                "addnode \"validator\" \"add|remove|onetry\"");
         String[] parts = addr.split(":");
         String ip = parts[0];
         int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 44806;
@@ -938,13 +1111,13 @@ public class RpcServer {
 
     private String disconnectNode(String params) throws RpcException {
         String addr = parseStringParam(params, 0);
-        if (addr == null) throw new RpcException(-1, "disconnectnode \"node\"");
+        if (addr == null) throw new RpcException(-1, "disconnectnode \"validator\"");
         return "null";
     }
 
     private String getAddedNodeInfo(String params) throws RpcException {
         String addr = parseStringParam(params, 0);
-        if (addr == null) throw new RpcException(-1, "getaddednodeinfo \"node\"");
+        if (addr == null) throw new RpcException(-1, "getaddednodeinfo \"validator\"");
         String ip = addr.split(":")[0];
         boolean known = SeedDatabase.get().getSeedByIp(ip) != null
                 || PeerDiscovery.get().isDiscovered(ip);
@@ -1122,7 +1295,7 @@ public class RpcServer {
      * Matches real hsd's createrawtransaction shape: builds a complete
      * but genuinely UNSIGNED transaction from given input outpoints and
      * address:amount outputs -- no private keys or signing involved at
-     * all, which is exactly why this fits on the node side despite
+     * all, which is exactly why this fits on the validator side despite
      * "creating a transaction" sounding wallet-like. A real wallet (or
      * anything else holding the right keys) would sign the result
      * separately before broadcasting it.
@@ -1207,7 +1380,7 @@ public class RpcServer {
      * writes). Checks the same merkle-root and proof-of-work rules
      * BlockProcessor/header-sync already enforce, plus signature
      * verification wherever the referenced UTXO happens to already
-     * exist in this node's own chain state -- honestly weaker than real
+     * exist in this validator's own chain state -- honestly weaker than real
      * hsd's full contextual validation (difficulty/timestamp rules
      * against actual chain position, etc.), since a standalone call like
      * this doesn't know where in the chain the block is meant to
@@ -1304,13 +1477,11 @@ public class RpcServer {
     }
 
     private String help() {
-        return "\"Available methods: getblockcount, getblockhash, getblockheader, getblock, "
-                + "getblockbyheight, getbestblockhash, getblockchaininfo, getdifficulty, "
-                + "getchaintips, getrawtransaction, decoderawtransaction, sendrawtransaction, "
-                + "gettxout, getrawmempool, getmempoolentry, getmempoolinfo, gettxoutsetinfo, "
-                + "getnameinfo, getnamebyhash, getnames, getinfo, getnetworkinfo, getpeerinfo, "
-                + "getconnectioncount, ping, setban, listbanned, clearbanned, stop, help, "
-                + "validateaddress\"";
+        // Generated from RPC_METHODS, sorted for stable, readable
+        // output -- not a separately hand-maintained string anymore.
+        String[] sorted = RPC_METHODS.clone();
+        java.util.Arrays.sort(sorted);
+        return "\"Available methods: " + String.join(", ", sorted) + "\"";
     }
 
     private String getBlockByHeight(String params) throws RpcException {

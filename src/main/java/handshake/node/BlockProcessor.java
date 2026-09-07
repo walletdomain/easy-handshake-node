@@ -6,15 +6,15 @@ import java.util.*;
 /**
  * BlockProcessor — processes confirmed blocks to update the UTXO set
  * and name state in ChainDB.
-    * <p>
+ * <p>
  * Called by ChainSync for each new block as it is confirmed.
-    * <p>
+ * <p>
  * Processing steps for each block:
  *   1. Remove spent UTXOs (inputs)
  *   2. Add new UTXOs (outputs)
  *   3. Update name state for covenant outputs
  *   4. Evict confirmed transactions from mempool
-    * <p>
+ * <p>
  * Name state machine (from hsd/lib/covenants/rules.js):
  *   NONE    → OPEN      via OPEN covenant
  *   OPEN    → BID       via BID covenant
@@ -111,7 +111,7 @@ public class BlockProcessor {
             // exist on real mainnet) is left unverified rather than
             // treated as invalid -- rejecting those would break sync on
             // perfectly valid, real blocks that every other real hsd
-            // node accepts.
+            // validator accepts.
             if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
                 for (int i = 0; i < tx.inputs.size(); i++) {
                     TxParser.Input input = tx.inputs.get(i);
@@ -170,6 +170,16 @@ public class BlockProcessor {
                         + "(rest of block still processed)%n", txid, height, e.getMessage());
             }
         }
+
+        // Step 3b: Persist any new tree nodes from this block, then
+        // advance the "official" committed root if this height lands
+        // on a real interval boundary -- confirmed directly from
+        // chain.js/chaindb.js. Must run once per block (not per
+        // covenant/transaction), after every covenant in this block
+        // has already been applied above. Persisting every block, not
+        // just at commit boundaries, is required for correctness
+        // across a restart (see UrkelNameTree's own class comment).
+        db.persistNameTreeState(height);
 
         // Step 4: Evict confirmed transactions from mempool
         if (mempool != null) {
@@ -288,6 +298,34 @@ public class BlockProcessor {
         }
 
         db.saveName(entry);
+
+        // Feed the tree, matching real hsd's own exclusion exactly:
+        // "BID and REDEEM covenants do not update NameState" (confirmed
+        // directly from chaindb.js's comment). Every other covenant
+        // type does, mirroring the state transitions already applied
+        // to `entry` above.
+        if (type != COV_BID && type != COV_REDEEM) {
+            UrkelNameState ns = new UrkelNameState();
+            ns.name = entry.name != null ? entry.name.getBytes(java.nio.charset.StandardCharsets.US_ASCII) : new byte[0];
+            ns.data = entry.resourceData != null ? entry.resourceData : new byte[0];
+            ns.height = entry.height;
+            ns.renewal = entry.renewal;
+            if (entry.ownerTxid != null && !entry.ownerTxid.isEmpty()) {
+                ns.ownerHash = fromHex(entry.ownerTxid);
+                ns.ownerIndex = entry.ownerIndex;
+            }
+            ns.value = entry.value;
+            ns.highest = entry.highest;
+            ns.transfer = entry.transfer;
+            ns.revoked = entry.revoked;
+            ns.claimed = entry.claimed;
+            ns.renewals = entry.renewals;
+            ns.registered = "CLOSED".equals(entry.state);
+            ns.expired = false; // expiration isn't proactively tracked yet -- known gap
+            ns.weak = entry.weak;
+
+            db.getNameTree().applyNameState(nameHashBytes, ns);
+        }
     }
 
     // ── Block parsing ─────────────────────────────────────────────────────────
@@ -345,12 +383,12 @@ public class BlockProcessor {
      * Extracts the plaintext name string from a covenant's items, when
      * that covenant type actually carries one at item index 2. Confirmed
      * against a real, complete covenant item reference for every type:
-        * <p>
+     * <p>
      *   CLAIM:    [nameHash, height, name, flags]
      *   OPEN:     [nameHash, height, name]
      *   BID:      [nameHash, height, name, blind]
      *   FINALIZE: [nameHash, height, name, flags, claimHeight, renewals, blockHash]
-        * <p>
+     * <p>
      *   REVEAL:   [nameHash, height, nonce]        -- item[2] is a NONCE, not a name
      *   REDEEM:   [nameHash, height]                -- no item[2] at all
      *   REGISTER: [nameHash, height, recordData, blockHash]
@@ -358,7 +396,7 @@ public class BlockProcessor {
      *   RENEW:    [nameHash, height, blockHash]
      *   TRANSFER: [nameHash, height, version, address]
      *   REVOKE:   [nameHash, height]                -- no item[2] at all
-        * <p>
+     * <p>
      * Previously EVERY one of these second-group types was treated as if
      * item[2] held the name, meaning random binary data (nonces, hashes,
      * record data) was being interpreted as ASCII text and stored as the
@@ -412,5 +450,13 @@ public class BlockProcessor {
         StringBuilder sb = new StringBuilder(b.length * 2);
         for (byte x : b) sb.append(String.format("%02x", x));
         return sb.toString();
+    }
+
+    private static byte[] fromHex(String s) {
+        byte[] b = new byte[s.length() / 2];
+        for (int i = 0; i < b.length; i++) {
+            b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        }
+        return b;
     }
 }
