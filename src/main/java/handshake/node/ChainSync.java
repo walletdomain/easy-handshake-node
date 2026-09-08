@@ -7,7 +7,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
 /**
- * ChainSync — synchronizes the node with the Handshake network.
+ * ChainSync — synchronizes the validator with the Handshake network.
  * <p>
  * Responsibilities:
  *   1. Header sync: download all block headers from peers
@@ -234,7 +234,7 @@ public class ChainSync {
      * active outbound connection at the moment a transaction is
      * accepted. Still a real, meaningful improvement over the previous
      * complete absence of relay: without this, any transaction reaching
-     * this node (including via its own sendrawtransaction RPC) was a
+     * this validator (including via its own sendrawtransaction RPC) was a
      * dead end that would never propagate further.
      */
     private void relayTxToPeers(String txid, byte[] raw, String excludeIp) {
@@ -284,7 +284,7 @@ public class ChainSync {
      * header (height 0) predates some fix and no longer matches the real
      * network's genesis hash. Previously this required manually deleting
      * the whole data directory to recover -- if it's ever wrong again for
-     * any reason, the node now detects and fixes it automatically instead
+     * any reason, the validator now detects and fixes it automatically instead
      * of getting stuck (peers won't recognize our locator, so they just
      * keep resending genesis, which we'd then reject as "doesn't chain,"
      * forever).
@@ -301,7 +301,7 @@ public class ChainSync {
                     + "This can happen if the data predates a fix, but can also mean "
                     + "the database file itself was left in an inconsistent state by "
                     + "an unclean shutdown (e.g. a forceful process kill while the "
-                    + "node was still running) -- either way, resetting headers alone "
+                    + "validator was still running) -- either way, resetting headers alone "
                     + "isn't safe here, since blocks/UTXOs/names derived from that same "
                     + "data could be equally suspect. No manual deletion needed.");
             System.out.println("[ChainSync] Computed hash: " + toHex(computedHash));
@@ -1020,6 +1020,23 @@ public class ChainSync {
 
                 // Receive blocks
                 int received = 0;
+                // FIX: previously this loop unconditionally did
+                // received++ regardless of whether processBlock actually
+                // succeeded, and the outer loop advanced `height` and
+                // (via a later successful block calling
+                // db.setBlockTip()) the PERSISTED tip past any rejected
+                // height in between -- silently and permanently
+                // orphaning that block's UTXO/name-state changes with no
+                // pause, no stop, and no re-request, ever. Now: the
+                // instant a block fails, stop pulling further blocks
+                // from this (now-banned) peer and stop this whole
+                // download pass, without counting the failed block as
+                // received. db.getBlockTip() is therefore left pointing
+                // at exactly the height before the failure, so the next
+                // sync attempt -- necessarily with a different peer,
+                // since this one is banned -- naturally re-requests the
+                // correct height instead of skipping it.
+                boolean batchFailed = false;
                 while (received < hashes.size() && running) {
                     byte[] msg = peer.readMessage(60_000);
                     if (msg == null) break;
@@ -1027,7 +1044,10 @@ public class ChainSync {
                         handleNonBlockMessage(msg, peer);
                         continue;
                     }
-                    processBlock(msg, height + received, peer.ip);
+                    if (!processBlock(msg, height + received, peer.ip)) {
+                        batchFailed = true;
+                        break;
+                    }
                     received++;
                 }
 
@@ -1054,7 +1074,7 @@ public class ChainSync {
                     blocksSinceCommit = 0;
                 }
 
-                if (received == 0) break;
+                if (received == 0 || batchFailed) break;
             }
         } finally {
             // Guarantee whatever was accumulated gets committed even if
@@ -1068,7 +1088,7 @@ public class ChainSync {
         }
     }
 
-    private void processBlock(byte[] msg, int height, String fromIp) {
+    private boolean processBlock(byte[] msg, int height, String fromIp) {
         byte[] rawBlock = Arrays.copyOfRange(msg, 9, msg.length);
         byte[] header   = Arrays.copyOf(rawBlock, Math.min(236, rawBlock.length));
         byte[] hash     = HeaderUtil.hash(header);
@@ -1081,7 +1101,7 @@ public class ChainSync {
                 System.err.printf("[ChainSync] Block %d hash mismatch!%n", height);
                 PeerScorecard.get().recordInvalidData(fromIp,
                         "block " + height + " hash mismatch");
-                return;
+                return false;
             }
         }
 
@@ -1100,7 +1120,7 @@ public class ChainSync {
             // point of failure.
             PeerScorecard.get().banPeer(fromIp,
                     "sent block " + height + " that failed validation");
-            return;
+            return false;
         }
         PeerScorecard.get().recordValidData(fromIp);
 
@@ -1117,6 +1137,7 @@ public class ChainSync {
             System.out.printf("[ChainSync] Block %d processed (total: %d)%n",
                     height, blocksDownloaded.get());
         }
+        return true;
     }
 
     private void handleNonBlockMessage(byte[] msg, PeerConnection peer)
@@ -1210,7 +1231,7 @@ public class ChainSync {
     // sends unsolicited (PING, TX, GETADDR/ADDR, GETHEADERS, GETDATA).
     // Unlike outbound peers -- which connect, sync, and close within a
     // single syncCycle() -- inbound peers stay open until they disconnect
-    // or the node shuts down, since we don't control when they'll have
+    // or the validator shuts down, since we don't control when they'll have
     // something to say.
 
     private final ExecutorService inboundExecutor = Executors.newCachedThreadPool(r -> {
@@ -1303,7 +1324,7 @@ public class ChainSync {
 
     /**
      * Responds to a peer's GETHEADERS request -- the other half of what
-     * this node has only ever done as a client (see syncHeaders()/
+     * this validator has only ever done as a client (see syncHeaders()/
      * buildLocator()) until now. Finds the first locator hash we
      * recognize (locators are ordered most-recent-first, matching the
      * same convention our own outbound locators use), then sends up to
@@ -1329,7 +1350,7 @@ public class ChainSync {
             }
         }
         // Stop hash (32 bytes) follows -- not enforced, matching this
-        // node's own outbound requests, which always use an all-zero
+        // validator's own outbound requests, which always use an all-zero
         // stop hash and rely on the batch size cap instead.
 
         int startHeight = matchHeight + 1; // -1+1 = 0 (genesis) if no match
@@ -1358,7 +1379,7 @@ public class ChainSync {
 
     /**
      * Responds to a peer's GETDATA request for blocks or mempool
-     * transactions -- the other half of what this node has only ever
+     * transactions -- the other half of what this validator has only ever
      * done as a client until now. Items we don't have are silently
      * skipped rather than answered with NOTFOUND; the requesting peer's
      * own timeout handles that case the same way ours already does.
@@ -1525,7 +1546,7 @@ public class ChainSync {
             // writeLE32(-1) serializes to 0xFFFFFFFF on the wire, which a
             // real peer reads back as an UNSIGNED height of 4,294,967,295.
             // Every single VERSION message sent so far had this exact
-            // value; a real hsd node very plausibly rejects a peer
+            // value; a real hsd validator very plausibly rejects a peer
             // claiming a chain height of 4.29 billion outright. Clamp to 0
             // before it ever reaches the wire.
             if (ourHeight < 0) ourHeight = 0;

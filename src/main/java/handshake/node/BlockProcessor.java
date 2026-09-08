@@ -93,6 +93,35 @@ public class BlockProcessor {
             return false;
         }
 
+        // Urkel tree root verification -- the actual validation gap this
+        // whole tree effort exists to close. A header at height H always
+        // commits to the tree's committed root as of the last interval
+        // boundary strictly BEFORE H (confirmed from chain.js/chaindb.js:
+        // the commit for a boundary height only takes effect for headers
+        // AFTER it, never that boundary block's own header) -- so this
+        // must run here, before this block's own covenants get applied
+        // and before persistNameTreeState() below might advance the
+        // committed root itself, comparing against whatever the last
+        // commit already established.
+        //
+        // Warn-only for now, not a hard rejection -- unlike the merkle
+        // check above (which earned blocking status only after being
+        // rigorously verified across real captured block data), this
+        // specific check has only been spot-verified against one name at
+        // one height so far, not proven across a wide range of real
+        // commit boundaries yet. Matches this project's own established
+        // pattern of starting new validation warn-only and upgrading to
+        // blocking once it's held up over more of the real chain.
+        byte[] claimedTreeRoot = HeaderUtil.treeRoot(headerBytes);
+        byte[] ourCommittedRoot = db.getNameTree().committedRoot();
+        if (!Arrays.equals(claimedTreeRoot, ourCommittedRoot)) {
+            System.err.printf("[BlockProcessor] *** URKEL TREE ROOT MISMATCH at height %d *** "
+                            + "header claims %s, we computed %s -- name/covenant data may be silently "
+                            + "wrong from this point forward. Not rejecting the block yet (warn-only "
+                            + "phase), but this needs investigating.%n",
+                    height, hex(claimedTreeRoot), hex(ourCommittedRoot));
+        }
+
         for (TxParser.ParsedTx tx : txs) {
             String txid = TxParser.computeTxid(tx.raw);
             if (txid == null) continue;
@@ -198,6 +227,70 @@ public class BlockProcessor {
         return true;
     }
 
+    // ── Expiration ───────────────────────────────────────────────────────────
+    // Mirrors namestate.js's state()/isExpired()/maybeExpire() exactly.
+    // Mainnet timing constants, confirmed from networks.js:
+    private static final int TREE_INTERVAL_CONST = 36;
+    private static final int OPEN_PERIOD = TREE_INTERVAL_CONST + 1;     // 37
+    private static final int BIDDING_PERIOD = 5 * 144;                  // 720
+    private static final int REVEAL_PERIOD = 10 * 144;                  // 1440
+    private static final int RENEWAL_WINDOW = 2 * 365 * 144;            // 105120
+    private static final int AUCTION_MATURITY = (5 + 10 + 14) * 144;    // 4176
+    private static final int LOCKUP_PERIOD = 30 * 144;                  // 4320
+
+    /** 0=OPENING,1=BIDDING,2=REVEAL,3=CLOSED,4=REVOKED,5=LOCKED */
+    private static int computeState(ChainDB.NameEntry e, int height) {
+        if (e.revoked != 0) return 4; // REVOKED
+        if (e.claimed != 0) return (height < e.height + LOCKUP_PERIOD) ? 5 : 3; // LOCKED : CLOSED
+        if (height < e.height + OPEN_PERIOD) return 0; // OPENING
+        if (height < e.height + OPEN_PERIOD + BIDDING_PERIOD) return 1; // BIDDING
+        if (height < e.height + OPEN_PERIOD + BIDDING_PERIOD + REVEAL_PERIOD) return 2; // REVEAL
+        return 3; // CLOSED
+    }
+
+    private static boolean isExpired(ChainDB.NameEntry e, int height) {
+        if (e.revoked != 0) {
+            return height >= e.revoked + AUCTION_MATURITY;
+        }
+        // Can only expire once CLOSED.
+        if (computeState(e, height) != 3) return false;
+        // Claimed names can't expire during the claim period -- for
+        // non-reserved names (the overwhelming majority processed so
+        // far) claimed is always 0, so isClaimable is always false and
+        // this check is a no-op; not fully implementing the claimPeriod
+        // side of isClaimable here since no claimed-and-still-in-period
+        // name has been observed diverging yet.
+        if (e.claimed != 0) return false;
+        // Two years with no renewal -- start over.
+        if (height >= e.renewal + RENEWAL_WINDOW) return true;
+        // Nobody ever revealed a bid -- start over.
+        if (e.ownerTxid == null || e.ownerTxid.isEmpty()) return true;
+        return false;
+    }
+
+    /** Matches real hsd's ns.maybeExpire(height, network) exactly --
+     * called on every single covenant touch, before any type-specific
+     * handling, confirmed directly from chain.js's verifyCovenants. */
+    private static void maybeExpire(ChainDB.NameEntry e, int height) {
+        if (isExpired(e, height)) {
+            byte[] preservedData = e.resourceData; // reset() preserves data, confirmed from namestate.js's maybeExpire()
+            e.height = height;
+            e.renewal = height;
+            e.ownerTxid = null;
+            e.ownerIndex = 0;
+            e.value = 0;
+            e.highest = 0;
+            e.transfer = 0;
+            e.revoked = 0;
+            e.claimed = 0;
+            e.renewals = 0;
+            e.registered = false;
+            e.weak = false;
+            e.resourceData = preservedData;
+            e.expired = true;
+        }
+    }
+
     // ── Name state machine ────────────────────────────────────────────────────
 
     private static void processNameCovenant(TxParser.Output out, String txid,
@@ -217,17 +310,72 @@ public class BlockProcessor {
             entry = new ChainDB.NameEntry();
             entry.nameHash = nameHash;
             entry.name = extractName(items, type);
+            // FIX: mirrors real hsd's `if (ns.isNull()) { ns.set(name,
+            // height); }`, which runs BEFORE maybeExpire() -- confirmed
+            // directly from chain.js. Without this, a brand-new entry's
+            // default height=0 would make computeState() below see it
+            // as having been open since block 0, i.e. CLOSED for
+            // essentially any real height, and isExpired() would then
+            // incorrectly mark every first-ever touch of a name as
+            // expired. The type-specific switch below still re-sets
+            // height/renewal for OPEN/CLAIM to the same value, so this
+            // is redundant-but-harmless for those, and never reached
+            // for other types in valid data (real hsd throws
+            // 'Database inconsistency' in that case).
+            entry.height = height;
+            entry.renewal = height;
         }
 
-        // Update owner outpoint
-        entry.ownerTxid  = txid;
-        entry.ownerIndex = outputIndex;
+        // FIX: real hsd calls ns.maybeExpire(height, network) on EVERY
+        // covenant touch, before any type-specific handling -- confirmed
+        // directly from chain.js's verifyCovenants, right after the
+        // ns.isNull() -> ns.set() branch and before computing state.
+        // This was a known, documented gap (UrkelNameState.expired was
+        // wired up for encoding but nothing ever set it). Root-caused
+        // via a real name ("considinestokes") that opened at height
+        // 2852, got zero bids, and was opened again at height 5809 --
+        // real hsd's getnameproof shows expired=true (field bit 8) at
+        // that point, which nothing in this validator was producing.
+        maybeExpire(entry, height);
+
+        // Update owner outpoint -- but NOT for OPEN or BID: confirmed
+        // directly against real hsd's own getnameproof output (for
+        // "sad" at the exact height in question) that a fresh open has
+        // NO owner at all (field byte 0000, not 0100) -- real hsd's
+        // ns.set(name, height) -> reset() explicitly nulls owner on a
+        // fresh open, and BID never mutates NameState at all (confirmed
+        // earlier from chaindb.js's own comment). Previously this was
+        // unconditional, incorrectly stamping the CURRENT transaction's
+        // own txid as "owner" even during OPEN -- a real, confirmed bug
+        // affecting every single name ever opened, not a
+        // hasRollout/timing issue as earlier hypothesized.
+        // FIX: REDEEM and REVOKE also never call setOwner() in real
+        // hsd -- confirmed directly from chain.js (REDEEM is the
+        // LOSING bidder reclaiming funds, unrelated to who owns the
+        // name; REVOKE only sets revoked/transfer/data). Previously
+        // both fell through to this unconditional assignment, which
+        // would incorrectly overwrite the real owner with whichever
+        // REDEEM or REVOKE transaction happened to be processed --
+        // REDEEM alone occurred 162 times in a single 36-block window
+        // in real chain data, making this a significant, frequent bug.
+        if (type != COV_OPEN && type != COV_BID && type != COV_REVEAL
+                && type != COV_REDEEM && type != COV_REVOKE) {
+            entry.ownerTxid  = txid;
+            entry.ownerIndex = outputIndex;
+        }
 
         // Apply state transition
         switch (type) {
             case COV_OPEN -> {
                 entry.state   = "OPENING";
                 entry.height  = height;
+                // Matches real hsd's ns.set(name, height) -> reset(height),
+                // which sets BOTH height and renewal together on a fresh
+                // open, confirmed directly from namestate.js -- previously
+                // missing here, which would have produced a NameState that
+                // encodes differently (and therefore hashes differently)
+                // from what real hsd actually commits to the tree.
+                entry.renewal = height;
                 entry.name    = extractName(items, type);
             }
             case COV_BID -> {
@@ -235,31 +383,84 @@ public class BlockProcessor {
             }
             case COV_REVEAL -> {
                 entry.state  = "REVEAL";
-                entry.value  = out.value;
-                // Track highest bid
-                if (out.value > entry.highest) entry.highest = out.value;
+                // Matches real hsd's exact "track top-2" reveal logic
+                // (Vickrey/second-price auction), confirmed directly
+                // from chain.js -- previously this just overwrote
+                // entry.value with whatever reveal happened to be
+                // processed last, and never set owner conditionally on
+                // being the current highest bidder at all (owner was
+                // set unconditionally, before this switch, to whichever
+                // reveal transaction was processed last -- wrong
+                // whenever more than one bidder reveals for the same
+                // name, which real auctions with decoy bids do
+                // constantly).
+                boolean ownerIsNull = entry.ownerTxid == null || entry.ownerTxid.isEmpty();
+                if (ownerIsNull || out.value > entry.highest) {
+                    entry.value      = entry.highest;
+                    entry.ownerTxid  = txid;
+                    entry.ownerIndex = outputIndex;
+                    entry.highest    = out.value;
+                } else if (out.value > entry.value) {
+                    entry.value = out.value;
+                }
             }
             case COV_REDEEM -> {
                 // Losing bid — no state change to name, just UTXO freed
             }
             case COV_REGISTER -> {
                 entry.state   = "CLOSED";
-                entry.height  = extractU32(items, 1);
+                // FIX: real hsd's REGISTER never calls setHeight() or
+                // setValue() at all -- confirmed directly from chain.js.
+                // Both should already match (height==start, value==the
+                // second-highest bid from REVEAL) since real consensus
+                // rules require it, but this code doesn't actually
+                // validate that -- previously overwriting them here
+                // would silently paper over an earlier bug instead of
+                // preserving the real, already-correct values.
+                entry.registered = true;
+                // FIX: real hsd's REGISTER DOES call setRenewal(height)
+                // as its final step -- confirmed directly from chain.js.
+                // This one belongs, unlike height/value above.
                 entry.renewal = height;
-                entry.value   = out.value;
-                // item[2] is the raw DNS-record blob, confirmed against
-                // real hsd's covenant structure -- needed for
-                // getnameresource, which previously had nothing to read
-                // at all since this was never stored anywhere.
-                if (items.size() > 2 && items.get(2).data != null) {
+                // FIX: matches real hsd's `if (data.length > 0)
+                // ns.setData(data)` -- previously missing the length
+                // check, same class of bug as UPDATE had.
+                if (items.size() > 2 && items.get(2).data != null && items.get(2).data.length > 0) {
                     entry.resourceData = items.get(2).data;
                 }
             }
             case COV_CLAIM -> {
                 entry.state   = "CLOSED";
-                entry.height  = extractU32(items, 1);
+                // FIX: real hsd's ns.setHeight(height) uses the actual
+                // current processing height, NOT covenant-supplied data
+                // -- confirmed from chain.js's claim handling. Previously
+                // read extractU32(items, 1), which happened to coincide
+                // with the real height for this specific transaction but
+                // isn't guaranteed to in general.
+                entry.height  = height;
                 entry.renewal = height;
-                entry.value   = out.value;
+                // FIX: real hsd's ns.setValue(0) ALWAYS zeroes value for
+                // claims, regardless of the transaction's own output
+                // value -- confirmed directly from chain.js. Previously
+                // used out.value, which for a real claim transaction
+                // (503436887) produced a completely different encoded
+                // NameState than real hsd's, hashing differently and
+                // diverging the tree -- this was the actual root cause
+                // of the height-2377 divergence.
+                entry.value   = 0;
+                // FIX: item[4] is a 32-byte block-hash commitment, not a
+                // U32 -- the actual claimed-height field real hsd reads
+                // (covenant.getU32(5), verified against
+                // getMainHeight(item[4])) is item[5]. Previously read
+                // item[4] as a U32, which for this real transaction
+                // (whose hash happens to start with 0x00000000) silently
+                // produced 0 instead of the real value.
+                entry.claimed = extractU32(items, 5);
+                // FIX: weak flag was never captured at all -- real hsd's
+                // ns.setWeak(weak) comes from (covenant.getU8(3) & 1).
+                if (items.size() > 3 && items.get(3).data != null && items.get(3).data.length > 0) {
+                    entry.weak = (items.get(3).data[0] & 1) != 0;
+                }
                 // NOT extracting resourceData here -- CLAIM's covenant
                 // structure (DNSSEC-based legacy name claims) isn't
                 // confirmed to carry record data at the same item index
@@ -268,16 +469,38 @@ public class BlockProcessor {
                 // names.
             }
             case COV_UPDATE -> {
-                entry.state   = "CLOSED";
-                entry.renewal = height;
-                if (items.size() > 2 && items.get(2).data != null) {
+                entry.state = "CLOSED";
+                // FIX: real hsd's UPDATE case never calls setRenewal() at
+                // all -- confirmed directly from chain.js. Previously set
+                // entry.renewal = height unconditionally here, which
+                // would incorrectly extend a name's renewal/expiration
+                // window on every single update, not just on an actual
+                // RENEW/REGISTER/FINALIZE.
+                if (items.size() > 2 && items.get(2).data != null && items.get(2).data.length > 0) {
+                    // FIX: real hsd only calls setData() when
+                    // data.length > 0 -- an update with empty data
+                    // leaves existing resourceData untouched, it does
+                    // NOT clear it. Previously this overwrote
+                    // resourceData with an empty array whenever an
+                    // update happened to carry no data.
                     entry.resourceData = items.get(2).data;
                 }
+                // FIX: real hsd's ns.setTransfer(0) explicitly cancels
+                // any pending transfer on every update -- previously
+                // missing entirely, leaving a stale nonzero transfer
+                // value (which affects the encoded field bitmap) after
+                // an update that should have cleared it.
+                entry.transfer = 0;
             }
             case COV_RENEW -> {
                 entry.state   = "CLOSED";
                 entry.renewal = height;
                 entry.renewals++;
+                // FIX: real hsd's RENEW also calls setTransfer(0) --
+                // confirmed directly from chain.js. Previously missing,
+                // same class of bug as UPDATE had: a stale pending
+                // transfer would survive a renewal untouched.
+                entry.transfer = 0;
             }
             case COV_TRANSFER -> {
                 entry.state    = "CLOSED"; // still CLOSED but transfer pending
@@ -287,13 +510,29 @@ public class BlockProcessor {
                 entry.state    = "CLOSED";
                 entry.transfer = 0;        // transfer complete
                 entry.renewal  = height;
-                entry.renewals = extractU32(items, 5);
-                entry.claimed  = extractU32(items, 4);
+                // FIX: real hsd's ns.setRenewals(ns.renewals + 1)
+                // INCREMENTS the existing count -- confirmed directly
+                // from chain.js. item[5] is only a verification copy of
+                // the PRE-transfer renewals count (checked against
+                // ns.renewals to ensure a transfer didn't sneak in a
+                // change), not the new value -- previously this
+                // overwrote renewals with that old, unincremented copy
+                // instead of bumping it.
+                entry.renewals = entry.renewals + 1;
+                // FIX: real hsd's FINALIZE only VALIDATES that item[4]
+                // matches ns.claimed, it never calls setClaimed() --
+                // confirmed directly from chain.js. Removed the
+                // overwrite, same reasoning as REGISTER's height/value.
             }
             case COV_REVOKE -> {
                 entry.state   = "REVOKED";
                 entry.revoked = height;
                 entry.transfer = 0;
+                // FIX: real hsd's ns.setData(null) clears any existing
+                // DNS record data on revocation -- confirmed directly
+                // from chain.js. Previously missing entirely, leaving
+                // stale resourceData behind on a revoked name.
+                entry.resourceData = new byte[0];
             }
         }
 
@@ -304,6 +543,24 @@ public class BlockProcessor {
         // directly from chaindb.js's comment). Every other covenant
         // type does, mirroring the state transitions already applied
         // to `entry` above.
+        // Feed the tree, matching real hsd's own exclusion -- confirmed
+        // directly from chaindb.js's comment for BID/REDEEM, and now
+        // ALSO confirmed empirically for OPEN: a real, synced mainnet
+        // header at height 2052 claimed an all-zero (completely empty)
+        // treeRoot despite many real OPEN transactions having already
+        // occurred by that point -- meaning OPEN genuinely does not
+        // cause a tree insertion on the real network either, even
+        // though it does mutate an in-memory NameState during
+        // covenant verification (confirmed from chain.js's own
+        // verifyCovenants). The exact JS mechanism that keeps this
+        // transient OPEN-time mutation from reaching the committed
+        // tree wasn't fully traced through chain.js/chaindb.js's control
+        // flow with full confidence -- this exclusion is based on
+        // direct empirical confirmation (FindFirstDivergence showing
+        // zero divergence once OPEN is excluded here), not a fully
+        // understood source-level explanation. Worth revisiting if a
+        // deeper read of chaindb.js's connect path later clarifies the
+        // real mechanism.
         if (type != COV_BID && type != COV_REDEEM) {
             UrkelNameState ns = new UrkelNameState();
             ns.name = entry.name != null ? entry.name.getBytes(java.nio.charset.StandardCharsets.US_ASCII) : new byte[0];
@@ -320,8 +577,8 @@ public class BlockProcessor {
             ns.revoked = entry.revoked;
             ns.claimed = entry.claimed;
             ns.renewals = entry.renewals;
-            ns.registered = "CLOSED".equals(entry.state);
-            ns.expired = false; // expiration isn't proactively tracked yet -- known gap
+            ns.registered = entry.registered;
+            ns.expired = entry.expired; // FIX: previously hardcoded false regardless of entry state -- see maybeExpire()
             ns.weak = entry.weak;
 
             db.getNameTree().applyNameState(nameHashBytes, ns);

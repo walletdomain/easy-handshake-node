@@ -428,14 +428,26 @@ public class ChainDB {
         public boolean weak;
         public int    transfer;       // transfer lockup block (0 if not transferring)
         public int    revoked;
+        public boolean registered;    // set explicitly by REGISTER, NOT derived from state -- confirmed via real hsd's getnameproof for "crypto51": a freshly-claimed name has state=CLOSED but registered=false, since CLAIM never sets it (previously this was wrongly derived as state=="CLOSED", which incorrectly marked every claim as registered too)
+        public boolean expired = false; // set by maybeExpire() when an auction closes with no revealed bids (or a registration goes unrenewed past renewalWindow) -- confirmed against real hsd's getnameproof, field bit 8
         public byte[] resourceData = new byte[0]; // raw DNS-record blob from the most recent UPDATE/REGISTER covenant, for getnameresource
 
         public String toStorage() {
+            // ownerTxid can genuinely be null now (OPEN no longer sets
+            // it, confirmed correct against real hsd's own reset()
+            // logic) -- string concatenation would otherwise silently
+            // turn a null into the literal text "null", which survives
+            // a round trip through storage and later breaks every
+            // downstream null-check (including fromHex, which then
+            // crashes trying to parse "null" as hex). Write an explicit
+            // empty string instead, matching what every null-check here
+            // already treats as "no owner".
+            String ownerTxidField = (ownerTxid == null) ? "" : ownerTxid;
             return name + "|" + nameHash + "|" + state + "|" + height + "|"
-                    + renewal + "|" + ownerTxid + "|" + ownerIndex + "|"
+                    + renewal + "|" + ownerTxidField + "|" + ownerIndex + "|"
                     + value + "|" + highest + "|" + claimed + "|"
                     + renewals + "|" + weak + "|" + transfer + "|" + revoked
-                    + "|" + hex(resourceData);
+                    + "|" + hex(resourceData) + "|" + registered + "|" + expired;
         }
 
         public static NameEntry fromStorage(String s) {
@@ -450,7 +462,7 @@ public class ChainDB {
             // entry" is a far safer fallback than losing everything else
             // in the block over one corrupted/stale record.
             try {
-                String[] p = s.split("\\|", 15);
+                String[] p = s.split("\\|", 17);
                 NameEntry e = new NameEntry();
                 e.name       = p[0];
                 e.nameHash   = p[1];
@@ -467,6 +479,11 @@ public class ChainDB {
                 e.transfer   = Integer.parseInt(p[12]);
                 e.revoked    = p.length > 13 ? Integer.parseInt(p[13]) : 0;
                 e.resourceData = p.length > 14 && !p[14].isEmpty() ? fromHex(p[14]) : new byte[0];
+                // Defaults to false for records written before this field
+                // existed -- matches a fresh NameEntry's own default,
+                // safer than guessing true for old records.
+                e.registered = p.length > 15 && Boolean.parseBoolean(p[15]);
+                e.expired    = p.length > 16 && Boolean.parseBoolean(p[16]);
                 return e;
             } catch (Exception ex) {
                 System.err.println("[ChainDB] WARNING: unparseable NameEntry record, "
