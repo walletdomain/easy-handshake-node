@@ -368,20 +368,44 @@ public class ChainSync {
     }
 
     /**
-     * Stops the sync scheduler -- and, critically, actually waits for
-     * any already-in-progress syncCycle() execution to genuinely finish
-     * before returning, not just for scheduler.shutdown() to prevent
-     * future runs from being scheduled. Those are different things:
-     * shutdown() alone let a real, observed shutdown proceed straight
-     * to db.close()/ConfigDB.close() while a background cycle was still
-     * mid-flight inside BlockProcessor, producing "Map is closed"/"This
-     * store is closed" errors from the losing side of that race. The
-     * errors themselves were caught cleanly (MVStore correctly refused
-     * the post-close operation rather than corrupting anything, and the
-     * failed write for that one height was never committed, so it will
-     * simply be re-downloaded and reprocessed on the next start) --
-     * but the race itself was real and worth actually closing, not just
-     * relying on having gotten lucky with the timing this time.
+     * Stops the sync scheduler -- and waits for any already-in-progress
+     * syncCycle() execution to genuinely finish before returning, not
+     * just for scheduler.shutdown() to prevent future runs from being
+     * scheduled. Those are different things: shutdown() alone lets a
+     * real, observed shutdown proceed straight to db.close()/
+     * ConfigDB.close() while a background cycle is still mid-flight
+     * inside BlockProcessor, producing "Map is closed"/"This store is
+     * closed" errors from the losing side of that race. Those errors
+     * are safe on their own (MVStore correctly refuses the post-close
+     * operation rather than corrupting anything, and the failed write
+     * for that one height is never committed, so it's simply
+     * re-downloaded and reprocessed on the next start).
+     *
+     * FIX: this used to fall back to scheduler.shutdownNow() when the
+     * grace period elapsed, in order to make the wait actually
+     * deterministic rather than "relying on having gotten lucky with
+     * timing." That intent was right, but shutdownNow()'s mechanism --
+     * Thread.interrupt() -- is genuinely unsafe here: Java's NIO file
+     * channels have documented behavior where interrupting a thread
+     * blocked in a channel I/O call closes the ENTIRE underlying
+     * channel, process-wide, not just that one thread's view of it.
+     * Confirmed directly from a real crash: an interrupted mid-flight
+     * read in BlockProcessor closed the shared database file channel
+     * out from under the shutdown hook's own subsequent db.commit()
+     * call on a completely different thread, which then threw
+     * ClosedChannelException and aborted the REST of the shutdown
+     * hook -- meaning db.close()/ConfigDB.commit()/ConfigDB.close()
+     * never ran at all. That's strictly worse than the original,
+     * merely-suboptimal race this was meant to close.
+     *
+     * The scheduler's threads are daemon threads (see the ThreadFactory
+     * above), so the JVM can abandon a still-running one at actual
+     * process exit without any explicit interruption -- it's simply
+     * killed at the OS level, which never touches Java's
+     * interrupt-triggered channel-closing logic. So on timeout, this
+     * now just logs and returns, accepting exactly the same
+     * already-safe race the class comment above describes, rather than
+     * "fixing" it into a worse one.
      */
     public void stop() {
         running = false;
@@ -389,13 +413,17 @@ public class ChainSync {
         try {
             if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.out.println("[ChainSync] Sync cycle did not stop within 30s -- "
-                        + "forcing shutdown (any in-flight block processing will be "
-                        + "abandoned, safely: nothing partial gets committed).");
-                scheduler.shutdownNow();
+                        + "proceeding with shutdown anyway. Any in-flight block "
+                        + "processing will be abandoned, safely: nothing partial "
+                        + "gets committed, and it will simply be re-downloaded and "
+                        + "reprocessed on the next start. Deliberately NOT "
+                        + "interrupting the background thread here -- doing so can "
+                        + "close the shared database file channel out from under "
+                        + "other threads, including this shutdown sequence's own "
+                        + "final commit.");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            scheduler.shutdownNow();
         }
     }
 

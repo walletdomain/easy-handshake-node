@@ -120,9 +120,43 @@ public class UrkelNodeStore {
         return result;
     }
 
-    private static String hex(byte[] b) {
+    static String hex(byte[] b) {
         StringBuilder sb = new StringBuilder(b.length * 2);
         for (byte x : b) sb.append(String.format("%02x", x));
         return sb.toString();
+    }
+
+    /** Removes every stored node NOT in reachableHexHashes -- the
+     *  companion to collectReachable() in UrkelTree. This store is
+     *  content-addressed and append-only by construction (put() never
+     *  overwrites, only adds), which mirrors real Urkel's own on-disk
+     *  design, but without a periodic prune of unreachable history this
+     *  grows without bound: every single covenant transaction rewrites
+     *  a tree-depth's worth of nodes along its path to the root, and
+     *  none of the superseded ones were ever being removed. Confirmed
+     *  as the actual driver of both a real, observed 45GB database
+     *  after only 65,000 blocks and a real, observed progressive
+     *  slowdown in processing (a map growing into the millions of
+     *  entries gets slower to read and write against, independent of
+     *  MVStore's own chunk-level compact(), which only reclaims old
+     *  VERSIONS of the SAME key -- it has no way to know that a
+     *  different, still-technically-live key is logically obsolete).
+     *  Safe to call only when reachableHexHashes is known-complete for
+     *  every root this store still needs to serve (see
+     *  UrkelNameTree.pruneUnreachable() for why immediately after a
+     *  commit boundary is the one point where that's guaranteed true
+     *  cheaply, since the live and committed roots briefly coincide
+     *  there). Returns the number of entries actually removed. */
+    public int pruneUnreachable(java.util.Set<String> reachableHexHashes) {
+        java.util.List<String> toRemove = new java.util.ArrayList<>();
+        for (String key : store.keySet()) {
+            if (!reachableHexHashes.contains(key)) {
+                toRemove.add(key);
+            }
+        }
+        for (String key : toRemove) {
+            store.remove(key);
+        }
+        return toRemove.size();
     }
 }

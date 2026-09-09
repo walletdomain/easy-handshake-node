@@ -109,11 +109,23 @@ public class UrkelNameTree {
      *  where the tree's current (live) root becomes the new "official"
      *  committed root -- matching chaindb.js's "await
      *  this.txn.commit()" at the same boundary. Returns true if a
-     *  commit actually happened this call. */
+     *  commit actually happened this call.
+     *
+     *  Also the one safe, natural point to prune the node store: right
+     *  here, committedRootNode and the live root are, for this single
+     *  instant, the exact same object graph (committedRootNode was
+     *  just set to a snapshot of it on the line above) -- so a
+     *  reachability walk from either one captures everything BOTH the
+     *  live tree (for continuing forward) and the committed root (for
+     *  proveCommitted()/getnameproof) still need, without needing two
+     *  separate walks or any risk of the two views having already
+     *  diverged. Everything else in the node store at this point is,
+     *  by construction, superseded history from before this boundary. */
     public boolean maybeCommit(int height) {
         if (height % TREE_INTERVAL != 0) return false;
         lastCommittedRoot = tree.rootHash().clone();
         committedRootNode = tree.snapshotRoot();
+        tree.pruneUnreachableFrom(committedRootNode);
         return true;
     }
 

@@ -9,19 +9,19 @@ import java.nio.channels.FileLock;
 import java.nio.file.*;
 
 /**
- * Main — entry point for the Handshake node node.
+ * Main — entry point for the Handshake validator validator.
  * <p>
  * Startup sequence:
- *   1. Load config (node.conf)
+ *   1. Load config (validator.conf)
  *   2. Open chain database (chain.mv.db)
- *   3. Load node identity (node.key)
+ *   3. Load validator identity (validator.key)
  *   4. Initialize peer scorecard
  *   5. Start RPC server (JSON-RPC + WebSocket)
  *   6. Start P2P server (accept inbound Brontide connections)
  *   7. Start chain sync (header sync + block download + peer discovery)
  * <p>
  * Usage:
- *   java -jar easy-handshake-node.jar [data-dir]
+ *   java -jar easy-handshake-validator.jar [data-dir]
  * <p>
  * Default data directory: a ".easy-handshake" folder created next to the
  * jar file itself (not the current working directory -- those aren't
@@ -164,15 +164,26 @@ public class Main {
         // ── Shutdown hook ─────────────────────────────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\n[Main] Shutting down...");
-            sync.stop();
-            p2p.stop();
-            rpc.stop();
-            webAdmin.stop();
-            socketServer.stop();
-            db.commit();
-            db.close();
-            ConfigDB.get().commit();
-            ConfigDB.get().close();
+            // FIX: each step is now independently guarded. Previously an
+            // exception anywhere in this sequence (confirmed via a real
+            // crash: db.commit() threw ClosedChannelException after a
+            // forced-shutdown race) silently aborted every step after
+            // it -- db.close(), ConfigDB.get().commit(), and
+            // ConfigDB.get().close() never ran at all, leaving the
+            // config database un-flushed and both databases un-closed
+            // on top of whatever triggered the original failure. Each
+            // step now runs regardless of whether an earlier one
+            // failed, and any failure is reported rather than silently
+            // swallowed.
+            safeShutdownStep("sync.stop", sync::stop);
+            safeShutdownStep("p2p.stop", p2p::stop);
+            safeShutdownStep("rpc.stop", rpc::stop);
+            safeShutdownStep("webAdmin.stop", webAdmin::stop);
+            safeShutdownStep("socketServer.stop", socketServer::stop);
+            safeShutdownStep("db.commit", db::commit);
+            safeShutdownStep("db.close", db::close);
+            safeShutdownStep("ConfigDB.commit", () -> ConfigDB.get().commit());
+            safeShutdownStep("ConfigDB.close", () -> ConfigDB.get().close());
             System.out.println("[Main] Shutdown complete.");
         }, "shutdown-hook"));
 
@@ -249,13 +260,98 @@ public class Main {
     }
 
     private static String defaultDataDir() {
-        // Previously resolved relative to the running jar/classes location
-        // (fine for development, where that's target/classes) -- but a
-        // packaged, user-installed distribution needs a location that's
-        // always writable regardless of where the app itself is
-        // installed, and that naturally separates data per user on a
-        // shared machine. The user's home directory is the standard,
-        // reliable choice for this on every platform this runs on.
+        // FIX: previously always resolved to the user's home directory,
+        // regardless of where the jar itself was run from. That's the
+        // right choice when the jar lives somewhere that might not be
+        // writable (e.g. a system-protected install location), which is
+        // exactly why this was moved away from resolving relative to
+        // the jar/classes location in the first place.
+        //
+        // But it also meant there was no way to make a node default to
+        // storing its (potentially very large -- tens of GB even this
+        // early in the chain) database next to a deliberately-chosen
+        // location, like a NAS or LAN drive, without an explicit
+        // command-line argument every single run. If the person places
+        // and runs the jar itself from such a location on purpose, the
+        // data belongs right there by default.
+        //
+        // So: prefer a .easy-handshake folder next to the running
+        // jar/classes, but only if that location is actually writable
+        // right now -- falling back to the home directory otherwise,
+        // preserving the original robustness this code was written for.
+        // This keeps the explicit command-line argument (see main()'s
+        // args[0] handling, a few lines up) as the one, already-existing
+        // way to fully override the location regardless of where the
+        // jar lives.
+        String jarAdjacent = jarAdjacentDataDir();
+        if (jarAdjacent != null && isWritableDataDir(jarAdjacent)) {
+            return jarAdjacent;
+        }
         return Path.of(System.getProperty("user.home"), ".easy-handshake").toString();
+    }
+
+    /** Returns a .easy-handshake path next to the running jar (or, in a
+     *  dev/IDE run, next to the compiled classes root), or null if that
+     *  location can't be determined at all -- some launch mechanisms
+     *  (certain application-packaging tools, some test runners) don't
+     *  expose a usable code source location, and falling back cleanly
+     *  is far better than failing startup over it. */
+    private static String jarAdjacentDataDir() {
+        try {
+            java.net.URI codeLocation = Main.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI();
+            Path codePath = Path.of(codeLocation);
+            // A packaged jar's code source IS the jar file itself, so
+            // its parent is the containing folder. A dev/IDE run's code
+            // source is the classes ROOT DIRECTORY (e.g. target/classes)
+            // itself, which is already the directory we want -- no
+            // extra parent step there, or this would land one level too
+            // high (in target/ instead of alongside the actual run).
+            Path containingDir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
+            if (containingDir == null) return null;
+            return containingDir.resolve(".easy-handshake").toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Checks whether a data directory is actually usable right now --
+     *  by creating it (mkdirs is a no-op if it already exists) and
+     *  writing then deleting a small marker file, rather than trusting
+     *  any weaker signal. This is deliberately conservative: a NAS
+     *  that's temporarily unreachable, a read-only mount, or a
+     *  permissions issue should all cleanly fall back to the home
+     *  directory rather than fail startup outright. */
+    private static boolean isWritableDataDir(String dir) {
+        try {
+            Path dirPath = Path.of(dir);
+            Files.createDirectories(dirPath);
+            Path marker = dirPath.resolve(".write-test");
+            Files.writeString(marker, "");
+            Files.delete(marker);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Runs one shutdown step in isolation -- a failure here is reported
+     *  but never prevents the remaining steps from running. See the
+     *  shutdown hook's own comment for why this matters: a single
+     *  uncaught exception used to silently abort everything after it,
+     *  including steps (like ConfigDB's own commit/close) with no
+     *  relation to whatever failed first. */
+    private static void safeShutdownStep(String label, ShutdownStep step) {
+        try {
+            step.run();
+        } catch (Throwable t) {
+            System.err.println("[Main] Shutdown step '" + label + "' failed (continuing "
+                    + "with remaining shutdown steps regardless): " + t);
+        }
+    }
+
+    @FunctionalInterface
+    private interface ShutdownStep {
+        void run() throws Exception;
     }
 }

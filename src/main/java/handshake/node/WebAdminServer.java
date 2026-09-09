@@ -24,7 +24,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * A lightweight, localhost-only admin web server for the node --
+ * A lightweight, localhost-only admin web server for the validator --
  * serves the static HTML/CSS/JS content in WebAdminServerContent, plus
  * a small JSON API for viewing/changing configuration and viewing the
  * RPC API key. No TLS: the security boundary here isn't encryption,
@@ -143,9 +143,34 @@ public class WebAdminServer {
             int blockHeight = db.getBlockTip();
             double dbSizeGB = db.getDiskSizeBytes() / 1e9;
 
+            // Best-known network height comes from the highest "starting
+            // height" any connected peer has announced (bestKnownPeerHeight,
+            // tracked in ChainSync as peers connect) -- this is the
+            // standard way to gauge "how far behind the real chain am I"
+            // since there's no single authoritative source for it, only
+            // what peers claim. chainSync can be null very early during
+            // startup before it's wired up via setChainSync(), and
+            // bestKnownPeerHeight can legitimately still be 0 if no peer
+            // has connected yet -- both cases report syncPercent as null
+            // rather than a misleading 0% or a divide-by-zero.
+            int networkHeight = (chainSync != null) ? chainSync.getBestKnownPeerHeight() : 0;
+            String syncPercentField;
+            if (networkHeight > 0) {
+                // Capped at 100 -- our own tip can transiently exceed the
+                // currently-best-connected peer's height right after that
+                // peer disconnects and a shorter-tipped one is all that's
+                // left, which shouldn't ever display as "101% synced".
+                double syncPercent = Math.min(100.0, (blockHeight * 100.0) / networkHeight);
+                syncPercentField = String.format(java.util.Locale.ROOT, "%.1f", syncPercent);
+            } else {
+                syncPercentField = "null";
+            }
+
             String json = "{"
                     + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
                     + "\"blockHeight\":" + blockHeight + ","
+                    + "\"networkHeight\":" + networkHeight + ","
+                    + "\"syncPercent\":" + syncPercentField + ","
                     + "\"dbSizeGB\":" + String.format(java.util.Locale.ROOT, "%.2f", dbSizeGB)
                     + "}";
             respondJson(ex, 200, json);

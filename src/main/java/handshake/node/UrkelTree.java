@@ -213,6 +213,42 @@ public class UrkelTree {
         return UrkelNode.Null.NIL;
     }
 
+    /** Walks from a given root, collecting the hex-encoded hash of
+     *  every Internal/Leaf node reachable from it into out -- the
+     *  companion operation to persistFrom(): where that writes
+     *  everything new since the last call, this identifies everything
+     *  still actually needed, for a caller that wants to prune anything
+     *  else from the node store. Stops descending into an already-
+     *  visited hash (a subtree can be shared by multiple paths after
+     *  copy-on-write updates) rather than re-walking it, and resolves
+     *  Hash placeholders through the node store exactly like normal
+     *  traversal does. */
+    public void collectReachable(UrkelNode node, java.util.Set<String> out) {
+        if (node.isNull()) return;
+        node = resolve(node);
+        String key = UrkelNodeStore.hex(node.hash());
+        if (!out.add(key)) return; // already visited this subtree
+
+        if (node.isInternal()) {
+            UrkelNode.Internal in = (UrkelNode.Internal) node;
+            collectReachable(in.left, out);
+            collectReachable(in.right, out);
+        }
+        // Leaf nodes have no children to descend into.
+    }
+
+    /** Convenience: collects everything reachable from root, then
+     *  removes everything else from the configured node store. No-op
+     *  (returns 0) if no node store is configured. See
+     *  UrkelNodeStore.pruneUnreachable() for the full reasoning on
+     *  safety and why this exists. */
+    public int pruneUnreachableFrom(UrkelNode root) {
+        if (nodeStore == null) return 0;
+        java.util.Set<String> reachable = new java.util.HashSet<>();
+        collectReachable(root, reachable);
+        return nodeStore.pruneUnreachable(reachable);
+    }
+
     /** Builds a proof for a key against an explicit root node, rather
      *  than the tree's current live root -- lets a caller prove
      *  against a specific historical snapshot (e.g. UrkelNameTree's

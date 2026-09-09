@@ -38,6 +38,7 @@ public final class WebAdminServerContent {
                             <h2>Node Status</h2>
                             <p>Uptime: <span id="uptime">Loading...</span></p>
                             <p>Block Height: <span id="block-height">Loading...</span></p>
+                            <p>Sync Progress: <span id="sync-percent">Loading...</span></p>
                             <p>Chain Database: <span id="db-size">Loading...</span></p>
                         </section>
 
@@ -613,6 +614,16 @@ public final class WebAdminServerContent {
                     const data = await res.json();
                     document.getElementById("uptime").textContent = data.uptime;
                     document.getElementById("block-height").textContent = data.blockHeight;
+                    // syncPercent is null until at least one peer has
+                    // announced its height (see WebAdminServer's own
+                    // comment on why null rather than a misleading 0%).
+                    const syncEl = document.getElementById("sync-percent");
+                    if (data.syncPercent === null) {
+                        syncEl.textContent = "Waiting for peers...";
+                    } else {
+                        syncEl.textContent = data.syncPercent + "% (block "
+                            + data.blockHeight + " of " + data.networkHeight + ")";
+                    }
                     document.getElementById("db-size").textContent = data.dbSizeGB + " GB";
                 } catch (e) {
                     document.getElementById("uptime").textContent = "Unavailable";
