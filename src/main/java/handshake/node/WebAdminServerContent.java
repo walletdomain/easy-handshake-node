@@ -50,17 +50,8 @@ public final class WebAdminServerContent {
 
                         <section class="card">
                             <h2>Configuration</h2>
-                            <p class="hint">Changes to network, ports, or host require a restart to take effect.</p>
+                            <p class="hint">Changes to ports or host require a restart to take effect.</p>
                             <form id="config-form">
-                                <label>
-                                    Network
-                                    <select name="network">
-                                        <option value="mainnet">mainnet</option>
-                                        <option value="testnet">testnet</option>
-                                        <option value="regtest">regtest</option>
-                                        <option value="simnet">simnet</option>
-                                    </select>
-                                </label>
                                 <label>
                                     P2P port
                                     <input type="number" name="p2p.port" min="1" max="65535">
@@ -72,10 +63,6 @@ public final class WebAdminServerContent {
                                 <label>
                                     RPC host
                                     <input type="text" name="rpc.host">
-                                </label>
-                                <label class="checkbox">
-                                    <input type="checkbox" name="index.tx">
-                                    Index transactions (needed for getrawtransaction lookups by hash)
                                 </label>
                                 <button type="submit">Save</button>
                             </form>
@@ -747,11 +734,9 @@ public final class WebAdminServerContent {
                 try {
                     const res = await fetch("/api/config");
                     const data = await res.json();
-                    form.elements["network"].value = data["network"];
                     form.elements["p2p.port"].value = data["p2p.port"];
                     form.elements["rpc.port"].value = data["rpc.port"];
                     form.elements["rpc.host"].value = data["rpc.host"];
-                    form.elements["index.tx"].checked = data["index.tx"] === true;
                 } catch (e) {
                     document.getElementById("config-message").textContent = "Failed to load current configuration.";
                     document.getElementById("config-message").className = "error";
@@ -766,11 +751,9 @@ public final class WebAdminServerContent {
                 message.className = "";
 
                 const payload = {
-                    "network": form.elements["network"].value,
                     "p2p.port": Number(form.elements["p2p.port"].value),
                     "rpc.port": Number(form.elements["rpc.port"].value),
-                    "rpc.host": form.elements["rpc.host"].value,
-                    "index.tx": form.elements["index.tx"].checked
+                    "rpc.host": form.elements["rpc.host"].value
                 };
 
                 try {

@@ -1,6 +1,5 @@
 package handshake.node;
 
-import org.h2.mvstore.MVMap;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -8,13 +7,13 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * PeerScorecard — tracks peer quality and manages connection backoffs.
-    * <p>
+ * <p>
  * Persists through ConfigDB's real "peerScores" map (recovered from an
  * earlier version of this project) instead of ChainDB. That real format
  * is comma-delimited:
-    * <p>
+ * <p>
  *   score,f1,failureCount,f3,successCount,backoffLevel,t1,t2,t3,height,agent
-    * <p>
+ * <p>
  * Field meanings below are a mix of confirmed and inferred -- see the
  * project notes for the methodology. CONFIRMED (clear, unambiguous
  * pattern across all 30 real entries): score (field 0, strictly 0/50/100),
@@ -29,12 +28,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * or guessed meaning -- they're preserved verbatim on read-modify-write
  * (as extra1/extra3) rather than dropped, since discarding unknown data
  * on every save would silently destroy whatever they represent.
-    * <p>
+ * <p>
  * backoffUntil doesn't appear in the real 11-field format at all (it's
  * presumably computed live rather than persisted in whatever app wrote
  * this data). It's appended here as a 12th field on write; reading
  * tolerates both the original 11-field format and this extended one.
-    * <p>
+ * <p>
  * Design principles (unchanged from before):
  *   - Seeds are NEVER permanently blacklisted — max 30min backoff
  *   - Discovered peers can be blacklisted but reset on restart
@@ -180,7 +179,7 @@ public class PeerScorecard {
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final ConcurrentHashMap<String, PeerRecord> cache = new ConcurrentHashMap<>();
-    private MVMap<String, String> peerScoresMap;
+    private KVMap<String, String> peerScoresMap;
 
     private PeerScorecard() {}
 
@@ -196,7 +195,7 @@ public class PeerScorecard {
             cache.put(e.getKey(), PeerRecord.fromStorage(e.getKey(), e.getValue()));
             loaded++;
         }
-        System.out.printf("[PeerScore] Loaded %d peer records from config_mv.db.%n", loaded);
+        System.out.printf("[PeerScore] Loaded %d peer records from the config database.%n", loaded);
         resetAllBackoffs();
     }
 
@@ -325,7 +324,7 @@ public class PeerScorecard {
      * lifetime -- distinct from the existing temporary backoff, which is
      * meant for peers that are merely unreliable or currently
      * unreachable. A ban is reserved for signals strong enough that a
-     * genuinely honest, correctly-functioning node could not plausibly
+     * genuinely honest, correctly-functioning validator could not plausibly
      * have produced them -- invalid proof-of-work being the clearest
      * example, since any honest relay verifies PoW before ever
      * forwarding a header. A single chain-link mismatch, by contrast,

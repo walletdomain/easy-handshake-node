@@ -1,8 +1,5 @@
 package handshake.node;
 
-import org.h2.mvstore.MVMap;
-import org.h2.mvstore.MVStore;
-
 import java.io.File;
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -53,21 +50,21 @@ public class ChainDB {
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    private final MVStore                  store;
-    private final MVMap<Long,   byte[]>    headers;
-    private final MVMap<Long,   byte[]>    blocks;
-    private final MVMap<Long,   byte[]>    chainwork;
-    private final MVMap<String, String>    utxos;
-    private final MVMap<String, String>    names;
-    private final MVMap<String, String>    meta;
-    private final MVMap<String, String>    peers;
+    private final KVStore                  store;
+    private final KVMap<Long,   byte[]>    headers;
+    private final KVMap<Long,   byte[]>    blocks;
+    private final KVMap<Long,   byte[]>    chainwork;
+    private final KVMap<String, String>    utxos;
+    private final KVMap<String, String>    names;
+    private final KVMap<String, String>    meta;
+    private final KVMap<String, String>    peers;
     /** Real header hash (hex) -> height. Needed to resolve a peer's
      *  GETHEADERS locator to a height without a linear scan over the
      *  whole chain (which would be up to 32 locator hashes x hundreds
      *  of thousands of headers per request). */
-    private final MVMap<String, Long>      hashIndex;
+    private final KVMap<String, Long>      hashIndex;
     /** Content-addressed Urkel tree node storage -- see UrkelNodeStore. */
-    private final MVMap<String, byte[]>    urkelNodes;
+    private final KVMap<String, byte[]>    urkelNodes;
 
     /** The Urkel name tree, tracking every name's tree-committed state
      *  across blocks -- now persisted to disk (via urkelNodes) after
@@ -78,6 +75,15 @@ public class ChainDB {
 
     public UrkelNameTree getNameTree() { return nameTree; }
 
+    /** Result of persistNameTreeState()'s two conceptually distinct
+     *  phases, split out specifically to answer a real question: when
+     *  "persist" dominates per-block timing, is it the per-block
+     *  write-new-nodes walk (persistBlockNanos), or the commit/prune-
+     *  submission step (maybeCommitNanos) -- which should be near-
+     *  instant now that the prune itself runs on its own background
+     *  thread, not inline here. */
+    public record PersistTiming(long persistBlockNanos, long maybeCommitNanos) {}
+
     /** Call once per block, after every covenant in that block has
      *  already been applied via getNameTree().applyNameState() --
      *  persists any newly created tree nodes, then advances the
@@ -86,47 +92,76 @@ public class ChainDB {
      *  pointers get written to meta immediately, not just held in
      *  memory, so a restart at any point resumes from exactly here. */
     public void persistNameTreeState(int height) {
+        persistNameTreeStateTimed(height);
+    }
+
+    /** Same as persistNameTreeState(), but returns a breakdown of
+     *  where the time actually went -- see PersistTiming's own comment
+     *  for why this distinction matters. */
+    public PersistTiming persistNameTreeStateTimed(int height) {
+        long t0 = System.nanoTime();
         nameTree.persistBlock();
         meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
+        long t1 = System.nanoTime();
 
         if (nameTree.maybeCommit(height)) {
             meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
         }
+        long t2 = System.nanoTime();
+
+        return new PersistTiming(t1 - t0, t2 - t1);
     }
 
     private ChainDB(String path) {
-        new File(path).getParentFile().mkdirs();
-        this.store     = new MVStore.Builder()
-                .fileName(path)
-                .compress()
-                .open();
-        // MVStore is versioned/copy-on-write: overwriting or clearing a
-        // key doesn't erase the old bytes in place, it writes a new
-        // chunk and leaves the old one on disk until compaction reclaims
-        // it. This project used to force retentionTime(0) here to
-        // reclaim that space more aggressively (see compact() below,
-        // which still does the real work of reclaiming it) -- but
-        // retentionTime(0) turned out to be a real, documented H2 risk,
-        // not just a performance tradeoff: with retention at 0, H2 can
-        // reuse a chunk's blocks while the chunk map written at close
-        // still references that chunk, which can leave the file
-        // requiring a very slow (or effectively stuck) recovery scan on
-        // the next open, or refusing to open at all -- confirmed
-        // directly against H2's own issue tracker, and consistent with
-        // a real hang observed here after an unclean shutdown. Left at
-        // H2's own default (45 seconds) now; periodic compact() calls
-        // still reclaim the same disk space this was originally added
-        // for, just without that risk.
+        this(path, false);
+    }
 
-        this.headers   = store.openMap("headers");
-        this.blocks    = store.openMap("blocks");
-        this.chainwork = store.openMap("chainwork");
-        this.utxos     = store.openMap("utxos");
-        this.names     = store.openMap("names");
-        this.meta      = store.openMap("meta");
-        this.peers     = store.openMap("peers");
-        this.hashIndex = store.openMap("hashIndex");
-        this.urkelNodes = store.openMap("urkelNodes");
+    /** readOnly=true is for standalone diagnostic tools specifically --
+     *  confirmed safe, via a real compile-and-run test against the
+     *  actual RocksDB API, to open even while the real, live node is
+     *  running and actively writing to the SAME database: RocksDB's
+     *  single-writer lock only applies to read-write handles, and its
+     *  dedicated read-only mode exists precisely so a separate tool can
+     *  inspect a live database's current state without needing the
+     *  running node to be stopped first. Deliberately does NOT touch
+     *  the instance singleton field at all -- this returns a fresh,
+     *  independent object, so a diagnostic tool using this can never
+     *  collide with, or accidentally substitute for, the real node's
+     *  own ChainDB.open()/get() singleton if it happens to run in the
+     *  same process for any reason. */
+    public static ChainDB openReadOnly(String path) {
+        return new ChainDB(path, true);
+    }
+
+    private ChainDB(String path, boolean readOnly) {
+        // Switched from MVStoreKVStore to RocksDBKVStore -- see
+        // RocksDBKVStore's own class comment, and RocksDBKVMap's
+        // runExclusiveOfCompaction() comment specifically, for the
+        // full reasoning: MVStore's B-tree/chunk-based design meant a
+        // long-running reachability walk could have the exact chunk
+        // it was reading physically reorganized out from under it by
+        // concurrent compaction, a real, repeatedly observed failure
+        // ("Chunk ... not found") that survived three different,
+        // progressively more targeted attempts to fix within MVStore's
+        // own concurrency model. RocksDB's LSM-tree design and native
+        // snapshot isolation eliminate that entire class of problem
+        // structurally, confirmed directly via a real compile-and-run
+        // test against the actual RocksDB API, not just by reasoning
+        // about it. This one line is deliberately the only place that
+        // concrete choice is made -- everything else in this class,
+        // and every one of its own callers, goes through the
+        // KVStore/KVMap interfaces and needed zero other changes.
+        this.store = new RocksDBKVStore(path, readOnly);
+
+        this.headers   = store.openLongBytesMap("headers");
+        this.blocks    = store.openLongBytesMap("blocks");
+        this.chainwork = store.openLongBytesMap("chainwork");
+        this.utxos     = store.openStringStringMap("utxos");
+        this.names     = store.openStringStringMap("names");
+        this.meta      = store.openStringStringMap("meta");
+        this.peers     = store.openStringStringMap("peers");
+        this.hashIndex = store.openStringLongMap("hashIndex");
+        this.urkelNodes = store.openStringBytesMap("urkelNodes");
 
         UrkelNodeStore nodeStore = new UrkelNodeStore(urkelNodes);
         byte[] persistedLiveRoot = fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT));
@@ -135,6 +170,16 @@ public class ChainDB {
     }
 
     public void close() {
+        // FIX: must wait for any in-progress background prune to
+        // actually finish BEFORE closing the underlying store --
+        // confirmed via a real, caught MVStoreException that a prune
+        // still running past this point hits when the file it's
+        // reading from gets closed out from under it. See
+        // UrkelNameTree.shutdownPruning()'s own comment for the full
+        // reasoning.
+        if (nameTree != null) {
+            nameTree.shutdownPruning();
+        }
         store.close();
     }
 
@@ -151,17 +196,20 @@ public class ChainDB {
      * (that's compaction's job specifically). Time-bounded rather than a
      * single unbounded pass, so a periodic call from ChainSync can't
      * stall block/header processing for an unpredictable length of time.
+     * The synchronization this used to need against the background
+     * prune's own store manipulation now lives inside MVStoreKVStore
+     * itself, since both are engine-specific concerns.
      */
     public void compact(int maxMillis) {
-        store.compactFile(maxMillis);
+        store.compact(maxMillis);
     }
 
     public String getPath() {
-        return store.getFileStore().getFileName();
+        return store.getFileName();
     }
 
     public long getDiskSizeBytes() {
-        return new File(store.getFileStore().getFileName()).length();
+        return store.getDiskSizeBytes();
     }
 
     // ── Header operations ─────────────────────────────────────────────────────
@@ -288,7 +336,7 @@ public class ChainDB {
         // of data at once, give compaction a real, larger time budget
         // right away rather than waiting for the next periodic call --
         // this is exactly the moment the most disk space is reclaimable.
-        store.compactFile(30_000);
+        store.compact(30_000);
         System.out.println("[ChainDB] Full reset complete.");
     }
 
@@ -539,7 +587,7 @@ public class ChainDB {
     }
 
     public java.util.Map<String, String> getAllPeers() {
-        return java.util.Collections.unmodifiableMap(peers);
+        return peers.asUnmodifiableMap();
     }
 
     // ── Meta operations ───────────────────────────────────────────────────────

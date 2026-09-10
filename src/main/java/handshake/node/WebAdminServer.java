@@ -52,17 +52,16 @@ public class WebAdminServer {
      *  here -- max.outbound, index.address, and log.level are all
      *  currently stored but not consulted by anything in the codebase,
      *  so exposing them as "editable" would silently mislead: they'd
-     *  appear to save successfully while having zero real effect. */
+     *  appear to save successfully while having zero real effect.
+     *  "network" and "index.tx" used to be here too -- see
+     *  NodeConfig.getNetwork()/indexTx()'s own comments for why they're
+     *  now hardcoded rather than editable at all. */
     private static final Set<String> EDITABLE_KEYS = Set.of(
-            "network", "p2p.port", "rpc.port", "rpc.host", "index.tx"
+            "p2p.port", "rpc.port", "rpc.host"
     );
 
     private static final Set<String> REQUIRES_RESTART = Set.of(
-            "network", "p2p.port", "rpc.port", "rpc.host"
-    );
-
-    private static final Set<String> VALID_NETWORKS = Set.of(
-            "mainnet", "testnet", "regtest", "simnet"
+            "p2p.port", "rpc.port", "rpc.host"
     );
 
     private final NodeConfig config;
@@ -411,11 +410,9 @@ public class WebAdminServer {
         try {
             if (ex.getRequestMethod().equals("GET")) {
                 StringBuilder sb = new StringBuilder("{");
-                sb.append("\"network\":\"").append(jsonEscape(config.getNetwork())).append("\",");
                 sb.append("\"p2p.port\":").append(config.getP2pPort()).append(",");
                 sb.append("\"rpc.port\":").append(config.getRpcPort()).append(",");
-                sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\",");
-                sb.append("\"index.tx\":").append(config.indexTx());
+                sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\"");
                 sb.append("}");
                 respondJson(ex, 200, sb.toString());
                 return;
@@ -469,8 +466,6 @@ public class WebAdminServer {
      *  only surface as a confusing failure on next restart. */
     private String validate(String key, String value) {
         return switch (key) {
-            case "network" -> VALID_NETWORKS.contains(value) ? null
-                    : "network must be one of: mainnet, testnet, regtest, simnet";
             case "p2p.port", "rpc.port" -> {
                 try {
                     int port = Integer.parseInt(value);
@@ -480,8 +475,6 @@ public class WebAdminServer {
                 }
             }
             case "rpc.host" -> value.isBlank() ? "Host cannot be empty" : null;
-            case "index.tx" -> (value.equals("true") || value.equals("false")) ? null
-                    : "index.tx must be true or false";
             default -> "Unknown key";
         };
     }

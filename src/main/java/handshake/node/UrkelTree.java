@@ -31,6 +31,21 @@ public class UrkelTree {
         this.nodeStore = nodeStore;
     }
 
+    /** Exposes a point-in-time key snapshot from the configured node
+     *  store -- see UrkelNodeStore.snapshotKeys()'s own comment for
+     *  what this is for. Callers (specifically UrkelNameTree.
+     *  maybeCommit()) need to capture this SYNCHRONOUSLY, at the same
+     *  instant as the committed root itself, and BEFORE submitting the
+     *  actual prune to a background thread -- see
+     *  pruneUnreachableFrom()'s own comment for the full reasoning on
+     *  why that timing specifically matters and is not just a style
+     *  preference. Empty set (not null, not an exception) if no node
+     *  store is configured, matching pruneUnreachableFrom()'s own
+     *  no-op-when-unconfigured behavior. */
+    public java.util.Set<UrkelNodeStore.HashKey> snapshotStoreKeys() {
+        return nodeStore == null ? java.util.Set.of() : nodeStore.snapshotKeys();
+    }
+
     /** Resolves a node if it's a lazy Hash placeholder, otherwise
      *  returns it unchanged. Called at the top of every traversal step
      *  so a placeholder anywhere in the tree gets transparently
@@ -213,9 +228,10 @@ public class UrkelTree {
         return UrkelNode.Null.NIL;
     }
 
-    /** Walks from a given root, collecting the hex-encoded hash of
-     *  every Internal/Leaf node reachable from it into out -- the
-     *  companion operation to persistFrom(): where that writes
+    /** Walks from a given root, collecting the compact hash key (see
+     *  UrkelNodeStore.HashKey's own comment for why this isn't a hex
+     *  String) of every Internal/Leaf node reachable from it into out --
+     *  the companion operation to persistFrom(): where that writes
      *  everything new since the last call, this identifies everything
      *  still actually needed, for a caller that wants to prune anything
      *  else from the node store. Stops descending into an already-
@@ -223,10 +239,10 @@ public class UrkelTree {
      *  copy-on-write updates) rather than re-walking it, and resolves
      *  Hash placeholders through the node store exactly like normal
      *  traversal does. */
-    public void collectReachable(UrkelNode node, java.util.Set<String> out) {
+    public void collectReachable(UrkelNode node, java.util.Set<UrkelNodeStore.HashKey> out) {
         if (node.isNull()) return;
         node = resolve(node);
-        String key = UrkelNodeStore.hex(node.hash());
+        UrkelNodeStore.HashKey key = new UrkelNodeStore.HashKey(node.hash());
         if (!out.add(key)) return; // already visited this subtree
 
         if (node.isInternal()) {
@@ -237,16 +253,88 @@ public class UrkelTree {
         // Leaf nodes have no children to descend into.
     }
 
+    /** Result of a prune pass, broken down by phase -- the walk
+     *  (collectReachable(), resolving every still-needed node) and the
+     *  removal (nodeStore.pruneUnreachable(), deleting everything
+     *  else) are quite different operations with very different cost
+     *  profiles, and only measuring them separately can actually show
+     *  which one (if either) is the real bottleneck rather than just a
+     *  single combined number. */
+    public record PruneResult(int removed, long walkMillis, long removeMillis) {}
+
     /** Convenience: collects everything reachable from root, then
      *  removes everything else from the configured node store. No-op
-     *  (returns 0) if no node store is configured. See
-     *  UrkelNodeStore.pruneUnreachable() for the full reasoning on
-     *  safety and why this exists. */
-    public int pruneUnreachableFrom(UrkelNode root) {
-        if (nodeStore == null) return 0;
-        java.util.Set<String> reachable = new java.util.HashSet<>();
-        collectReachable(root, reachable);
-        return nodeStore.pruneUnreachable(reachable);
+     *  (0 removed, 0ms either phase) if no node store is configured.
+     *  See UrkelNodeStore.pruneUnreachable() for the full reasoning on
+     *  safety and why this exists.
+     *
+     *  FIX: this can now run on a background thread while the main
+     *  thread keeps mutating the LIVE tree and persisting brand-new
+     *  nodes concurrently (see UrkelNameTree.maybeCommit()'s own
+     *  comment for why that's safe for the walk itself). But it is
+     *  NOT automatically safe for the removal step: that step used to
+     *  compare against nodeStore's CURRENT key set at removal time,
+     *  which -- given the walk alone takes 66-97+ seconds, during
+     *  which the main thread keeps persisting new nodes from LATER
+     *  blocks the whole time -- would include keys that didn't exist
+     *  yet when this root was snapshotted. Those newer keys are
+     *  correctly absent from `reachable` (which only reflects THIS
+     *  root), so comparing against the live key set would have
+     *  incorrectly treated brand-new, genuinely-needed data as
+     *  orphaned.
+     *
+     *  SECOND, MORE SERIOUS FIX: the key snapshot must now be passed in
+     *  by the caller, captured SYNCHRONOUSLY at the same moment as
+     *  `root` itself (see UrkelNameTree.maybeCommit(), which now does
+     *  exactly this) -- this method previously called
+     *  nodeStore.snapshotKeys() itself, internally, which sounds
+     *  equivalent but isn't: this whole method only runs inside the
+     *  background executor's task, submitted asynchronously from
+     *  maybeCommit(). The scheduling delay between submission and the
+     *  executor actually starting the task is itself a real window --
+     *  during it, the main thread keeps processing blocks and
+     *  persisting brand-new, not-yet-committed nodes to disk. A key
+     *  snapshot taken AFTER that delay would incorrectly include those
+     *  newer nodes (since they're already on disk by then), but they
+     *  are NOT reachable from `root` (an older, already-fixed committed
+     *  root that predates them) -- so they would be wrongly treated as
+     *  orphaned and deleted, even though the live tree still needs them
+     *  and will need them again at the very next commit. Confirmed as
+     *  a real, reproducible bug via a direct test (apply the same
+     *  covenant sequence two ways -- straight through, and with a
+     *  close/reopen restart injected partway through -- and compare the
+     *  resulting committed roots) before this fix, and confirmed fixed
+     *  by the same test afterward. Capturing keySnapshot at the same
+     *  synchronous instant as `root` closes this precisely the way the
+     *  original comment already intended for the walk's own duration,
+     *  just correctly extended to cover the submission delay too.
+     *
+     *  FIX: the ENTIRE walk-then-remove now runs under
+     *  runExclusiveOfCompaction() -- confirmed via a real, repeatedly
+     *  observed "Chunk ... not found" error that persisted even after
+     *  raising MVStore's retention time well beyond any observed walk
+     *  duration, ruling out "walk simply outlasted retention" as the
+     *  (sole) cause. compactFile() doesn't just reclaim old, dead
+     *  versions after retention expires -- it actively defragments the
+     *  file, physically moving and renumbering live chunks, which can
+     *  invalidate a chunk the walk is mid-read on regardless of
+     *  retention timing. Only the removal phase was ever protected
+     *  against this before; the walk itself, despite being the longer
+     *  of the two phases, never was. */
+    public PruneResult pruneUnreachableFrom(UrkelNode root, java.util.Set<UrkelNodeStore.HashKey> keySnapshot) {
+        if (nodeStore == null) return new PruneResult(0, 0, 0);
+        return nodeStore.runExclusiveOfCompaction(() -> {
+            long walkStart = System.currentTimeMillis();
+            java.util.Set<UrkelNodeStore.HashKey> reachable = new java.util.HashSet<>();
+            collectReachable(root, reachable);
+            long walkMillis = System.currentTimeMillis() - walkStart;
+
+            long removeStart = System.currentTimeMillis();
+            int removed = nodeStore.pruneUnreachable(keySnapshot, reachable);
+            long removeMillis = System.currentTimeMillis() - removeStart;
+
+            return new PruneResult(removed, walkMillis, removeMillis);
+        });
     }
 
     /** Builds a proof for a key against an explicit root node, rather
@@ -290,10 +378,41 @@ public class UrkelTree {
      *  otherwise permanently lose any tree changes made between the
      *  last persist and the restart. No-op if no node store is
      *  configured (pure in-memory use, e.g. most of this class's own
-     *  tests). */
+     *  tests).
+     *
+     *  FIX: previously called nodeStore.put() individually for every
+     *  single new node during the walk -- confirmed via direct
+     *  benchmarking as a real, measured cost: persistBlock() became
+     *  the dominant per-block processing cost (up to ~80% of total
+     *  time) in real, high-covenant-volume ranges of the chain, since
+     *  every new node write was a separate round-trip. Now collects
+     *  every not-yet-persisted node during the walk first, then writes
+     *  them all as a single batched operation (see UrkelNodeStore.
+     *  putAll() / KVMap.putAll()) -- the same technique already proven
+     *  to give a dramatic (~18x) speedup for the prune's own bulk
+     *  removal path. Each node is marked persisted=true DURING the
+     *  walk itself (unchanged from before), both to correctly avoid
+     *  re-descending into or re-collecting an already-visited subtree
+     *  within this same call, and to keep the walk's own O(what
+     *  changed) cost profile -- but if the batch write itself then
+     *  fails, every node just marked is rolled back to persisted=false
+     *  before the exception propagates, preserving the exact same
+     *  safe-to-retry guarantee the old per-node approach had: nothing
+     *  is ever left incorrectly marked as durable when it isn't. */
     public void persistFrom(UrkelNode node) {
         if (nodeStore == null) return;
-        persist(node);
+        java.util.List<UrkelNode> toWrite = new java.util.ArrayList<>();
+        collectUnpersisted(node, toWrite);
+        if (toWrite.isEmpty()) return;
+        try {
+            nodeStore.putAll(toWrite);
+        } catch (RuntimeException e) {
+            for (UrkelNode n : toWrite) {
+                if (n.isInternal()) ((UrkelNode.Internal) n).persisted = false;
+                else if (n.isLeaf()) ((UrkelNode.Leaf) n).persisted = false;
+            }
+            throw e;
+        }
     }
 
     /** Convenience: persists from the tree's current live root. */
@@ -301,16 +420,16 @@ public class UrkelTree {
         persistFrom(root);
     }
 
-    private void persist(UrkelNode node) {
+    private void collectUnpersisted(UrkelNode node, java.util.List<UrkelNode> out) {
         if (node.isHash()) return; // already on disk by definition
         if (node.isNull()) return; // nothing to store for an empty subtree
 
         if (node.isInternal()) {
             UrkelNode.Internal in = (UrkelNode.Internal) node;
             if (in.persisted) return; // this node and everything under it is already saved
-            persist(in.left);
-            persist(in.right);
-            nodeStore.put(in);
+            collectUnpersisted(in.left, out);
+            collectUnpersisted(in.right, out);
+            out.add(in);
             in.persisted = true;
             return;
         }
@@ -318,7 +437,7 @@ public class UrkelTree {
         // Leaf
         UrkelNode.Leaf lf = (UrkelNode.Leaf) node;
         if (lf.persisted) return;
-        nodeStore.put(lf);
+        out.add(lf);
         lf.persisted = true;
     }
 

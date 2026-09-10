@@ -43,6 +43,47 @@ public class BlockProcessor {
     private static final int COV_FINALIZE = TxParser.COV_FINALIZE;
     private static final int COV_REVOKE   = TxParser.COV_REVOKE;
 
+    // ── Per-phase timing diagnostics ────────────────────────────────────────
+    // Direct measurement rather than inferring from GC log patterns: a
+    // real, observed slowdown (down to ~2.7 seconds/block) persisted even
+    // after fixing GC pause times with a larger heap, meaning something
+    // OTHER than GC pausing itself is consuming the time. These
+    // accumulate across blocks and get logged (then reset) every 100
+    // blocks, matching ChainSync's own existing log cadence, so this
+    // gives a direct breakdown of where time actually goes without
+    // flooding the log with a line per block.
+    private static long sigVerifyNanos = 0;
+    private static long utxoBookkeepingNanos = 0;
+    private static long covenantProcessingNanos = 0;
+    // Split into its two constituent phases -- see
+    // ChainDB.PersistTiming's own comment for why this distinction
+    // matters: persist was consistently the dominant cost even in
+    // windows with no logged background prune activity at all, and
+    // the combined number alone couldn't say whether that was the
+    // per-block write-new-nodes walk (persistBlockNanos) or the
+    // commit/prune-submission step (maybeCommitNanos, which should be
+    // near-instant now that the prune itself runs off-thread).
+    private static long persistBlockNanos = 0;
+    private static long maybeCommitNanos = 0;
+    private static int blocksSinceTimingLog = 0;
+
+    private static void logTimingIfDue(int height) {
+        blocksSinceTimingLog++;
+        if (blocksSinceTimingLog < 100) return;
+        System.out.printf("[BlockProcessor] Timing over last %d blocks (ending height %d): "
+                        + "sigVerify=%.1fs utxoBookkeeping=%.1fs covenantProcessing=%.1fs "
+                        + "persistBlock=%.1fs maybeCommit=%.1fs%n",
+                blocksSinceTimingLog, height,
+                sigVerifyNanos / 1e9, utxoBookkeepingNanos / 1e9, covenantProcessingNanos / 1e9,
+                persistBlockNanos / 1e9, maybeCommitNanos / 1e9);
+        sigVerifyNanos = 0;
+        utxoBookkeepingNanos = 0;
+        covenantProcessingNanos = 0;
+        persistBlockNanos = 0;
+        maybeCommitNanos = 0;
+        blocksSinceTimingLog = 0;
+    }
+
     /**
      * Processes a raw block at the given height, updating UTXO set and
      * name state. Returns false if the block's merkle root doesn't match
@@ -52,14 +93,40 @@ public class BlockProcessor {
      * verification exists to catch, the same category as invalid PoW: a
      * signal an honest peer could never legitimately produce).
      */
-    public static boolean process(byte[] rawBlock, int height,
-                                  ChainDB db, Mempool mempool) {
+    /** VALID: block fully, correctly applied -- safe to save and advance
+     *  the tip past. REJECTED: a genuine consensus violation (bad
+     *  merkle root, failed signature) -- the peer that sent this is at
+     *  fault and should be banned. INTERNAL_ERROR: something in OUR OWN
+     *  processing broke (a bug, a storage error) that has nothing to do
+     *  with what the peer actually sent -- must not advance the tip
+     *  past it (this height needs to be retried, not silently treated
+     *  as done), but banning the peer over our own bug would be wrong
+     *  and could end up banning every peer we ever sync from if the
+     *  same internal issue recurs. Previously this whole distinction
+     *  didn't exist: process() returned a single boolean that meant
+     *  "advance the tip" and nothing else, so an unexpected internal
+     *  exception was either (a) silently treated as fully valid (the
+     *  original bug) or (b) indistinguishable from a real peer-fault
+     *  rejection (a smaller, but still real, follow-on problem). */
+    public enum Result { VALID, REJECTED, INTERNAL_ERROR }
+
+    public static Result process(byte[] rawBlock, int height,
+                                 ChainDB db, Mempool mempool) {
         try {
-            return processInternal(rawBlock, height, db, mempool);
+            return processInternal(rawBlock, height, db, mempool)
+                    ? Result.VALID : Result.REJECTED;
         } catch (Exception e) {
-            System.err.printf("[BlockProcessor] Error at height %d: %s%n",
-                    height, e.getMessage());
-            return true; // an unexpected parsing error isn't a merkle violation
+            // Confirmed via a real, observed "Chunk ... not found"
+            // MVStore error landing exactly on 36-block tree-commit
+            // boundaries (the one place persistNameTreeState()'s new
+            // node-store pruning runs) -- an exception THERE means the
+            // tree's on-disk state may be incomplete or inconsistent
+            // for this height. This is categorically an internal
+            // failure, not evidence the peer sent us anything invalid.
+            System.err.printf("[BlockProcessor] Internal error at height %d: %s -- "
+                    + "NOT advancing past it (will be retried), and NOT blaming "
+                    + "whichever peer happened to send it%n", height, e.getMessage());
+            return Result.INTERNAL_ERROR;
         }
     }
 
@@ -142,6 +209,7 @@ public class BlockProcessor {
             // perfectly valid, real blocks that every other real hsd
             // validator accepts.
             if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
+                long sigStart = System.nanoTime();
                 for (int i = 0; i < tx.inputs.size(); i++) {
                     TxParser.Input input = tx.inputs.get(i);
                     ChainDB.UtxoEntry spentUtxo = db.getUtxo(input.prevTxid, input.prevIndex);
@@ -155,6 +223,7 @@ public class BlockProcessor {
                         return false;
                     }
                 }
+                sigVerifyNanos += System.nanoTime() - sigStart;
             }
 
             // Isolated per-transaction: previously an exception in ANY
@@ -165,6 +234,7 @@ public class BlockProcessor {
             // problem with one transaction's covenant data shouldn't cost
             // the rest of a perfectly valid block.
             try {
+                long utxoStart = System.nanoTime();
                 // Step 1: Remove spent UTXOs
                 if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
                     for (TxParser.Input input : tx.inputs) {
@@ -188,11 +258,25 @@ public class BlockProcessor {
                             height
                     );
                     db.saveUtxo(txid, i, utxo);
+                    utxoBookkeepingNanos += System.nanoTime() - utxoStart;
 
-                    // Step 3: Update name state for covenant outputs
+                    // Step 3: Update name state for covenant outputs --
+                    // timed SEPARATELY from raw UTXO bookkeeping above,
+                    // specifically because this is what actually
+                    // touches the live, in-memory Urkel tree
+                    // (insert()/remove() per name), which may need to
+                    // resolve() Hash placeholders for parts of the tree
+                    // this run hasn't touched yet since the last
+                    // restart -- a real, different cost than simple
+                    // UTXO map reads/writes, and one worth being able
+                    // to see on its own rather than folded into a
+                    // single combined number.
                     if (out.covenant != null && out.covenant.type != COV_NONE) {
+                        long covenantStart = System.nanoTime();
                         processNameCovenant(out, txid, i, height, db);
+                        covenantProcessingNanos += System.nanoTime() - covenantStart;
                     }
+                    utxoStart = System.nanoTime();
                 }
             } catch (Exception e) {
                 System.err.printf("[BlockProcessor] Error processing tx %s at height %d: %s "
@@ -208,7 +292,10 @@ public class BlockProcessor {
         // has already been applied above. Persisting every block, not
         // just at commit boundaries, is required for correctness
         // across a restart (see UrkelNameTree's own class comment).
-        db.persistNameTreeState(height);
+        ChainDB.PersistTiming timing = db.persistNameTreeStateTimed(height);
+        persistBlockNanos += timing.persistBlockNanos();
+        maybeCommitNanos += timing.maybeCommitNanos();
+        logTimingIfDue(height);
 
         // Step 4: Evict confirmed transactions from mempool
         if (mempool != null) {

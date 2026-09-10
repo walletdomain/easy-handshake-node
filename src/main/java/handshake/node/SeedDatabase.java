@@ -1,6 +1,5 @@
 package handshake.node;
 
-import org.h2.mvstore.MVMap;
 
 import java.util.Collections;
 import java.util.List;
@@ -10,14 +9,14 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * SeedDatabase — loads known Handshake seed nodes from ConfigDB's real
  * "seeds" map (recovered from an earlier version of this project),
  * replacing the previous hardcoded-in-Java list.
-    * <p>
+ * <p>
  * Real format found in the recovered data: for a key = ip, the value is
  *   brontideKey|port|source|<blank 4th field, meaning unconfirmed>|isBuiltin
  * A separate tombstone convention also exists: a key "deleted:<ip>" with
  * value "true" marks a seed as permanently removed (distinct from
  * PeerScorecard's temporary backoff) -- entries with such a tombstone
  * are skipped on load.
-    * <p>
+ * <p>
  * Design principles (unchanged from before):
  *   - Seeds are NEVER permanently blacklisted by THIS class — only
  *     temporarily backed off, and that's PeerScorecard's job, not this
@@ -35,8 +34,8 @@ public class SeedDatabase {
     // ── Seed record ───────────────────────────────────────────────────────────
 
     /**
-     * A known seed node.
-        * <p>
+     * A known seed validator.
+     * <p>
      * @param brontideKey  Base32-encoded compressed secp256k1 public key (33 bytes)
      *                     Empty string for cleartext-only peers (port 12038)
      * @param ip           IPv4 or IPv6 address
@@ -104,7 +103,7 @@ public class SeedDatabase {
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    private final MVMap<String, String> seedsMap;
+    private final KVMap<String, String> seedsMap;
     private final List<Seed> seeds = new CopyOnWriteArrayList<>();
 
     private SeedDatabase() {
@@ -134,7 +133,7 @@ public class SeedDatabase {
             seeds.add(Seed.fromStorage(ip, entry.getValue()));
             loaded++;
         }
-        System.out.printf("[SeedDB] Loaded %d seeds from config_mv.db (%d tombstoned/skipped).%n",
+        System.out.printf("[SeedDB] Loaded %d seeds from the config database (%d tombstoned/skipped).%n",
                 loaded, skippedDeleted);
     }
 
@@ -145,11 +144,11 @@ public class SeedDatabase {
     // ── Bootstrap seeds ───────────────────────────────────────────────────────
     //
     // Used ONLY to populate the "seeds" map on a genuinely fresh install
-    // (empty map, no config_mv.db carried over). Without this, a first-run
-    // node would load zero seeds from an empty DB and have no way to ever
+    // (empty map, no existing config database carried over). Without this, a first-run
+    // validator would load zero seeds from an empty DB and have no way to ever
     // discover its first peer -- ChainSync only dials from
     // getBrontideSeeds(), and PeerDiscovery starts empty too. These are the
-    // same 10 real, verified entries recovered from a working config_mv.db
+    // same 10 real, verified entries recovered from a working config database
     // (the 3 that database had explicitly marked "deleted:<ip>" -- found
     // to be bad in production -- are deliberately excluded here too).
     private static final List<Seed> BOOTSTRAP_SEEDS = List.of(
@@ -162,7 +161,7 @@ public class SeedDatabase {
             new Seed("aoihqqagbhzz6wxg43itefqvmgda4uwtky362p22kbimcyg5fdp54", "172.104.214.189", 44806, "seed-2", true),
             new Seed("aiwykdz37okry3pb2lzdsgbxeg72uky2zckxmiapzstpqqmb2hnge", "35.154.209.88", 44806, "handshake-micro-grants", true),
             new Seed("ap5vuwabzwyz6akhesanada4skhetd2jsvpkwuqxzuaoovn5ez4xg", "45.79.134.225", 44806, "seed-1", true),
-            new Seed("anbwqus4a45bwiztei62lf2jiurzbsakzm7z2oz4oqug3ea5i3sac", "74.208.31.75", 44806, "relay-node", true)
+            new Seed("anbwqus4a45bwiztei62lf2jiurzbsakzm7z2oz4oqug3ea5i3sac", "74.208.31.75", 44806, "relay-validator", true)
     );
 
     private void bootstrapIfEmpty() {
@@ -212,7 +211,7 @@ public class SeedDatabase {
 
     /**
      * Adds a dynamically discovered seed (e.g. from ADDR messages) and
-     * persists it into config_mv.db's "seeds" map (isBuiltin=false) so it
+     * persists it into the config database's "seeds" map (isBuiltin=false) so it
      * survives restarts. Only added if not already known or previously
      * deleted.
      */

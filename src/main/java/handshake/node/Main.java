@@ -124,6 +124,20 @@ public class Main {
         // inbound handshakes to it directly)
         ChainSync sync = new ChainSync(config, db, identity, rpc);
         webAdmin.setChainSync(sync);
+        // FIX: this call was missing entirely -- RpcServer.chainSync
+        // stayed null for the node's whole lifetime, meaning every RPC
+        // method depending on it silently fell back to its "no
+        // ChainSync" default instead of throwing or warning about it.
+        // Confirmed as the real cause of a genuine, reported bug
+        // (getpeerinfo always returning an empty array despite the
+        // node actively syncing) -- and, worse, also the cause of
+        // getblockchaininfo's "verificationprogress" always reporting
+        // exactly 1.0 (100%), from block zero onward: with chainSync
+        // null, chainPeerHeight silently fell back to our OWN tip
+        // instead of the real, known peer height, making the
+        // tip/chainPeerHeight division always compute to tip/tip = 1.0
+        // regardless of actual sync progress.
+        rpc.setChainSync(sync);
         sync.start();
         System.out.println("[Main] Chain sync started.");
 

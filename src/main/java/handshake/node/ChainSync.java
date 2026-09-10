@@ -1139,15 +1139,24 @@ public class ChainSync {
         // downloaded, or it would never get re-requested (from this peer
         // or, ideally, a different one) and the UTXO/name-state database
         // would be permanently missing this height's changes.
-        boolean blockValid = BlockProcessor.process(rawBlock, height, db, mempool);
-        if (!blockValid) {
-            // Reason is generic here since process() can now fail for
-            // either a merkle root mismatch or a checked, failed
-            // signature verification -- the specific reason is already
-            // logged to the console by BlockProcessor itself at the
-            // point of failure.
+        BlockProcessor.Result result = BlockProcessor.process(rawBlock, height, db, mempool);
+        if (result == BlockProcessor.Result.REJECTED) {
+            // A genuine consensus violation (bad merkle root, failed
+            // signature) -- this peer actually sent us something
+            // invalid, so banning it is correct.
             PeerScorecard.get().banPeer(fromIp,
                     "sent block " + height + " that failed validation");
+            return false;
+        }
+        if (result == BlockProcessor.Result.INTERNAL_ERROR) {
+            // Something in OUR OWN processing broke -- nothing to do
+            // with what this peer actually sent. Same "don't advance
+            // the tip" behavior as a rejection (this height must be
+            // retried, not silently skipped), but deliberately NOT
+            // banning the peer: doing so for our own bug could end up
+            // banning every peer we ever sync from if the same
+            // internal issue recurs, for a reason that was never
+            // actually their fault.
             return false;
         }
         PeerScorecard.get().recordValidData(fromIp);

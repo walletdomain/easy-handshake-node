@@ -1053,10 +1053,15 @@ public class RpcServer {
         long total = rt.totalMemory();
         long free = rt.freeMemory();
         long used = total - free;
+        long max = rt.maxMemory(); // FIX: the actual -Xmx ceiling -- previously missing
+        // entirely, so there was no way to see "used vs the real limit",
+        // only "used vs currently-allocated" (which itself grows toward
+        // the ceiling over time and isn't the same thing).
         return "{"
                 + "\"total\":" + (total / 1_048_576) + ","
                 + "\"jsHeap\":" + (used / 1_048_576) + ","
                 + "\"jsHeapTotal\":" + (total / 1_048_576) + ","
+                + "\"jsHeapMax\":" + (max / 1_048_576) + ","
                 + "\"nativeHeap\":0,"
                 + "\"external\":0"
                 + "}";

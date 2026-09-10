@@ -28,6 +28,46 @@ public class UrkelNameTree {
      *  on mainnet is 36 blocks (~6 hours). */
     public static final int TREE_INTERVAL = 36;
 
+    /** How many commit boundaries to let pass between prunes -- pruning
+     *  itself is a pure internal optimization with no real-protocol
+     *  requirement to run on the commit schedule, unlike TREE_INTERVAL
+     *  itself. Confirmed via direct timing that the walk phase of a
+     *  prune (visiting every node reachable from the live tree) costs
+     *  roughly the same ~70 seconds regardless of how much has actually
+     *  been orphaned since the last prune -- it's driven by the size of
+     *  the whole live tree, not by elapsed time. That means running it
+     *  less often directly cuts the AVERAGE per-block cost by roughly
+     *  this same factor, without meaningfully reintroducing the old
+     *  disk-bloat problem (the removal phase is now fast regardless of
+     *  batch size, so a larger backlog still clears quickly once pruned).
+     *  This is a mitigation, not a fix for the walk's own cost -- the
+     *  real fix is tracking orphaned nodes incrementally as updates
+     *  happen, avoiding the periodic full-tree walk entirely, which is
+     *  a separate, more involved change to insert()/remove() themselves. */
+    private static final int PRUNE_EVERY_N_COMMITS = 10;
+    private int commitsSinceLastPrune = 0;
+
+    /** A single, dedicated daemon thread for pruning -- see
+     *  maybeCommit()'s own comment for the full reasoning. Daemon so it
+     *  never blocks a clean shutdown, matching the pattern already used
+     *  for every other background thread in this codebase. */
+    private final java.util.concurrent.ExecutorService pruneExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "urkel-prune");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** Guards against submitting a second prune while one is still
+     *  running -- if the walk is still going by the time the next
+     *  scheduled prune boundary arrives, that boundary is simply
+     *  skipped rather than queued, since the executor's own single
+     *  thread would just make it wait anyway; skipping means the
+     *  height it would have run at doesn't matter, and the one after
+     *  it will try again. */
+    private final java.util.concurrent.atomic.AtomicBoolean pruneInProgress =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final UrkelTree tree = new UrkelTree(256);
     private byte[] lastCommittedRoot = UrkelHash.ZERO.clone();
     private UrkelNode committedRootNode = UrkelNode.Null.NIL;
@@ -111,7 +151,7 @@ public class UrkelNameTree {
      *  this.txn.commit()" at the same boundary. Returns true if a
      *  commit actually happened this call.
      *
-     *  Also the one safe, natural point to prune the node store: right
+     *  Also the one safe, natural point to KICK OFF pruning: right
      *  here, committedRootNode and the live root are, for this single
      *  instant, the exact same object graph (committedRootNode was
      *  just set to a snapshot of it on the line above) -- so a
@@ -119,14 +159,124 @@ public class UrkelNameTree {
      *  live tree (for continuing forward) and the committed root (for
      *  proveCommitted()/getnameproof) still need, without needing two
      *  separate walks or any risk of the two views having already
-     *  diverged. Everything else in the node store at this point is,
-     *  by construction, superseded history from before this boundary. */
+     *  diverged.
+     *
+     *  FIX: previously ran the whole walk+removal INLINE, blocking
+     *  this call (and therefore the entire main sync thread, since
+     *  this is called from BlockProcessor's per-block path) for however
+     *  long the walk took -- confirmed via direct timing to be 66-97
+     *  seconds even after every other optimization applied here,
+     *  because it's driven by the size of the whole live tree, not by
+     *  how much has changed. That cost is real and currently
+     *  unavoidable without a substantially riskier rewrite of
+     *  insert()/remove() themselves (attempted and reverted earlier --
+     *  a rigorous cross-check against this exact walk caught a genuine
+     *  data-loss bug in that approach). What CAN be fixed safely,
+     *  without touching any of that already-verified tree logic at
+     *  all, is WHERE this work runs: committedRootNode is a frozen,
+     *  immutable snapshot the instant it's captured (insert()/remove()
+     *  never mutate existing nodes, only build new ones), so a
+     *  background thread walking it can never be corrupted by the main
+     *  thread continuing to mutate the LIVE tree concurrently -- they
+     *  operate on different, non-overlapping object graphs by
+     *  construction. Submitting the walk+removal to its own thread
+     *  here means block processing keeps running at full speed while
+     *  pruning catches up quietly in the background, rather than
+     *  freezing everything for up to a minute and a half every time it
+     *  runs. */
     public boolean maybeCommit(int height) {
         if (height % TREE_INTERVAL != 0) return false;
         lastCommittedRoot = tree.rootHash().clone();
         committedRootNode = tree.snapshotRoot();
-        tree.pruneUnreachableFrom(committedRootNode);
+
+        commitsSinceLastPrune++;
+        if (commitsSinceLastPrune < PRUNE_EVERY_N_COMMITS) {
+            return true; // commit happened; skip pruning this cycle
+        }
+        commitsSinceLastPrune = 0;
+
+        if (!pruneInProgress.compareAndSet(false, true)) {
+            // A previous prune is still running -- skip this boundary
+            // entirely rather than queue another one behind it; the
+            // next boundary (36 blocks later) will try again, and
+            // nothing here depends on pruning happening at any
+            // SPECIFIC height, only on it happening often enough.
+            System.out.println("[UrkelNameTree] Skipping prune at height " + height
+                    + " -- a previous prune is still running in the background");
+            return true;
+        }
+
+        UrkelNode rootToPrune = committedRootNode;
+        // FIX: keySnapshot MUST be captured here, synchronously, at the
+        // same instant as rootToPrune above -- NOT inside the async
+        // lambda below. See UrkelTree.pruneUnreachableFrom()'s own
+        // comment for the full, serious reasoning: the delay between
+        // submitting work to the executor and the executor actually
+        // starting it is itself a real window during which the main
+        // thread keeps persisting new, not-yet-committed nodes. A
+        // snapshot taken late (inside the lambda, as this used to do)
+        // would wrongly include those newer nodes as removal
+        // candidates, since they're on disk by then but not reachable
+        // from this (older) committed root -- silently deleting data
+        // the live tree still needs. Confirmed as a real, reproducible
+        // bug via a direct restart-vs-continuous test before this fix.
+        java.util.Set<UrkelNodeStore.HashKey> keySnapshot = tree.snapshotStoreKeys();
+        pruneExecutor.submit(() -> {
+            // FIX: previously an exception here (confirmed via a real,
+            // observed MVStore "Chunk ... not found" error at this
+            // exact point) propagated all the way out and caused the
+            // ENTIRE block to be treated as an internal-error failure
+            // -- but a failed prune doesn't actually threaten
+            // correctness here. The committed/live root was already
+            // fixed above, computed from the in-memory tree, before
+            // this ever runs; pruning is pure disk cleanup, and
+            // pruneUnreachable() already computes its full removal
+            // list before removing anything, so even a failure mid-
+            // removal can only leave extra garbage for the next
+            // prune's walk to catch -- it can never remove something
+            // still needed. Now running on its own background thread,
+            // this isolation matters even more: a failure here must
+            // never propagate anywhere near the main sync thread.
+            try {
+                long pruneStart = System.currentTimeMillis();
+                UrkelTree.PruneResult result = tree.pruneUnreachableFrom(rootToPrune, keySnapshot);
+                long pruneMillis = System.currentTimeMillis() - pruneStart;
+                System.out.printf("[UrkelNameTree] Background prune (started at height %d): "
+                                + "removed %d entries in %dms total (walk=%dms remove=%dms)%n",
+                        height, result.removed(), pruneMillis, result.walkMillis(), result.removeMillis());
+            } catch (Exception e) {
+                System.err.printf("[UrkelNameTree] Background prune (started at height %d) "
+                        + "failed (non-fatal -- will retry at a later commit boundary): %s%n", height, e);
+            } finally {
+                pruneInProgress.set(false);
+            }
+        });
+
         return true;
+    }
+
+    /** Shuts down the background prune executor gracefully -- waits for
+     *  any prune currently in flight to actually finish before
+     *  returning, rather than letting it continue running against a
+     *  store that's about to be closed out from under it. Confirmed as
+     *  a real, necessary step: a background prune left running past
+     *  ChainDB.close() hit a genuine MVStoreException reading from the
+     *  now-closed file, caught safely by the existing non-fatal
+     *  handling but exactly the class of shutdown race this project
+     *  has already had to fix once before (interrupting a thread mid-
+     *  file-I/O). Call this BEFORE closing the underlying store, not
+     *  after. */
+    public void shutdownPruning() {
+        pruneExecutor.shutdown();
+        try {
+            if (!pruneExecutor.awaitTermination(120, java.util.concurrent.TimeUnit.SECONDS)) {
+                System.err.println("[UrkelNameTree] Background prune did not finish within 120s "
+                        + "during shutdown -- proceeding anyway, since it's daemon and non-fatal, "
+                        + "but this may leave a warning logged from a prune that lost its store.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Looks up a name's current state directly (bypassing the

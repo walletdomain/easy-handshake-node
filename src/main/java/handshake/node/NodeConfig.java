@@ -1,13 +1,11 @@
 package handshake.node;
 
-import org.h2.mvstore.MVMap;
-
 /**
- * NodeConfig — configuration management for the Handshake node node.
+ * NodeConfig — configuration management for the Handshake validator validator.
  * <p>
  * Backed by ConfigDB's "settings" H2 map (recovered from an earlier,
  * more unified version of this project -- a desktop app with toggleable
- * full_node/dns/miner/wallet modules -- rather than the plain node.conf
+ * full_node/dns/miner/wallet modules -- rather than the plain validator.conf
  * properties file this class used before). Existing keys are read as-is;
  * any key this class needs that isn't already present gets a default
  * value written in (without touching keys it doesn't recognize).
@@ -15,7 +13,7 @@ import org.h2.mvstore.MVMap;
  * RESOLVED AMBIGUITY: the recovered settings map also has "http.port"/
  * "http.bind" (8888 / 127.0.0.1), which turned out to be for a web
  * dashboard from that earlier, more unified project. This project is
- * intentionally a lean, RPC-only node -- no web server, no dashboard,
+ * intentionally a lean, RPC-only validator -- no web server, no dashboard,
  * no TLS -- so those keys are no longer exposed here at all.
  * getRpcPort()/getRpcHost() keep their own "rpc.port"/"rpc.host" keys
  * and original defaults (12037 / 127.0.0.1, matching hsd's real RPC
@@ -73,20 +71,36 @@ public class NodeConfig {
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final String dataDir;
-    private final MVMap<String, String> settings;
+    private final KVMap<String, String> settings;
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
     private NodeConfig(String dataDir) {
         this.dataDir  = dataDir;
         this.settings = ConfigDB.open(dataDir).settingsMap();
-        System.out.println("[Config] Loaded " + settings.size() + " settings from config_mv.db");
+        System.out.println("[Config] Loaded " + settings.size() + " settings from the config database");
     }
 
     // ── Getters ───────────────────────────────────────────────────────────────
 
     public String  getDataDir()     { return dataDir; }
-    public String  getNetwork()     { return get("network",    DEFAULT_NETWORK); }
+    /** Hardcoded, not user-configurable -- this project only ever
+     *  connects to and validates mainnet, deliberately. A "Network"
+     *  selector previously existed in the admin panel but did nothing
+     *  real (every consensus constant -- genesis hash, magic bytes,
+     *  ports, auction timing -- was already hardcoded to mainnet's
+     *  values regardless of what was selected), which risked a person
+     *  believing they were on a low-stakes test network while every
+     *  transaction was actually real. Removed rather than wired up:
+     *  the whole point of this project is a newcomer never having to
+     *  understand or decide something like "which network am I on" in
+     *  the first place. getNetwork() itself stays, since RPC output
+     *  and Bech32 address-prefix selection genuinely need it -- it just
+     *  can no longer be anything other than mainnet, including for
+     *  anyone who already had a stale "network=testnet"-type value
+     *  sitting in an existing config database from before this
+     *  change. */
+    public String  getNetwork()     { return DEFAULT_NETWORK; }
     public int     getP2pPort()     { return getInt("p2p.port",    DEFAULT_P2P_PORT); }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
     /** Dedicated port for the Brontide-encrypted WebSocket event/call
@@ -104,7 +118,18 @@ public class NodeConfig {
     public int     getMaxInbound()  { return getInt("max.inbound",  DEFAULT_MAX_INBOUND); }
     public int     getMaxOutbound() { return getInt("max.outbound", DEFAULT_MAX_OUTBOUND); }
     public boolean indexAddress()   { return getBool("index.address", DEFAULT_INDEX_ADDR); }
-    public boolean indexTx()        { return getBool("index.tx",      DEFAULT_INDEX_TX); }
+    /** Hardcoded on, not user-configurable -- this used to be a toggle
+     *  in the admin panel, but the only thing it gates is whether
+     *  getrawtransaction can look up an arbitrary already-confirmed
+     *  transaction by txid alone (see RpcServer.getRawTransaction()).
+     *  Unlike the old network selector, this has no safety downside to
+     *  leaving it off by mistake -- but there's also no real scenario
+     *  where a newcomer benefits from it being off, and the wallet
+     *  work this project is heading toward will need exactly this
+     *  capability. Simpler to guarantee it's always there than to ask
+     *  anyone to understand what a "tx index" is and why they might
+     *  want one. */
+    public boolean indexTx()        { return DEFAULT_INDEX_TX; }
     public String  getLogLevel()    { return get("log.level",      DEFAULT_LOG_LEVEL); }
     /** Stored in the config database now, as requested -- editable via
      *  the admin panel is a natural follow-up, not built yet. */
@@ -113,7 +138,7 @@ public class NodeConfig {
 
     // Informational module toggles, present in the recovered settings map.
     // Not currently consulted by any class in this project (this is a
-    // single-purpose node build), but exposed since the data is there.
+    // single-purpose validator build), but exposed since the data is there.
     public boolean isFullNodeModuleEnabled() { return getBool("module.full_node", true); }
     public boolean isDnsModuleEnabled()      { return getBool("module.dns", false); }
     public boolean isMinerModuleEnabled()    { return getBool("module.miner", false); }
@@ -131,7 +156,7 @@ public class NodeConfig {
 
     /** All raw settings as a plain map, for the settings dashboard page. */
     public java.util.Map<String, String> getAllSettings() {
-        return new java.util.LinkedHashMap<>(settings);
+        return new java.util.LinkedHashMap<>(settings.asUnmodifiableMap());
     }
 
     public void set(String key, String value) {

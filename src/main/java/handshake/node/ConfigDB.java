@@ -1,26 +1,27 @@
 package handshake.node;
 
-import org.h2.mvstore.MVMap;
-import org.h2.mvstore.MVStore;
-
 import java.io.File;
 import java.util.Map;
 
 /**
- * ConfigDB — owns the shared H2 MVStore file that holds node configuration,
- * seed addresses, peer scores, and discovered peers (settings / seeds /
- * peerScores / discoveredPeers maps).
-    * <p>
- * This exists because all four of those maps live in ONE physical file
- * (the "config_mv.db" recovered from the earlier project), and H2's
- * MVStore only allows one open handle per file at a time -- NodeConfig,
- * SeedDatabase, and PeerScorecard can't each open their own MVStore on
- * the same file independently. This class is the single owner; the other
- * three classes go through it.
-    * <p>
- * File name: the recovered database was literally named "config_mv.db"
- * (not the more typical "config.mv.db"), so that's what's used here to
- * match the real file rather than assume a renamed convention.
+ * ConfigDB — owns the shared storage engine handle that holds validator
+ * configuration, seed addresses, peer scores, and discovered peers
+ * (settings / seeds / peerScores / discoveredPeers maps).
+ * <p>
+ * This exists because all four of those maps live in ONE physical
+ * database, and a single storage engine handle only allows one open
+ * instance at a time -- NodeConfig, SeedDatabase, and PeerScorecard
+ * can't each open their own handle on the same underlying data
+ * independently. This class is the single owner; the other three
+ * classes go through it, entirely via the KVStore/KVMap abstraction --
+ * none of them know or care which concrete engine is actually
+ * underneath.
+ * <p>
+ * Directory name: kept as "config" for continuity with the file this
+ * used to be (the recovered database was literally named
+ * "config_mv.db") -- now a RocksDB directory rather than a single H2
+ * file, matching ChainDB's own migration for the same reasons (see
+ * RocksDBKVStore's own class comment).
  */
 public final class ConfigDB {
 
@@ -38,33 +39,30 @@ public final class ConfigDB {
         return instance;
     }
 
-    private final MVStore store;
-    private final MVMap<String, String> settings;
-    private final MVMap<String, String> seeds;
-    private final MVMap<String, String> peerScores;
-    private final MVMap<String, String> discoveredPeers;
+    private final KVStore store;
+    private final KVMap<String, String> settings;
+    private final KVMap<String, String> seeds;
+    private final KVMap<String, String> peerScores;
+    private final KVMap<String, String> discoveredPeers;
 
     private ConfigDB(String dataDir) {
-        String path = dataDir + "/config_mv.db";
+        String path = dataDir + "/config";
         File parent = new File(path).getParentFile();
         if (parent != null) parent.mkdirs();
 
-        this.store = new MVStore.Builder()
-                .fileName(path)
-                .compress()
-                .open();
-        this.settings = store.openMap("settings");
-        this.seeds = store.openMap("seeds");
-        this.peerScores = store.openMap("peerScores");
-        this.discoveredPeers = store.openMap("discoveredPeers");
+        this.store = new RocksDBKVStore(path);
+        this.settings = store.openStringStringMap("settings");
+        this.seeds = store.openStringStringMap("seeds");
+        this.peerScores = store.openStringStringMap("peerScores");
+        this.discoveredPeers = store.openStringStringMap("discoveredPeers");
     }
 
-    public MVMap<String, String> settingsMap() { return settings; }
-    public MVMap<String, String> seedsMap() { return seeds; }
-    public MVMap<String, String> peerScoresMap() { return peerScores; }
-    public MVMap<String, String> discoveredPeersMap() { return discoveredPeers; }
+    public KVMap<String, String> settingsMap() { return settings; }
+    public KVMap<String, String> seedsMap() { return seeds; }
+    public KVMap<String, String> peerScoresMap() { return peerScores; }
+    public KVMap<String, String> discoveredPeersMap() { return discoveredPeers; }
 
-    public Map<String, String> settingsSnapshot() { return Map.copyOf(settings); }
+    public Map<String, String> settingsSnapshot() { return settings.asUnmodifiableMap(); }
 
     public void commit() {
         store.commit();
