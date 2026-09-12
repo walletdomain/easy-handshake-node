@@ -61,7 +61,39 @@ public class RocksDBKVStore implements KVStore {
     // still bounds 8 of 9 column families' memory far below the
     // original, fully-untuned defaults, without starving the one that
     // genuinely needs more room to avoid thrashing.
-    private static final long SHARED_BLOCK_CACHE_BYTES = 128L * 1024 * 1024;        // 128MB, shared across ALL column families
+    // FIX: was a fixed 128MB regardless of the actual machine this
+    // runs on -- deliberately conservative for a modest machine, but
+    // leaving real, available headroom unused on a more capable one.
+    // Now scales with actual detected physical RAM: 10% of total,
+    // floored at 256MB (so even a genuinely low-memory machine still
+    // gets a real, functional cache, not something so small it barely
+    // helps) and capped at 4GB (so a very large machine doesn't end up
+    // with an oversized cache for what a block cache actually needs --
+    // diminishing returns well before that point for this specific
+    // workload). Detected via com.sun.management.OperatingSystemMXBean,
+    // confirmed directly to work correctly (via a real compile-and-run
+    // test, not assumed) rather than the JVM's own -Xmx ceiling, which
+    // reports the heap limit, not total system memory. Falls back to
+    // the old 128MB default if detection fails for any reason (e.g. a
+    // non-HotSpot JVM that doesn't implement this interface) --
+    // detection failing should never be fatal for something this
+    // secondary.
+    private static long detectSharedBlockCacheBytes() {
+        long floor = 256L * 1024 * 1024;
+        long ceiling = 4L * 1024 * 1024 * 1024;
+        try {
+            var osBean = (com.sun.management.OperatingSystemMXBean)
+                    java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            long totalPhysical = osBean.getTotalMemorySize();
+            long tenPercent = totalPhysical / 10;
+            return Math.max(floor, Math.min(tenPercent, ceiling));
+        } catch (Exception | LinkageError e) {
+            System.out.println("[RocksDBKVStore] Could not detect physical memory ("
+                    + e.getClass().getSimpleName() + ") -- using the 128MB fallback for the shared block cache.");
+            return 128L * 1024 * 1024;
+        }
+    }
+
     private static final long DEFAULT_WRITE_BUFFER_SIZE_BYTES = 16L * 1024 * 1024;  // 16MB per memtable for low-write-volume column families
     private static final long HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES = 64L * 1024 * 1024; // 64MB for "urkelNodes" specifically -- close to RocksDB's own original default
     private static final String HIGH_VOLUME_COLUMN_FAMILY = "urkelNodes";
@@ -96,7 +128,7 @@ public class RocksDBKVStore implements KVStore {
         this.path = path;
         this.readOnly = readOnly;
         if (!readOnly) new File(path).mkdirs();
-        this.sharedBlockCache = new LRUCache(SHARED_BLOCK_CACHE_BYTES);
+        this.sharedBlockCache = new LRUCache(detectSharedBlockCacheBytes());
 
         this.dbOptions = new DBOptions()
                 .setCreateIfMissing(!readOnly)

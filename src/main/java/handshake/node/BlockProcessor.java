@@ -43,6 +43,34 @@ public class BlockProcessor {
     private static final int COV_FINALIZE = TxParser.COV_FINALIZE;
     private static final int COV_REVOKE   = TxParser.COV_REVOKE;
 
+    // ── Signature verification depth cutoff ─────────────────────────────────
+    // FIX: signature verification (pure CPU work, no shortcuts) was
+    // confirmed as a major, unavoidable contributor to real, severe
+    // processing slowdowns during the long initial catch-up sync --
+    // directly measured, not assumed, via ScanCovenantVolume showing
+    // genuinely extreme real transaction volume in several ranges of
+    // the chain's history. A deliberate, explicit design decision: for
+    // any block more than SIGNATURE_VERIFICATION_DEPTH behind the best
+    // known peer height, skip signature verification entirely during
+    // catch-up sync. This does NOT weaken header/proof-of-work
+    // validation at all -- that runs in full, for every single header,
+    // completely unaffected by this. The security property being
+    // relied on: forging a chain SIGNATURE_VERIFICATION_DEPTH blocks
+    // deep, with a transaction an honest miner would never have
+    // included, requires sustained majority hashrate for that entire
+    // depth -- genuinely difficult and expensive for a real attacker,
+    // regardless of the exact depth chosen within a reasonable range.
+    // 288 blocks (~2 days at Handshake's block time) was chosen as a
+    // deliberately conservative depth for this reason specifically.
+    public static final int SIGNATURE_VERIFICATION_DEPTH = 288;
+
+    // Logged once, the first time full verification resumes after a
+    // stretch of skipped blocks, so this behavior is visible rather
+    // than a silent, invisible mode switch -- true only WHILE
+    // currently skipping, so the transition back to full verification
+    // gets exactly one clear log line, not one per block.
+    private static boolean wasSkippingSignatures = false;
+
     // ── Per-phase timing diagnostics ────────────────────────────────────────
     // Direct measurement rather than inferring from GC log patterns: a
     // real, observed slowdown (down to ~2.7 seconds/block) persisted even
@@ -72,10 +100,10 @@ public class BlockProcessor {
         if (blocksSinceTimingLog < 100) return;
         System.out.printf("[BlockProcessor] Timing over last %d blocks (ending height %d): "
                         + "sigVerify=%.1fs utxoBookkeeping=%.1fs covenantProcessing=%.1fs "
-                        + "persistBlock=%.1fs maybeCommit=%.1fs%n",
+                        + "persistBlock=%.1fs maybeCommit=%.1fs heap=%s%n",
                 blocksSinceTimingLog, height,
                 sigVerifyNanos / 1e9, utxoBookkeepingNanos / 1e9, covenantProcessingNanos / 1e9,
-                persistBlockNanos / 1e9, maybeCommitNanos / 1e9);
+                persistBlockNanos / 1e9, maybeCommitNanos / 1e9, UrkelNameTree.heapSnapshot());
         sigVerifyNanos = 0;
         utxoBookkeepingNanos = 0;
         covenantProcessingNanos = 0;
@@ -111,9 +139,9 @@ public class BlockProcessor {
     public enum Result { VALID, REJECTED, INTERNAL_ERROR }
 
     public static Result process(byte[] rawBlock, int height,
-                                 ChainDB db, Mempool mempool) {
+                                 ChainDB db, Mempool mempool, int bestKnownPeerHeight) {
         try {
-            return processInternal(rawBlock, height, db, mempool)
+            return processInternal(rawBlock, height, db, mempool, bestKnownPeerHeight)
                     ? Result.VALID : Result.REJECTED;
         } catch (Exception e) {
             // Confirmed via a real, observed "Chunk ... not found"
@@ -131,7 +159,7 @@ public class BlockProcessor {
     }
 
     private static boolean processInternal(byte[] rawBlock, int height,
-                                           ChainDB db, Mempool mempool) {
+                                           ChainDB db, Mempool mempool, int bestKnownPeerHeight) {
         // Parse the block
         List<TxParser.ParsedTx> txs = parseBlockTxs(rawBlock);
         List<String> confirmedTxids = new ArrayList<>();
@@ -209,21 +237,50 @@ public class BlockProcessor {
             // perfectly valid, real blocks that every other real hsd
             // validator accepts.
             if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
-                long sigStart = System.nanoTime();
-                for (int i = 0; i < tx.inputs.size(); i++) {
-                    TxParser.Input input = tx.inputs.get(i);
-                    ChainDB.UtxoEntry spentUtxo = db.getUtxo(input.prevTxid, input.prevIndex);
-                    if (spentUtxo == null || spentUtxo.addrHash().length != 20) {
-                        continue; // unverifiable -- not a failure, just not checked
+                // FIX: skip signature verification entirely for blocks
+                // deep enough behind the best known peer height -- see
+                // SIGNATURE_VERIFICATION_DEPTH's own comment for the
+                // full reasoning. bestKnownPeerHeight <= 0 means "not
+                // yet known" (e.g. before any peer connection has been
+                // established) -- deliberately defaults to full
+                // verification in that case, not skipping, since
+                // treating an unknown height as "definitely far enough
+                // behind" would be a real, dangerous bug (skipping
+                // verification on the very blocks at the tip, which is
+                // exactly the opposite of the intent here).
+                boolean tooFarBehindToSkip =
+                        bestKnownPeerHeight > 0 && (bestKnownPeerHeight - height) > SIGNATURE_VERIFICATION_DEPTH;
+                if (tooFarBehindToSkip) {
+                    if (!wasSkippingSignatures) {
+                        System.out.printf("[BlockProcessor] Height %d is more than %d blocks behind "
+                                        + "the best known peer height (%d) -- skipping signature verification "
+                                        + "for this and subsequent blocks until caught up%n",
+                                height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
+                        wasSkippingSignatures = true;
                     }
-                    if (!TxVerify.verifyInput(tx, i, spentUtxo.addrHash(), spentUtxo.value())) {
-                        System.err.printf("[BlockProcessor] Signature verification failed for "
-                                + "tx %s input %d at height %d -- rejecting block, no UTXO/name "
-                                + "changes applied%n", txid, i, height);
-                        return false;
+                } else {
+                    if (wasSkippingSignatures) {
+                        System.out.printf("[BlockProcessor] Height %d is now within %d blocks of the "
+                                        + "best known peer height (%d) -- resuming full signature verification%n",
+                                height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
+                        wasSkippingSignatures = false;
                     }
+                    long sigStart = System.nanoTime();
+                    for (int i = 0; i < tx.inputs.size(); i++) {
+                        TxParser.Input input = tx.inputs.get(i);
+                        ChainDB.UtxoEntry spentUtxo = db.getUtxo(input.prevTxid, input.prevIndex);
+                        if (spentUtxo == null || spentUtxo.addrHash().length != 20) {
+                            continue; // unverifiable -- not a failure, just not checked
+                        }
+                        if (!TxVerify.verifyInput(tx, i, spentUtxo.addrHash(), spentUtxo.value())) {
+                            System.err.printf("[BlockProcessor] Signature verification failed for "
+                                    + "tx %s input %d at height %d -- rejecting block, no UTXO/name "
+                                    + "changes applied%n", txid, i, height);
+                            return false;
+                        }
+                    }
+                    sigVerifyNanos += System.nanoTime() - sigStart;
                 }
-                sigVerifyNanos += System.nanoTime() - sigStart;
             }
 
             // Isolated per-transaction: previously an exception in ANY
@@ -284,6 +341,16 @@ public class BlockProcessor {
             }
         }
 
+        // Step 3a: Flush this block's buffered name writes as a single
+        // batched operation -- see ChainDB.saveName()/flushPendingNames()'s
+        // own comments for the full reasoning. Timed as part of
+        // persistBlock, since it's the same kind of operation:
+        // flushing this block's accumulated writes once, rather than
+        // individually as they happened.
+        long nameFlushStart = System.nanoTime();
+        db.flushPendingNames();
+        persistBlockNanos += System.nanoTime() - nameFlushStart;
+
         // Step 3b: Persist any new tree nodes from this block, then
         // advance the "official" committed root if this height lands
         // on a real interval boundary -- confirmed directly from
@@ -292,7 +359,7 @@ public class BlockProcessor {
         // has already been applied above. Persisting every block, not
         // just at commit boundaries, is required for correctness
         // across a restart (see UrkelNameTree's own class comment).
-        ChainDB.PersistTiming timing = db.persistNameTreeStateTimed(height);
+        ChainDB.PersistTiming timing = db.persistNameTreeStateTimed(height, bestKnownPeerHeight);
         persistBlockNanos += timing.persistBlockNanos();
         maybeCommitNanos += timing.maybeCommitNanos();
         logTimingIfDue(height);

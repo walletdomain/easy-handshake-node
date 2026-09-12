@@ -1139,7 +1139,7 @@ public class ChainSync {
         // downloaded, or it would never get re-requested (from this peer
         // or, ideally, a different one) and the UTXO/name-state database
         // would be permanently missing this height's changes.
-        BlockProcessor.Result result = BlockProcessor.process(rawBlock, height, db, mempool);
+        BlockProcessor.Result result = BlockProcessor.process(rawBlock, height, db, mempool, getBestKnownPeerHeight());
         if (result == BlockProcessor.Result.REJECTED) {
             // A genuine consensus violation (bad merkle root, failed
             // signature) -- this peer actually sent us something

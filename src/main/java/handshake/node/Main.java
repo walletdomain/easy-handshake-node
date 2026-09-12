@@ -87,9 +87,9 @@ public class Main {
         ChainDB db = ChainDB.open(dbPath);
         System.out.printf("[Main] Chain DB opened: %s (%.1f GB)%n",
                 dbPath, db.getDiskSizeBytes() / 1e9);
-        System.out.printf("[Main] Headers: %d  Blocks: %d  UTXOs: %d  Names: %d%n",
-                db.getHeaderCount(), db.getBlockCount(),
-                db.getUtxoCount(), db.getNameCount());
+        System.out.printf("[Main] Headers: ~%d  Blocks: ~%d  UTXOs: ~%d  Names: ~%d%n",
+                db.getHeaderCountEstimate(), db.getBlockCountEstimate(),
+                db.getUtxoCountEstimate(), db.getNameCountEstimate());
         db.backfillHashIndexIfNeeded();
 
         // ── 4. Node identity (Brontide keypair) ───────────────────────────────

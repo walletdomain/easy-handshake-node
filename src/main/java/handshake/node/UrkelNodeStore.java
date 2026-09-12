@@ -215,26 +215,53 @@ public class UrkelNodeStore {
         return b;
     }
 
-    /** Eagerly materializes a true, point-in-time copy of every key
-     *  currently in the store -- deliberately NOT a live view, since
-     *  this is specifically meant to be captured once, before a
-     *  potentially long-running background walk, and remain completely
-     *  unaffected by whatever the main thread adds to the store
-     *  afterward. See pruneUnreachable()'s own comment for why this
-     *  matters.
+    /** Opens a lightweight, O(1) snapshot handle representing this
+     *  store's exact key set right now -- deliberately NOT eagerly
+     *  materialized here. See KVMap.openSnapshot()'s own comment for
+     *  the full reasoning: an earlier version of this method (called
+     *  snapshotKeys()) DID eagerly materialize the full key set on the
+     *  calling thread, which was correct but became a severe, real
+     *  performance regression once the store reached several million
+     *  keys -- a 40+ second synchronous block on every single commit,
+     *  confirmed directly from real, reported production timing data
+     *  (maybeCommit() jumping from ~0s to 40-45s the moment this
+     *  method started being called synchronously rather than from a
+     *  background thread).
      *
-     *  Returns the compact HashKey form directly -- see HashKey's own
-     *  comment for why, and note this is now a single materialization,
-     *  not a copy-of-a-copy: the previous version wrapped an already-
-     *  fully-materialized store.keySet() in a second, redundant new
-     *  HashSet<>(...), needlessly doubling memory for the exact same
-     *  data. */
-    public java.util.Set<HashKey> snapshotKeys() {
-        java.util.Set<HashKey> result = new java.util.HashSet<>();
-        for (String hexKey : store.keySet()) {
-            result.add(new HashKey(unhex(hexKey)));
-        }
-        return result;
+     *  The returned handle's own keys() method still does that same
+     *  expensive enumeration -- it has to, the data has to actually be
+     *  read from somewhere -- but callers now control WHEN that
+     *  happens, separately from WHEN the point-in-time guarantee gets
+     *  fixed (which is here, at openSnapshot() time, and is cheap).
+     *  Deferring keys() to a background thread (see UrkelNameTree.
+     *  maybeCommit()) gets the exact same correctness property as the
+     *  old eager version without blocking anything. */
+    public KVMap.KVSnapshot<HashKey> openSnapshot() {
+        KVMap.KVSnapshot<String> raw = store.openSnapshot();
+        return new KVMap.KVSnapshot<HashKey>() {
+            @Override
+            public java.util.Set<HashKey> keys() {
+                java.util.Set<HashKey> result = new java.util.HashSet<>();
+                for (String hexKey : raw.keys()) {
+                    result.add(new HashKey(unhex(hexKey)));
+                }
+                return result;
+            }
+
+            @Override
+            public void forEachKey(java.util.function.Consumer<HashKey> action) {
+                // Must override, not rely on the interface's own
+                // default -- that default calls keys() internally,
+                // which would silently undo the whole point of
+                // streaming. See KVSnapshot.forEachKey()'s own comment.
+                raw.forEachKey(hexKey -> action.accept(new HashKey(unhex(hexKey))));
+            }
+
+            @Override
+            public void close() {
+                raw.close();
+            }
+        };
     }
 
     /** Removes every stored node NOT in reachableHashes -- the
@@ -276,13 +303,17 @@ public class UrkelNodeStore {
      *  RocksDB WriteBatch, or anything else; it just asks the store to
      *  remove a set of keys efficiently. Returns the number of entries
      *  actually removed. */
-    public int pruneUnreachable(java.util.Set<HashKey> keySnapshot, java.util.Set<HashKey> reachableHashes) {
-        java.util.List<String> toRemove = new java.util.ArrayList<>();
-        for (HashKey key : keySnapshot) {
-            if (!reachableHashes.contains(key)) {
-                toRemove.add(hex(key.bytes));
-            }
-        }
-        return store.removeAll(toRemove);
+    /** Removes an already-determined set of unreachable keys -- the
+     *  actual set-difference logic (which keys are unreachable) now
+     *  lives in UrkelTree.pruneUnreachableFrom() itself, computed via a
+     *  genuine stream rather than ever materializing the full key set
+     *  here; see that method's own comment and KVSnapshot.forEachKey()'s
+     *  for why. This is now just the batched-write step. */
+    public int removeKeys(java.util.List<HashKey> toRemove) {
+        java.util.List<String> hexKeys = new java.util.ArrayList<>(toRemove.size());
+        for (HashKey key : toRemove) hexKeys.add(hex(key.bytes));
+        System.out.println("[UrkelNodeStore] Prune removal phase STARTING: " + hexKeys.size()
+                + " entries to remove (heap: " + UrkelNameTree.heapSnapshot() + ")");
+        return store.removeAll(hexKeys);
     }
 }

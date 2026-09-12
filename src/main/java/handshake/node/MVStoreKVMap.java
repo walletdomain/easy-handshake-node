@@ -130,4 +130,22 @@ public class MVStoreKVMap<K, V> implements KVMap<K, V> {
         // UrkelNodeStore.pruneUnreachable()'s own reasoning).
         return keys.size();
     }
+
+    /** No cheap, native point-in-time snapshot primitive to lean on
+     *  here the way RocksDBKVMap's does -- MVMap doesn't expose one
+     *  with an equivalent O(1) cost profile. Falls back to eagerly
+     *  materializing the key set right now, synchronously, which is
+     *  exactly what this whole KVSnapshot abstraction was built to
+     *  move away from for the active (RocksDB) engine -- but this
+     *  fallback stays correct, which is what actually matters here
+     *  given MVStore is no longer the production path this session
+     *  settled on. */
+    @Override
+    public KVSnapshot<K> openSnapshot() {
+        java.util.Set<K> materialized = new java.util.LinkedHashSet<>(map.keySet());
+        return new KVSnapshot<K>() {
+            @Override public java.util.Set<K> keys() { return materialized; }
+            @Override public void close() { /* nothing to release */ }
+        };
+    }
 }

@@ -44,8 +44,20 @@ public abstract class UrkelNode {
 
     public static final class Internal extends UrkelNode {
         public final UrkelBits prefix;
-        public UrkelNode left;
-        public UrkelNode right;
+        // FIX: volatile, not just mutable -- once collapsePersisted()
+        // (see UrkelTree.persistFrom()) starts replacing already-
+        // persisted children with lightweight Hash placeholders to free
+        // memory, these fields can be written by the main thread while
+        // the background prune thread concurrently reads them via
+        // collectReachable(). Object reference assignment is already
+        // atomic in Java (no risk of a "torn" read), but without
+        // volatile there's no guaranteed happens-before relationship,
+        // meaning the prune thread could keep seeing a stale value
+        // indefinitely on some platforms/JIT configurations. volatile
+        // closes that gap directly rather than relying on it happening
+        // to work in practice.
+        public volatile UrkelNode left;
+        public volatile UrkelNode right;
         private byte[] cachedHash;
         /** Bookkeeping only, not part of this node's identity/hash --
          *  lets persistence prune a walk the moment it hits a node

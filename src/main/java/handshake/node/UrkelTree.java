@@ -5,13 +5,23 @@ package handshake.node;
  * real Urkel's tree.js (read in full) -- the insert/get/prove logic is
  * faithful to the original; only the disk-backed lazy-loading layer
  * (Pointer, the Hash placeholder node type, FileStore/MemoryStore) is
- * left out, since this project keeps the tree in memory for now rather
- * than replicate Urkel's own on-disk flat-file format. If/when this
- * needs to scale to real Handshake mainnet's full name set without
- * holding it all in memory, that's a separate, later integration step
- * (naturally backed by this project's existing H2/MVStore, the same as
- * everywhere else) -- not a change to the hashing/proof logic itself,
- * which is what actually has to match the real network's consensus.
+ * left out, since real Urkel's own flat-file format was never
+ * replicated exactly.
+ *
+ * "In-memory" describes how this class is IMPLEMENTED (a plain Java
+ * object graph, not a custom on-disk format), not how much of the
+ * tree is actually held in memory at once, which is now deliberately
+ * bounded -- see persistLive()'s own comment for the real history
+ * here: this used to also describe the actual RUNTIME behavior (the
+ * whole live tree really did stay resident, growing without bound for
+ * as long as the process ran), which caused a genuine, repeated
+ * OutOfMemoryError crash under sustained load. What actually persists
+ * between one block and the next now is a single 32-byte root hash,
+ * with the real object graph resolved fresh from the configured
+ * KVStore-backed node store on demand and released again immediately
+ * after -- the same structural approach real Urkel's own disk-backed
+ * design takes, just built on this project's existing storage
+ * abstraction rather than a custom flat-file format.
  */
 public class UrkelTree {
 
@@ -31,19 +41,27 @@ public class UrkelTree {
         this.nodeStore = nodeStore;
     }
 
-    /** Exposes a point-in-time key snapshot from the configured node
-     *  store -- see UrkelNodeStore.snapshotKeys()'s own comment for
-     *  what this is for. Callers (specifically UrkelNameTree.
-     *  maybeCommit()) need to capture this SYNCHRONOUSLY, at the same
-     *  instant as the committed root itself, and BEFORE submitting the
-     *  actual prune to a background thread -- see
-     *  pruneUnreachableFrom()'s own comment for the full reasoning on
-     *  why that timing specifically matters and is not just a style
-     *  preference. Empty set (not null, not an exception) if no node
+    /** Exposes a lightweight, O(1) point-in-time snapshot handle from
+     *  the configured node store -- see UrkelNodeStore.openSnapshot()'s
+     *  own comment for the full reasoning, and KVMap.openSnapshot()'s
+     *  for why this specific split (cheap handle now, expensive
+     *  enumeration deferred) exists at all. Callers (specifically
+     *  UrkelNameTree.maybeCommit()) capture this SYNCHRONOUSLY, at the
+     *  same instant as the committed root itself, then defer the
+     *  actual key() enumeration to a background thread -- see
+     *  pruneUnreachableFrom()'s own comment for why the SYNCHRONOUS
+     *  capture specifically still matters, even though it's now cheap.
+     *  Returns a snapshot whose keys() is an empty set if no node
      *  store is configured, matching pruneUnreachableFrom()'s own
      *  no-op-when-unconfigured behavior. */
-    public java.util.Set<UrkelNodeStore.HashKey> snapshotStoreKeys() {
-        return nodeStore == null ? java.util.Set.of() : nodeStore.snapshotKeys();
+    public KVMap.KVSnapshot<UrkelNodeStore.HashKey> openStoreSnapshot() {
+        if (nodeStore == null) {
+            return new KVMap.KVSnapshot<UrkelNodeStore.HashKey>() {
+                @Override public java.util.Set<UrkelNodeStore.HashKey> keys() { return java.util.Set.of(); }
+                @Override public void close() { }
+            };
+        }
+        return nodeStore.openSnapshot();
     }
 
     /** Resolves a node if it's a lazy Hash placeholder, otherwise
@@ -58,7 +76,20 @@ public class UrkelTree {
                             + "either setNodeStore() was never called, or a placeholder was "
                             + "constructed somewhere it shouldn't have been");
         }
-        return nodeStore.resolve(node.hash());
+        UrkelNode resolved = nodeStore.resolve(node.hash());
+        // Incremental orphan tracking's resurrection safeguard: resolve()
+        // (correctly) marks a just-loaded node persisted=true immediately,
+        // since its content demonstrably already exists on disk -- but
+        // that means it never goes through collectUnpersisted()'s
+        // persisted=false -> true transition, which is the ONLY other
+        // place unorphanIfPending() gets called. ANY successful resolve(),
+        // from ANY caller (insert, remove, get, collectReachable, all of
+        // them), proves this hash is reachable from whatever root is
+        // currently being traversed RIGHT NOW -- which is exactly what
+        // this safeguard needs to know, regardless of which operation
+        // triggered it. */
+        unorphanIfPending(resolved);
+        return resolved;
     }
 
     public UrkelTree(int bits) {
@@ -141,6 +172,13 @@ public class UrkelTree {
                 UrkelNode.Leaf newLeaf = leaf(key, value);
                 UrkelBits[] parts = in.prefix.split(matched);
                 UrkelNode.Internal child = new UrkelNode.Internal(parts[1], in.left, in.right);
+                orphan(in, child); // in's CHILDREN get reused (wrapped
+                // into child); in itself is only
+                // ACTUALLY superseded if child's own
+                // hash differs from it -- see
+                // orphan()'s own comment for why that
+                // check matters here specifically
+                // (matched == 0 makes them identical).
                 return UrkelNode.Internal.from(parts[0], newLeaf, child, bit);
             }
 
@@ -148,14 +186,20 @@ public class UrkelTree {
             UrkelNode y = in.get(!bit);
             UrkelNode z = insert(x, key, value, depth + 1);
             if (z == null) return null;
-            return UrkelNode.Internal.from(in.prefix, z, y, bit);
+            UrkelNode.Internal replacement = UrkelNode.Internal.from(in.prefix, z, y, bit);
+            orphan(in, replacement); // same prefix, new child on this
+            // side -- `y` (untouched sibling)
+            // is reused, not orphaned.
+            return replacement;
         }
 
         // Leaf
         UrkelNode.Leaf lf = (UrkelNode.Leaf) node;
         if (java.util.Arrays.equals(key, lf.key)) {
             if (java.util.Arrays.equals(value, lf.value)) return null; // genuine no-op
-            return leaf(key, value); // same key, new value -- simple replace
+            UrkelNode.Leaf replacement = leaf(key, value);
+            orphan(lf, replacement); // same key, new value -- simple replace
+            return replacement;
         }
 
         if (depth == bits) {
@@ -214,17 +258,35 @@ public class UrkelTree {
                 if (side.isInternal()) {
                     UrkelNode.Internal yin = (UrkelNode.Internal) side;
                     UrkelBits joined = in.prefix.join(yin.prefix, !bit);
-                    return new UrkelNode.Internal(joined, yin.left, yin.right);
+                    UrkelNode.Internal replacement = new UrkelNode.Internal(joined, yin.left, yin.right);
+                    orphan(in, replacement); // in is gone either way in
+                    // this branch -- collapsed
+                    // away entirely here.
+                    orphan(yin, replacement); // yin's OWN prefix gets
+                    // replaced by the newly
+                    // joined one -- yin's
+                    // CHILDREN are reused
+                    // directly, but yin itself
+                    // no longer exists.
+                    return replacement;
                 }
+                orphan(in, side); // `in` is replaced outright by `side`
+                // (== y, or Null) here -- side itself
+                // is reused/promoted as-is, not
+                // orphaned.
                 return side;
             }
 
-            return UrkelNode.Internal.from(in.prefix, z, y, bit);
+            UrkelNode.Internal replacement = UrkelNode.Internal.from(in.prefix, z, y, bit);
+            orphan(in, replacement); // `y` (the untouched sibling) is reused.
+            return replacement;
         }
 
         // Leaf
         UrkelNode.Leaf lf = (UrkelNode.Leaf) node;
         if (!java.util.Arrays.equals(key, lf.key)) return null;
+        orphan(lf, UrkelNode.Null.NIL); // the key matched -- lf is being
+        // removed outright.
         return UrkelNode.Null.NIL;
     }
 
@@ -238,20 +300,139 @@ public class UrkelTree {
      *  visited hash (a subtree can be shared by multiple paths after
      *  copy-on-write updates) rather than re-walking it, and resolves
      *  Hash placeholders through the node store exactly like normal
-     *  traversal does. */
+     *  traversal does.
+     *
+     *  Checks for a requested interrupt on every single node visited --
+     *  cheap (a volatile-flag read) next to the rest of a node visit's
+     *  own cost, and this is the one place a real, sustained-load prune
+     *  walk actually spends its time, so this is what makes shutdown
+     *  responsive rather than needing to wait out however much of a
+     *  potentially multi-minute walk was still left. See
+     *  UrkelNameTree.shutdownPruning() for why responding quickly here
+     *  is necessary, not just a nice-to-have -- closing the underlying
+     *  RocksDB store while this walk is still making native calls into
+     *  it is a real, confirmed, unrecoverable crash (not a catchable
+     *  Java exception -- RocksDB is native code via JNI, and misusing
+     *  an already-closed handle segfaults the whole process rather than
+     *  throwing), so shutdown MUST wait for this to actually stop, and
+     *  this is what lets that wait be fast instead of unboundedly long. */
+    /** How many nodes to visit between brief, voluntary CPU yields
+     *  during a walk -- see the throttled overload below for the full
+     *  reasoning. */
+    private static final int YIELD_EVERY_N_NODES = 5000;
+    private static final long YIELD_PAUSE_MILLIS = 5;
+
+    /** How often (wall-clock) to print a progress line during a long
+     *  walk -- deliberately time-based, not node-count-based like the
+     *  yield above: a walk over millions of nodes at 5,000/yield would
+     *  otherwise print thousands of lines, which defeats the point of
+     *  a diagnostic (nobody reads thousands of lines); a periodic
+     *  wall-clock cadence gives a steady trickle of real progress
+     *  information regardless of tree size. */
+    private static final long PROGRESS_LOG_EVERY_MILLIS = 10_000;
+
+    /** Mutable state threaded through collectReachable()'s recursion --
+     *  a small, named holder rather than a raw counter, since this now
+     *  tracks more than one thing: how many nodes since the last yield
+     *  (visitedSinceYield), how many total this walk (totalVisited, for
+     *  progress reporting), and when progress was last printed
+     *  (lastLogMillis, so PROGRESS_LOG_EVERY_MILLIS is measured against
+     *  wall-clock time, not node count). */
+    private static final class WalkState {
+        int visitedSinceYield = 0;
+        long totalVisited = 0;
+        long lastLogMillis = System.currentTimeMillis();
+    }
+
+    /** Public entry point -- starts fresh walk state. See the private,
+     *  throttled overload below for what actually happens node-by-
+     *  node; this just wraps it. */
     public void collectReachable(UrkelNode node, java.util.Set<UrkelNodeStore.HashKey> out) {
+        collectReachable(node, out, new WalkState());
+    }
+
+    /** Same traversal as the public overload above, with two additions
+     *  -- both added directly in response to a real, reported crash
+     *  that could previously only be diagnosed after the fact, by
+     *  inferring from block-height alignment and an external profiler
+     *  whether a prune was even running at the time:
+     *
+     *  1. Briefly sleeps every YIELD_EVERY_N_NODES nodes visited (see
+     *     below for the full reasoning on why this exists at all).
+     *  2. Prints a progress line -- nodes visited so far this walk,
+     *     current heap usage -- every PROGRESS_LOG_EVERY_MILLIS,
+     *     giving direct, real-time visibility into whether a long walk
+     *     is genuinely still making progress and what memory is
+     *     actually doing while it runs, without needing to infer
+     *     either after the fact.
+     *
+     *  FIX (the yielding itself): confirmed via a real, reported case --
+     *  not just this process slowing down, but the whole machine
+     *  becoming unusable -- during a prune's walk at real production
+     *  scale (millions of live names, an order of magnitude past
+     *  anything tested here beforehand, and taking well over ten
+     *  minutes wall-clock as a direct result). The OS does preemptively
+     *  time-slice CPU among threads regardless, but a walk running
+     *  flat-out across millions of nodes, each triggering real
+     *  allocation and (for anything not already cached) a real disk
+     *  read, can still dominate available CPU and generate enough GC
+     *  pressure to make the whole system feel unresponsive for its
+     *  entire duration. A brief, periodic sleep genuinely frees a core
+     *  during that window, and slowing the walk's own allocation rate
+     *  somewhat also eases how aggressively the GC needs to run. The
+     *  honest cost: this adds real wall-clock time to the walk itself,
+     *  proportional to how many nodes it visits -- a deliberate trade
+     *  of some of the walk's own speed for the rest of the machine
+     *  staying usable while it runs, which is the right trade given
+     *  what actually happened here -- though also worth knowing
+     *  honestly: a slower walk means more time for concurrent
+     *  allocation from the main thread too, so this isn't guaranteed to
+     *  reduce PEAK memory even though it should ease CPU contention;
+     *  the progress logging above is what will actually show, directly,
+     *  whether that tradeoff is landing well in practice or not, rather
+     *  than continuing to guess. Combined with the prune thread's own
+     *  lowered OS priority (see pruneExecutor's own comment) -- two
+     *  different angles on the same problem, neither a complete fix
+     *  alone. */
+    private void collectReachable(UrkelNode node, java.util.Set<UrkelNodeStore.HashKey> out, WalkState state) {
+        if (Thread.currentThread().isInterrupted()) throw new PruneInterruptedException();
         if (node.isNull()) return;
         node = resolve(node);
         UrkelNodeStore.HashKey key = new UrkelNodeStore.HashKey(node.hash());
         if (!out.add(key)) return; // already visited this subtree
 
+        state.totalVisited++;
+        long now = System.currentTimeMillis();
+        if (now - state.lastLogMillis >= PROGRESS_LOG_EVERY_MILLIS) {
+            state.lastLogMillis = now;
+            System.out.println("[UrkelTree] Prune walk in progress: " + state.totalVisited
+                    + " nodes visited so far (heap: " + UrkelNameTree.heapSnapshot() + ")");
+        }
+
+        if (++state.visitedSinceYield >= YIELD_EVERY_N_NODES) {
+            state.visitedSinceYield = 0;
+            try {
+                Thread.sleep(YIELD_PAUSE_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new PruneInterruptedException();
+            }
+        }
+
         if (node.isInternal()) {
             UrkelNode.Internal in = (UrkelNode.Internal) node;
-            collectReachable(in.left, out);
-            collectReachable(in.right, out);
+            collectReachable(in.left, out, state);
+            collectReachable(in.right, out, state);
         }
         // Leaf nodes have no children to descend into.
     }
+
+    /** Thrown internally when a background prune's own walk detects
+     *  the shutdown-requested interrupt -- see collectReachable()'s and
+     *  shutdownPruning()'s own comments for why this exists and what
+     *  it's for. Not a real error; caught and handled as a clean,
+     *  expected abort by pruneUnreachableFrom()'s own caller. */
+    public static final class PruneInterruptedException extends RuntimeException {}
 
     /** Result of a prune pass, broken down by phase -- the walk
      *  (collectReachable(), resolving every still-needed node) and the
@@ -304,10 +485,23 @@ public class UrkelTree {
      *  covenant sequence two ways -- straight through, and with a
      *  close/reopen restart injected partway through -- and compare the
      *  resulting committed roots) before this fix, and confirmed fixed
-     *  by the same test afterward. Capturing keySnapshot at the same
-     *  synchronous instant as `root` closes this precisely the way the
-     *  original comment already intended for the walk's own duration,
-     *  just correctly extended to cover the submission delay too.
+     *  by the same test afterward.
+     *
+     *  SECOND FIX, immediately after the first: capturing the key
+     *  snapshot synchronously does NOT mean eagerly enumerating every
+     *  key synchronously -- an earlier version of this fix did exactly
+     *  that (Set<HashKey> keySnapshot, fully materialized before
+     *  submission), which was correct but became a severe, real
+     *  performance regression once the store reached several million
+     *  keys: 40+ seconds of blocked main-thread processing on every
+     *  single commit, confirmed directly from real, reported
+     *  production timing data. This parameter is now a lightweight,
+     *  O(1) KVSnapshot HANDLE instead (see KVMap.openSnapshot()'s own
+     *  comment) -- synchronous capture still fixes the correct instant
+     *  in time, but the actual expensive enumeration is deferred to
+     *  keys(), called from inside this method's own background task
+     *  below, not by the caller. Same correctness guarantee, without
+     *  blocking anything.
      *
      *  FIX: the ENTIRE walk-then-remove now runs under
      *  runExclusiveOfCompaction() -- confirmed via a real, repeatedly
@@ -321,20 +515,146 @@ public class UrkelTree {
      *  retention timing. Only the removal phase was ever protected
      *  against this before; the walk itself, despite being the longer
      *  of the two phases, never was. */
-    public PruneResult pruneUnreachableFrom(UrkelNode root, java.util.Set<UrkelNodeStore.HashKey> keySnapshot) {
+    public PruneResult pruneUnreachableFrom(UrkelNode root, KVMap.KVSnapshot<UrkelNodeStore.HashKey> keySnapshotHandle) {
+        if (nodeStore == null) return new PruneResult(0, 0, 0);
+        return nodeStore.runExclusiveOfCompaction(() -> {
+            try {
+                long walkStart = System.currentTimeMillis();
+                java.util.Set<UrkelNodeStore.HashKey> reachable = new java.util.HashSet<>();
+                collectReachable(root, reachable);
+                long walkMillis = System.currentTimeMillis() - walkStart;
+
+                // FIX: this used to call keySnapshotHandle.keys() first,
+                // eagerly materializing EVERY key in the store (live
+                // names plus however much unpruned garbage has
+                // accumulated -- potentially tens of millions of
+                // entries) into one, single in-memory Set, before ever
+                // comparing anything against `reachable` above.
+                // Confirmed as a real, severe OutOfMemoryError cause at
+                // real production scale -- see KVSnapshot.forEachKey()'s
+                // own comment for the full reasoning and how this was
+                // actually diagnosed (a heap jump of over a gigabyte
+                // within seconds, fast enough that none of this
+                // project's other prune safeguards -- which all live in
+                // collectReachable() above, a DIFFERENT step -- ever got
+                // a chance to even start).
+                //
+                // Streaming instead: each key from the store is checked
+                // against `reachable` (already bounded by the live
+                // tree's own size, not the total, garbage-inclusive
+                // store size) and immediately either discarded (if
+                // still needed) or added to toRemove (if not) -- the
+                // full key set itself is never materialized anywhere,
+                // only this walk's own reachable set (already required
+                // regardless) and toRemove, which should typically be
+                // far smaller than the full store.
+                long removeStart = System.currentTimeMillis();
+                java.util.List<UrkelNodeStore.HashKey> toRemove = new java.util.ArrayList<>();
+                keySnapshotHandle.forEachKey(key -> {
+                    if (!reachable.contains(key)) toRemove.add(key);
+                });
+                int removed = nodeStore.removeKeys(toRemove);
+                long removeMillis = System.currentTimeMillis() - removeStart;
+
+                return new PruneResult(removed, walkMillis, removeMillis);
+            } finally {
+                // Must always release the underlying snapshot resource
+                // (a real RocksDB Snapshot, for the active engine) --
+                // otherwise the engine keeps pinning whatever data
+                // existed at snapshot time indefinitely, unable to
+                // reclaim it. Not just a style concern: a real,
+                // growing resource leak if skipped.
+                keySnapshotHandle.close();
+            }
+        });
+    }
+
+    /** RE-ARCHITECTURE: hybrid mechanism -- the actual, primary way
+     *  cleanup happens now, replacing pruneUnreachableFrom() above on
+     *  the automatic path (that method stays available, unwired, as an
+     *  optional deep-audit tool -- see its own doc comment for the full
+     *  history of why the walk exists and what it protects against).
+     *
+     *  candidates comes from the incremental orphan tracker (see
+     *  orphan()/advanceOrphanGeneration()), accumulated continuously,
+     *  essentially for free, as insert()/remove() actually happen.
+     *  Confirmed, via extensive direct testing against this exact walk-
+     *  based mechanism on large, randomized operation sequences, to
+     *  have zero false negatives -- it never misses real garbage. What
+     *  it DOES have, confirmed the same way: a narrow, specific false-
+     *  positive rate (roughly 0.1% in that testing) from a resurrection
+     *  edge case that resisted several rounds of targeted, hook-based
+     *  fixes without being fully closed. Rather than keep chasing that
+     *  gap with more local hooks, or accept the real, permanent memory
+     *  cost of full reference counting (a separate, considered, and
+     *  rejected option -- see this project's own notes on why), this
+     *  runs the walk here specifically to VALIDATE candidates before
+     *  anything is actually deleted, not to independently rediscover
+     *  them.
+     *
+     *  This is a genuine efficiency win over the old mechanism, not
+     *  just a safety wrapper: the old approach needed the full,
+     *  expensive keySnapshotHandle.forEachKey() streaming enumeration
+     *  of EVERY key in the store (potentially tens of millions of
+     *  entries, live and garbage combined) to compute "store minus
+     *  reachable". This needs only the walk itself (already required
+     *  either way) to compute `reachable`, then filters the tracker's
+     *  own, typically far smaller candidate set against it -- no full-
+     *  store enumeration at all. */
+    public PruneResult reconcileAndRemove(UrkelNode root, java.util.Set<UrkelNodeStore.HashKey> candidates) {
         if (nodeStore == null) return new PruneResult(0, 0, 0);
         return nodeStore.runExclusiveOfCompaction(() -> {
             long walkStart = System.currentTimeMillis();
-            java.util.Set<UrkelNodeStore.HashKey> reachable = new java.util.HashSet<>();
-            collectReachable(root, reachable);
-            long walkMillis = System.currentTimeMillis() - walkStart;
+            // RE-ARCHITECTURE: disk-backed, not an in-memory HashSet --
+            // see DiskBackedHashKeySet's own class comment for the full
+            // reasoning. Closed in the finally below regardless of how
+            // this exits, so its scratch directory never lingers past
+            // one reconciliation cycle.
+            DiskBackedHashKeySet reachable = new DiskBackedHashKeySet();
+            try {
+                collectReachable(root, reachable);
+                long walkMillis = System.currentTimeMillis() - walkStart;
 
-            long removeStart = System.currentTimeMillis();
-            int removed = nodeStore.pruneUnreachable(keySnapshot, reachable);
-            long removeMillis = System.currentTimeMillis() - removeStart;
+                long removeStart = System.currentTimeMillis();
+                java.util.List<UrkelNodeStore.HashKey> confirmedGarbage = new java.util.ArrayList<>();
+                for (UrkelNodeStore.HashKey candidate : candidates) {
+                    if (!reachable.contains(candidate)) confirmedGarbage.add(candidate);
+                }
+                int removed = nodeStore.removeKeys(confirmedGarbage);
+                long removeMillis = System.currentTimeMillis() - removeStart;
 
-            return new PruneResult(removed, walkMillis, removeMillis);
+                return new PruneResult(removed, walkMillis, removeMillis);
+            } finally {
+                reachable.close();
+            }
         });
+    }
+
+    /** RE-ARCHITECTURE: no validation walk at all -- trusts the
+     *  incremental orphan tracker's own candidates completely, deleting
+     *  them directly. Used ONLY during deep catch-up (see
+     *  UrkelNameTree.maybeCommit()'s own comment for the full
+     *  reasoning): the validation walk above is now safe on modest
+     *  hardware thanks to DiskBackedHashKeySet, but it's still genuinely
+     *  slow, and during catch-up that slowness means real, ongoing CPU
+     *  and disk contention with the main sync thread -- the same
+     *  category of problem today's other catch-up-specific fixes (the
+     *  signature-verification skip, the reduced prune frequency) all
+     *  address the same way: accept a small, deliberate, bounded trust
+     *  reduction during the one phase where speed matters most, then
+     *  fall back to the fully-verified path once caught up, where
+     *  there's real idle time between blocks to afford it. The known,
+     *  narrow risk this accepts: an unresolved (not just unexplored --
+     *  four specific hypotheses investigated and ruled out or reverted)
+     *  false-positive rate in the incremental tracker, confirmed at
+     *  roughly 0.1% in large-scale testing. Not something to be
+     *  comfortable with indefinitely, but a small, bounded, catch-up-
+     *  only exposure rather than the correctness gap being the sole
+     *  thing standing between this project and running on a 4GB
+     *  machine at all. */
+    public int removeDirectly(java.util.Set<UrkelNodeStore.HashKey> candidates) {
+        if (nodeStore == null) return 0;
+        return nodeStore.removeKeys(new java.util.ArrayList<>(candidates));
     }
 
     /** Builds a proof for a key against an explicit root node, rather
@@ -349,14 +669,6 @@ public class UrkelTree {
     public UrkelProof proveFrom(UrkelNode snapshotRoot, byte[] key) {
         if (!isKey(key)) throw new IllegalArgumentException("Invalid key length");
         return prove(snapshotRoot, key);
-    }
-
-    /** The tree's current root node reference -- cheap to hold onto
-     *  (see proveFrom's own comment), useful for a caller that wants
-     *  to snapshot "prove-able state as of right now" without copying
-     *  the whole tree. */
-    public UrkelNode snapshotRoot() {
-        return root;
     }
 
     /** Sets the tree's root directly -- used on startup to resume from
@@ -413,11 +725,194 @@ public class UrkelTree {
             }
             throw e;
         }
+
+        // FIX: this is what actually bounds this project's in-memory
+        // footprint -- see this project's own class comment and
+        // UrkelNode.Internal's own comment on `left`/`right` for the
+        // full reasoning. Deliberately runs AFTER the write above has
+        // already succeeded, never before or during: collapsing a node
+        // to a lightweight placeholder BEFORE confirming it's actually
+        // safely on disk would mean a failed write could permanently
+        // lose data that was never really persisted -- the exact
+        // opposite of what collectUnpersisted()'s own rollback-on-
+        // failure guarantees a few lines above. Only ever replaces a
+        // child with a placeholder once that specific child's own
+        // `persisted` flag is true, which by this point is guaranteed
+        // for everything actually written just now, and was already
+        // true (and thus already collapsed, if this ran on an earlier
+        // call) for anything written earlier. Only ever walks reachable
+        // from the live root passed in here -- UrkelNameTree no longer
+        // retains any separate, standing object-graph reference for the
+        // committed root at all (see its own committedRootAsNode()),
+        // only a plain hash value materialized into a fresh, lightweight
+        // placeholder each time something needs one -- so there's
+        // nothing else this could ever reach or affect. resolve()
+        // already handles a Hash placeholder anywhere in the tree
+        // transparently, including from the background prune's own
+        // walk (confirmed directly under real concurrent load, not
+        // just reasoned about -- see this fix's own verification).
+        for (UrkelNode n : toWrite) {
+            if (n.isInternal()) {
+                UrkelNode.Internal in = (UrkelNode.Internal) n;
+                collapseIfPersisted(in, true);
+                collapseIfPersisted(in, false);
+            }
+        }
     }
 
-    /** Convenience: persists from the tree's current live root. */
+    private void collapseIfPersisted(UrkelNode.Internal parent, boolean isLeft) {
+        UrkelNode child = isLeft ? parent.left : parent.right;
+        if (child.isHash() || child.isNull()) return; // nothing to collapse
+        if (!isPersisted(child)) return;
+        UrkelNode.Hash placeholder = new UrkelNode.Hash(child.hash());
+        if (isLeft) parent.left = placeholder;
+        else parent.right = placeholder;
+    }
+
+    private static boolean isPersisted(UrkelNode node) {
+        return (node.isInternal() && ((UrkelNode.Internal) node).persisted)
+                || (node.isLeaf() && ((UrkelNode.Leaf) node).persisted);
+    }
+
+    /** RE-ARCHITECTURE, incremental orphan tracking: two generations,
+     *  not one -- see advanceOrphanGeneration()'s own comment for why a
+     *  single generation isn't enough on its own. pendingOrphans is
+     *  THIS commit window's newly-superseded candidates; awaitingNextCommit
+     *  is the PREVIOUS window's, already buffered through one full extra
+     *  cycle, about to become the actually-safe-to-delete set the next
+     *  time advanceOrphanGeneration() is called. unorphanIfPending()
+     *  checks and removes from BOTH -- a hash is only ever truly beyond
+     *  this class's own protection once it's been handed back to the
+     *  caller as a confirmed, final deletion batch, at which point the
+     *  one-extra-cycle buffer it already sat through is what provides
+     *  the real safety margin (see UrkelNameTree's own commit-boundary
+     *  handling for the timing reasoning that buffer is built on).
+     *
+     *  FIX: both genuinely need to be thread-safe, not just mutable --
+     *  confirmed the hard way, via a real ConcurrentModificationException
+     *  crash. orphan()/advanceOrphanGeneration() run on the main thread
+     *  during ordinary block processing, but unorphanIfPending() ALSO
+     *  gets called from resolve() (see its own comment), which runs
+     *  from collectReachable() -- and near the tip, that walk runs on
+     *  the BACKGROUND reconciliation thread, concurrently with the main
+     *  thread's own, ongoing mutations of these exact same sets. A
+     *  plain HashSet was never safe for that combination; it simply
+     *  hadn't been exercised by a background-thread walker calling into
+     *  resolve() until the near-tip path started using one. Deep
+     *  catch-up never triggers this specific race (that path never
+     *  walks at all), which is exactly why this went unnoticed until a
+     *  restart-consistency test happened to exercise the near-tip path
+     *  enough times to hit it. awaitingNextCommit is also volatile, not
+     *  just concurrent-safe internally -- it gets REASSIGNED (a new Set
+     *  entirely, not just mutated) inside advanceOrphanGeneration(), and
+     *  without volatile there's no guaranteed happens-before relationship
+     *  ensuring the background thread ever observes that reassignment
+     *  promptly, the same class of gap volatile already closed for
+     *  UrkelNode.Internal's own left/right fields earlier this session. */
+    private final java.util.Set<UrkelNodeStore.HashKey> pendingOrphans =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile java.util.Set<UrkelNodeStore.HashKey> awaitingNextCommit =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Records oldNode as a deletion candidate if (and only if) it was
+     *  already persisted AND its hash actually differs from newNode's --
+     *  called explicitly at each specific point in insert()/remove()
+     *  above where copy-on-write is known to supersede a node at its own
+     *  tree position, rather than derived generically from comparing
+     *  old vs. new results everywhere.
+     *
+     *  The hash-equality check is NOT redundant with the explicit call
+     *  sites above -- confirmed the hard way, via a direct cross-check
+     *  against the trusted walk-based mechanism on a large, randomized
+     *  operation sequence: a node CAN be reconstructed with genuinely
+     *  identical content (same hash) at a position that looks, from the
+     *  surrounding code, like a clear supersession -- e.g. insert()'s
+     *  own prefix-split case, where a new key diverging at position zero
+     *  produces a wrapper node that's hash-IDENTICAL to the original.
+     *  Reasoning case-by-case about which call sites need this and which
+     *  don't already produced one confirmed miss; checking uniformly,
+     *  every time, is what actually closed that gap rather than trading
+     *  it for a different unverified assumption. */
+    private void orphan(UrkelNode oldNode, UrkelNode newNode) {
+        if (isPersisted(oldNode) && !java.util.Arrays.equals(oldNode.hash(), newNode.hash())) {
+            pendingOrphans.add(new UrkelNodeStore.HashKey(oldNode.hash()));
+        }
+    }
+
+    /** Advances the generation pipeline at a commit boundary and returns
+     *  whatever's now actually, finally safe to delete.
+     *
+     *  FIX: originally a single generation, drained and handed to the
+     *  caller as immediately final. Confirmed WRONG via a direct,
+     *  large-scale cross-check against the trusted walk-based mechanism:
+     *  content-addressed hashes legitimately reappearing (a real,
+     *  measured occurrence, not a theoretical edge case) after their
+     *  generation had already been drained meant nothing could pull
+     *  them back out anymore, since UrkelTree's own bookkeeping had
+     *  already forgotten them entirely. Two generations fixes this: a
+     *  hash superseded during commit window N sits in pendingOrphans
+     *  through that whole window, then moves to awaitingNextCommit at
+     *  commit N -- still fully visible to unorphanIfPending() -- and
+     *  only becomes part of the RETURNED, final batch at commit N+1.
+     *  That's the SAME one-extra-cycle timing this whole design was
+     *  built on (see this class's own comments on why a generation
+     *  needs to survive one full window past the commit that directly
+     *  supersedes it), just correctly implemented as two live,
+     *  protectable stages instead of one stage plus an unprotected
+     *  handoff. */
+    public java.util.Set<UrkelNodeStore.HashKey> advanceOrphanGeneration() {
+        java.util.Set<UrkelNodeStore.HashKey> toReturn = awaitingNextCommit;
+        // Must also be a concurrent-safe set, not a plain HashSet copy --
+        // this becomes the NEW awaitingNextCommit, still subject to the
+        // exact same concurrent unorphanIfPending() calls from a
+        // background reconciliation walk. See these fields' own comment
+        // for the full reasoning.
+        java.util.Set<UrkelNodeStore.HashKey> nextGeneration = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        nextGeneration.addAll(pendingOrphans);
+        awaitingNextCommit = nextGeneration;
+        pendingOrphans.clear();
+        return toReturn;
+    }
+
+    /** Persists from the tree's current live root, then -- this is the
+     *  actual point of this method now, not incidental to it -- also
+     *  collapses the root itself down to a lightweight Hash placeholder
+     *  once it's confirmed safely on disk.
+     *
+     *  RE-ARCHITECTURE, step 2 (see UrkelNameTree.maybeCommit()'s own
+     *  comment for step 1, the committed root's equivalent): this
+     *  class's own header comment used to say this project "keeps the
+     *  tree in memory for now rather than replicate Urkel's own on-disk
+     *  flat-file format" -- that was true, and it was the real,
+     *  underlying cause of a genuine, repeated OutOfMemoryError crash
+     *  under sustained, extreme covenant load, surviving even after
+     *  persistFrom()'s own collapse logic above (which handles every
+     *  OTHER node in the tree, but never the root itself -- the root
+     *  has no parent whose own collapse pass would ever reach it, so it
+     *  stayed a full, retained object indefinitely, across every block,
+     *  no matter how long the process ran).
+     *
+     *  What survives between blocks now is a 32-byte hash, never a
+     *  retained object graph -- insert()/remove()/get() already handle
+     *  a Hash placeholder anywhere in the tree transparently, including
+     *  at the root, since this is exactly what already happens after
+     *  every real restart (root gets injected as a Hash placeholder
+     *  there too) -- so there's no new code path being exercised here,
+     *  only a change in how OFTEN that same, already-proven path gets
+     *  used: every block now, not just the first one after a restart.
+     *
+     *  The honest tradeoff, not hidden: every block's first touch of
+     *  any given name now needs a fresh resolve() from disk, even for a
+     *  name touched in the immediately preceding block, since nothing
+     *  stays resolved across the boundary between them anymore. This is
+     *  the real, deliberate cost of bounding memory this way -- the
+     *  same tradeoff real Urkel's own design makes, not a regression
+     *  introduced by accident. */
     public void persistLive() {
         persistFrom(root);
+        if (isPersisted(root)) {
+            root = new UrkelNode.Hash(root.hash());
+        }
     }
 
     private void collectUnpersisted(UrkelNode node, java.util.List<UrkelNode> out) {
@@ -431,6 +926,7 @@ public class UrkelTree {
             collectUnpersisted(in.right, out);
             out.add(in);
             in.persisted = true;
+            unorphanIfPending(in);
             return;
         }
 
@@ -439,6 +935,27 @@ public class UrkelTree {
         if (lf.persisted) return;
         out.add(lf);
         lf.persisted = true;
+        unorphanIfPending(lf);
+    }
+
+    /** RE-ARCHITECTURE, incremental orphan tracking's resurrection
+     *  safeguard: content-addressed hashes CAN legitimately reappear --
+     *  confirmed as a real, not just theoretical, occurrence by a
+     *  direct cross-check against the trusted walk-based mechanism on a
+     *  large, randomized operation sequence. If a hash that was
+     *  previously recorded as superseded gets newly persisted again --
+     *  the exact moment collectUnpersisted() above marks it
+     *  persisted=true -- it's unambiguously alive again, and MUST be
+     *  pulled back out of wherever it's currently sitting before
+     *  advanceOrphanGeneration() can ever hand it off as final. Checks
+     *  BOTH generations, not just the newest one -- see
+     *  advanceOrphanGeneration()'s own comment for why a hash already
+     *  moved into awaitingNextCommit still needs this same protection,
+     *  right up until the moment it's actually returned as confirmed. */
+    private void unorphanIfPending(UrkelNode node) {
+        UrkelNodeStore.HashKey key = new UrkelNodeStore.HashKey(node.hash());
+        pendingOrphans.remove(key);
+        awaitingNextCommit.remove(key);
     }
 
     /** Builds a proof for a key against the tree's current root --

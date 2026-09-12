@@ -84,27 +84,33 @@ public class ChainDB {
      *  thread, not inline here. */
     public record PersistTiming(long persistBlockNanos, long maybeCommitNanos) {}
 
-    /** Call once per block, after every covenant in that block has
-     *  already been applied via getNameTree().applyNameState() --
-     *  persists any newly created tree nodes, then advances the
-     *  official committed root if this height lands on a real
-     *  interval boundary (see UrkelNameTree.maybeCommit()). Both root
-     *  pointers get written to meta immediately, not just held in
-     *  memory, so a restart at any point resumes from exactly here. */
+    /** Convenience overload -- bestKnownPeerHeight=0 (unknown), which
+     *  UrkelNameTree.maybeCommit() treats the same safe way
+     *  BlockProcessor's own signature-verification skip does: unknown
+     *  means "assume we're at/near the tip," normal frequent pruning,
+     *  never the reduced-during-catchup schedule. Real production code
+     *  always goes through the overload below instead, which passes
+     *  the real value through from ChainSync; this one exists mainly
+     *  so tests and tools that don't have (or need) a real peer-height
+     *  value don't have to fabricate one. */
     public void persistNameTreeState(int height) {
-        persistNameTreeStateTimed(height);
+        persistNameTreeState(height, 0);
+    }
+
+    public void persistNameTreeState(int height, int bestKnownPeerHeight) {
+        persistNameTreeStateTimed(height, bestKnownPeerHeight);
     }
 
     /** Same as persistNameTreeState(), but returns a breakdown of
      *  where the time actually went -- see PersistTiming's own comment
      *  for why this distinction matters. */
-    public PersistTiming persistNameTreeStateTimed(int height) {
+    public PersistTiming persistNameTreeStateTimed(int height, int bestKnownPeerHeight) {
         long t0 = System.nanoTime();
         nameTree.persistBlock();
         meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
         long t1 = System.nanoTime();
 
-        if (nameTree.maybeCommit(height)) {
+        if (nameTree.maybeCommit(height, bestKnownPeerHeight)) {
             meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
         }
         long t2 = System.nanoTime();
@@ -541,18 +547,67 @@ public class ChainDB {
         }
     }
 
+    // FIX: saveName() previously wrote each covenant's name update
+    // directly, individually -- one RocksDB put() per covenant.
+    // Confirmed as a real, measurable contributor to slow covenant
+    // processing at real production scale (several hundred covenants
+    // per block during high-activity ranges of the chain): the exact
+    // same class of overhead (per-operation JNI/native round-trip
+    // cost) that WriteBatch already fixed for the Urkel tree's own
+    // node writes. Buffers this block's writes here instead, and
+    // flushPendingNames() -- called once per block, from
+    // BlockProcessor, at the same point persistNameTreeState() already
+    // runs -- writes them all as a single batched operation.
+    //
+    // getNameByHash() checks this buffer FIRST, before falling back to
+    // the real, on-disk map -- required for correctness, not just a
+    // nice-to-have: getNameByHash() is called from more than just the
+    // covenant-processing path that calls saveName() (RPC handlers, in
+    // particular, run on a separate thread and could ask for a name's
+    // state at any point, including mid-block, before this block's
+    // writes have been flushed). Without this, an RPC caller -- or a
+    // second covenant touching the same name later in the SAME block,
+    // both real, possible scenarios -- could see stale data.
+    private final java.util.Map<String, String> pendingNameWrites = new java.util.concurrent.ConcurrentHashMap<>();
+
     public void saveName(NameEntry entry) {
-        names.put(entry.nameHash, entry.toStorage());
+        pendingNameWrites.put(entry.nameHash, entry.toStorage());
+    }
+
+    /** Writes this block's buffered name updates as a single batched
+     *  operation, then clears the buffer. Must be called once per
+     *  block, BEFORE setBlockTip() advances for that block (see
+     *  BlockProcessor's own call site) -- setBlockTip() is
+     *  deliberately the last thing written per block specifically so a
+     *  crash before it means the whole block gets safely reprocessed
+     *  on restart; calling this after setBlockTip() would break that
+     *  guarantee, since a crash between them would permanently lose
+     *  buffered name writes for a block already marked complete. */
+    public void flushPendingNames() {
+        if (pendingNameWrites.isEmpty()) return;
+        names.putAll(pendingNameWrites);
+        pendingNameWrites.clear();
     }
 
     public NameEntry getNameByHash(String nameHash) {
+        String pending = pendingNameWrites.get(nameHash);
+        if (pending != null) return NameEntry.fromStorage(pending);
         String s = names.get(nameHash);
         return s != null ? NameEntry.fromStorage(s) : null;
     }
 
     public NameEntry getNameByString(String name) {
+        // Checks the pending (not-yet-flushed) buffer first, for the
+        // same reason getNameByHash() does -- see saveName()'s own
+        // comment. Small (at most one block's worth of writes), so
+        // scanning it first is cheap.
+        for (String storage : pendingNameWrites.values()) {
+            NameEntry ne = NameEntry.fromStorage(storage);
+            if (name.equalsIgnoreCase(ne.name)) return ne;
+        }
         // Linear scan — acceptable since name index is maintained separately
         for (var e : names.entrySet()) {
+            if (pendingNameWrites.containsKey(e.getKey())) continue; // already checked above, pending takes precedence
             NameEntry ne = NameEntry.fromStorage(e.getValue());
             if (name.equalsIgnoreCase(ne.name)) return ne;
         }
@@ -560,17 +615,41 @@ public class ChainDB {
     }
 
     public int getNameCount() {
-        return names.size();
+        // Pending entries not yet in `names` still need to count --
+        // but a pending entry for an EXISTING name (an update, not a
+        // brand-new registration) must not be double-counted.
+        int pendingNew = 0;
+        for (String key : pendingNameWrites.keySet()) {
+            if (!names.containsKey(key)) pendingNew++;
+        }
+        return names.size() + pendingNew;
+    }
+
+    /** Fast, approximate name count -- see KVMap.sizeEstimate()'s own
+     *  comment. Doesn't bother accounting for pendingNameWrites the way
+     *  getNameCount() does -- that buffer is only ever a single block's
+     *  worth of entries at most, trivial next to real production scale,
+     *  and this method exists purely for a startup banner where an
+     *  approximate figure was already the whole point. */
+    public int getNameCountEstimate() {
+        return names.sizeEstimate();
     }
 
     /** All names currently tracked, for the "getnames" RPC method.
      *  Skips any record that fails to parse (see NameEntry.fromStorage()'s
      *  defensive handling) rather than letting one bad record break the
-     *  whole listing. */
+     *  whole listing. Includes pending (not-yet-flushed) writes, taking
+     *  precedence over the committed version of the same name, for the
+     *  same reason getNameByHash() does. */
     public List<NameEntry> getAllNames() {
         List<NameEntry> result = new ArrayList<>();
-        for (String raw : names.values()) {
+        for (String raw : pendingNameWrites.values()) {
             NameEntry e = NameEntry.fromStorage(raw);
+            if (e != null) result.add(e);
+        }
+        for (var entry : names.entrySet()) {
+            if (pendingNameWrites.containsKey(entry.getKey())) continue; // already included above, pending takes precedence
+            NameEntry e = NameEntry.fromStorage(entry.getValue());
             if (e != null) result.add(e);
         }
         return result;
@@ -606,6 +685,17 @@ public class ChainDB {
     public int getHeaderCount()  { return headers.size(); }
     public int getBlockCount()   { return blocks.size(); }
     public int getUtxoCount()    { return utxos.size(); }
+
+    /** Fast, approximate counterparts -- see KVMap.sizeEstimate()'s own
+     *  comment. getUtxoCount()/getBlockCount()/getHeaderCount() stay
+     *  exact for their existing callers (gettxoutsetinfo genuinely
+     *  wants precision for an explicit audit-style RPC; these estimate
+     *  versions exist purely for Main's own startup banner, confirmed
+     *  directly to have been causing a real, multi-minute silent stall
+     *  at real production scale). */
+    public int getHeaderCountEstimate() { return headers.sizeEstimate(); }
+    public int getBlockCountEstimate()  { return blocks.sizeEstimate(); }
+    public int getUtxoCountEstimate()   { return utxos.sizeEstimate(); }
 
     /** Sums every UTXO's value -- a real linear scan, acceptable here
      *  since gettxoutsetinfo is an infrequent, user-initiated diagnostic

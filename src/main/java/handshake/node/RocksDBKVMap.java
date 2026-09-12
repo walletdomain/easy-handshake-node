@@ -109,6 +109,26 @@ public class RocksDBKVMap<K, V> implements KVMap<K, V> {
     }
 
     @Override
+    public int sizeEstimate() {
+        // RocksDB's own O(1) approximate property -- explicitly not
+        // exact (per RocksDB's own docs, can drift from the true count,
+        // especially soon after writes/compaction), which is exactly
+        // why size() itself can't just use this everywhere -- but for
+        // a purely informational count, this is the right tradeoff:
+        // instant instead of a real, multi-minute full iteration at
+        // real production scale.
+        try {
+            return (int) db.getLongProperty(cf, "rocksdb.estimate-num-keys");
+        } catch (org.rocksdb.RocksDBException e) {
+            // Fall back to the real, exact (but slow) count rather than
+            // silently reporting 0 -- this should be rare (the property
+            // itself is well-supported), but a startup banner showing
+            // "0" for everything would be actively misleading.
+            return size();
+        }
+    }
+
+    @Override
     public void clear() {
         // No direct "clear this column family" call -- iterate and
         // delete via a WriteBatch rather than one delete() per key,
@@ -252,5 +272,52 @@ public class RocksDBKVMap<K, V> implements KVMap<K, V> {
         // Matches the exact behavior this replaces: the count of keys
         // attempted, not a re-verified "actually existed" count.
         return keys.size();
+    }
+
+    /** Real, native RocksDB snapshot -- db.getSnapshot() is O(1),
+     *  confirmed directly (via a real compile-and-run test against the
+     *  actual RocksDB API) not to require copying or iterating
+     *  anything upfront. The expensive part (actually enumerating
+     *  keys) is deferred entirely into keys(), which callers are
+     *  expected to invoke later, off the calling thread -- see
+     *  KVMap.openSnapshot()'s own comment for why this specific split
+     *  exists. */
+    @Override
+    public KVSnapshot<K> openSnapshot() {
+        Snapshot snap = db.getSnapshot();
+        return new KVSnapshot<K>() {
+            @Override
+            public Set<K> keys() {
+                Set<K> result = new LinkedHashSet<>();
+                try (ReadOptions readOpts = new ReadOptions().setSnapshot(snap);
+                     RocksIterator it = db.newIterator(cf, readOpts)) {
+                    for (it.seekToFirst(); it.isValid(); it.next()) {
+                        result.add(decodeKey.apply(it.key()));
+                    }
+                }
+                return result;
+            }
+
+            @Override
+            public void forEachKey(java.util.function.Consumer<K> action) {
+                // FIX: real, streaming iteration -- never materializes
+                // more than one key at a time, unlike keys() above. See
+                // KVSnapshot.forEachKey()'s own comment for the full
+                // reasoning; this is the actual fix for a real,
+                // confirmed OOM crash.
+                try (ReadOptions readOpts = new ReadOptions().setSnapshot(snap);
+                     RocksIterator it = db.newIterator(cf, readOpts)) {
+                    for (it.seekToFirst(); it.isValid(); it.next()) {
+                        action.accept(decodeKey.apply(it.key()));
+                    }
+                }
+            }
+
+            @Override
+            public void close() {
+                db.releaseSnapshot(snap);
+                snap.close();
+            }
+        };
     }
 }
