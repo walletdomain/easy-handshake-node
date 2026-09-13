@@ -30,7 +30,7 @@ public final class WebAdminServerContent {
             <body>
                 <header>
                     <h1>Easy Handshake Node</h1>
-                    <p class="subtitle">Local admin interface</p>
+                    <p class="subtitle">Local admin interface &middot; v<span id="version">...</span></p>
                 </header>
                 <main>
                     <div class="column">
@@ -50,16 +50,8 @@ public final class WebAdminServerContent {
 
                         <section class="card">
                             <h2>Configuration</h2>
-                            <p class="hint">Changes to ports or host require a restart to take effect.</p>
+                            <p class="hint">Changes to the RPC host require a restart to take effect.</p>
                             <form id="config-form">
-                                <label>
-                                    P2P port
-                                    <input type="number" name="p2p.port" min="1" max="65535">
-                                </label>
-                                <label>
-                                    RPC port
-                                    <input type="number" name="rpc.port" min="1" max="65535">
-                                </label>
                                 <label>
                                     RPC host
                                     <input type="text" name="rpc.host">
@@ -599,6 +591,7 @@ public final class WebAdminServerContent {
                 try {
                     const res = await fetch("/api/status");
                     const data = await res.json();
+                    document.getElementById("version").textContent = data.version;
                     document.getElementById("uptime").textContent = data.uptime;
                     document.getElementById("block-height").textContent = data.blockHeight;
                     // syncPercent is null until at least one peer has
@@ -734,8 +727,6 @@ public final class WebAdminServerContent {
                 try {
                     const res = await fetch("/api/config");
                     const data = await res.json();
-                    form.elements["p2p.port"].value = data["p2p.port"];
-                    form.elements["rpc.port"].value = data["rpc.port"];
                     form.elements["rpc.host"].value = data["rpc.host"];
                 } catch (e) {
                     document.getElementById("config-message").textContent = "Failed to load current configuration.";
@@ -751,8 +742,6 @@ public final class WebAdminServerContent {
                 message.className = "";
 
                 const payload = {
-                    "p2p.port": Number(form.elements["p2p.port"].value),
-                    "rpc.port": Number(form.elements["rpc.port"].value),
                     "rpc.host": form.elements["rpc.host"].value
                 };
 

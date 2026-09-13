@@ -55,13 +55,29 @@ public class WebAdminServer {
      *  appear to save successfully while having zero real effect.
      *  "network" and "index.tx" used to be here too -- see
      *  NodeConfig.getNetwork()/indexTx()'s own comments for why they're
-     *  now hardcoded rather than editable at all. */
+     *  now hardcoded rather than editable at all.
+     *
+     *  FIX: "p2p.port" and "rpc.port" removed from here too, at the
+     *  person's own request -- both are above 1024 (no elevated
+     *  privileges needed), neither collides with any other common
+     *  software, and both are this project's fixed, standard ports for
+     *  Handshake P2P and RPC traffic specifically. There's no real
+     *  scenario where a newcomer benefits from changing either, and
+     *  every scenario where doing so by accident (a typo, a
+     *  misunderstanding) quietly breaks connectivity in a confusing
+     *  way. Enforced here, not just by removing the form fields in
+     *  WebAdminServerContent's HTML/JS -- a direct POST to this
+     *  endpoint attempting either key is rejected the same way an
+     *  unknown key already is, so the UI omission is a real guarantee,
+     *  not just a suggestion. rpc.host stays editable (a genuine,
+     *  occasionally useful setting, e.g. binding somewhere other than
+     *  loopback for a deliberate remote-RPC setup). */
     private static final Set<String> EDITABLE_KEYS = Set.of(
-            "p2p.port", "rpc.port", "rpc.host"
+            "rpc.host"
     );
 
     private static final Set<String> REQUIRES_RESTART = Set.of(
-            "p2p.port", "rpc.port", "rpc.host"
+            "rpc.host"
     );
 
     private final NodeConfig config;
@@ -166,6 +182,7 @@ public class WebAdminServer {
             }
 
             String json = "{"
+                    + "\"version\":\"" + jsonEscape(NodeConfig.VERSION) + "\","
                     + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
                     + "\"blockHeight\":" + blockHeight + ","
                     + "\"networkHeight\":" + networkHeight + ","
@@ -410,8 +427,6 @@ public class WebAdminServer {
         try {
             if (ex.getRequestMethod().equals("GET")) {
                 StringBuilder sb = new StringBuilder("{");
-                sb.append("\"p2p.port\":").append(config.getP2pPort()).append(",");
-                sb.append("\"rpc.port\":").append(config.getRpcPort()).append(",");
                 sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\"");
                 sb.append("}");
                 respondJson(ex, 200, sb.toString());

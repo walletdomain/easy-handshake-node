@@ -18,10 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *   - No double-spends against UTXO set
  *   - No double-spends within mempool
  *   - Covenant type rules (basic sanity)
+ *   - Full, name-state-aware covenant validation (see CovenantValidator)
  *   - Minimum relay fee
  * <p>
- * Note: Full covenant validation (bad-txns-covenants) requires
- * name state lookups — that is done in CovenantValidator.
  */
 public class Mempool {
 
@@ -207,6 +206,21 @@ public class Mempool {
         long outputValue = 0;
         for (TxParser.Output output : tx.outputs) {
             outputValue += output.value;
+        }
+
+        // FIX (Part 2): full, name-state-aware covenant validation --
+        // previously only basic covenant TYPE sanity was checked here
+        // (see this class's own doc comment); this is the real gap that
+        // comment referenced by name. mempoolHeight is tip+1, matching
+        // the height this transaction would actually confirm at if
+        // mined immediately.
+        int mempoolHeightForValidation = db.getBlockTip() + 1;
+        for (TxParser.Output output : tx.outputs) {
+            if (output.covenant == null) continue;
+            String rejectReason = CovenantValidator.validate(output, db, mempoolHeightForValidation);
+            if (rejectReason != null) {
+                throw new Exception(rejectReason);
+            }
         }
 
         if (outputValue > inputValue)

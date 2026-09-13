@@ -79,6 +79,26 @@ public class NodeConfig {
         this.dataDir  = dataDir;
         this.settings = ConfigDB.open(dataDir).settingsMap();
         System.out.println("[Config] Loaded " + settings.size() + " settings from the config database");
+
+        // FIX: persist the currently-running version into the config
+        // database itself, updated on every single startup -- not just
+        // read from the VERSION constant above. This doesn't do
+        // anything with the value yet (no upgrade-checking logic exists
+        // today), but it means that capability can be added later
+        // without a migration: "node.version.previous" already holds
+        // whatever version last successfully started against this
+        // exact database, from the very first time this change ships,
+        // rather than only from whenever someone eventually gets around
+        // to building the actual version-check feature. Captured BEFORE
+        // overwriting "node.version" with the current version, so a
+        // future upgrade-detector can compare the two and see exactly
+        // what changed, not just what the current version is.
+        String previousVersion = settings.get("node.version");
+        if (previousVersion != null && !previousVersion.equals(VERSION)) {
+            settings.put("node.version.previous", previousVersion);
+        }
+        settings.put("node.version", VERSION);
+        ConfigDB.get().commit();
     }
 
     // ── Getters ───────────────────────────────────────────────────────────────
@@ -131,6 +151,22 @@ public class NodeConfig {
      *  want one. */
     public boolean indexTx()        { return DEFAULT_INDEX_TX; }
     public String  getLogLevel()    { return get("log.level",      DEFAULT_LOG_LEVEL); }
+    /** The version this exact database was last successfully opened
+     *  by, immediately before the current run's own version overwrote
+     *  it in the constructor -- null if this is the very first run
+     *  against this database, or if the version has never changed
+     *  across restarts. Not consulted by anything today; exists so a
+     *  future upgrade/migration check has real historical data to work
+     *  from from day one. */
+    public String  getPreviousVersion() { return settings.get("node.version.previous"); }
+    /** The version recorded the last time this database was opened --
+     *  by definition always equal to VERSION right now, since the
+     *  constructor just wrote it, but exposed as its own accessor
+     *  (rather than pointing callers at the VERSION constant directly)
+     *  so a future version-checker can read "what does the database
+     *  itself say" without caring whether that happens to be sourced
+     *  from the same in-memory constant today. */
+    public String  getStoredVersion()   { return settings.get("node.version"); }
     /** Stored in the config database now, as requested -- editable via
      *  the admin panel is a natural follow-up, not built yet. */
     public String  getUserAgentComment() { return get("p2p.useragent.comment", DEFAULT_USERAGENT_COMMENT); }

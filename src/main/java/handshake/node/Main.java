@@ -23,12 +23,15 @@ import java.nio.file.*;
  * Usage:
  *   java -jar easy-handshake-validator.jar [data-dir]
  * <p>
- * Default data directory: a ".easy-handshake" folder created next to the
- * jar file itself (not the current working directory -- those aren't
- * always the same thing depending on how the jar is launched). On first
- * run this folder doesn't exist yet and gets created along with fresh
- * H2 database files inside it; on later runs its presence is exactly what
- * signals "not a fresh install" and the existing databases get reopened.
+ * Default data directory: a ".easy-handshake-node" folder created in the
+ * user's home directory (not the current working directory, and not
+ * relative to wherever the jar happens to be launched from -- a fixed,
+ * predictable location regardless of how this is started, matching the
+ * companion wallet project's own ".easy-handshake-wallet" file for
+ * consistency on a machine running both). On first run this folder
+ * doesn't exist yet and gets created along with fresh H2 database files
+ * inside it; on later runs its presence is exactly what signals "not a
+ * fresh install" and the existing databases get reopened.
  */
 public class Main {
 
@@ -41,8 +44,7 @@ public class Main {
 
     static void main(String[] args) throws Exception {
         System.out.println("╔══════════════════════════════════════╗");
-        System.out.println("║   Easy Handshake Node  v0.1.0        ║");
-        System.out.println("║   Handshake Validator Node           ║");
+        System.out.println("║   Easy Handshake Node  v" + NodeConfig.VERSION + "        ║");
         System.out.println("╚══════════════════════════════════════╝");
 
         // ── 1. Data directory ─────────────────────────────────────────────────
@@ -208,12 +210,6 @@ public class Main {
     }
 
     /**
-     * Resolves ".easy-handshake" next to the actual running jar file, not
-     * relative to the current working directory. Falls back to a relative
-     * "./.easy-handshake" if the jar's own location can't be determined
-     * (e.g. running exploded classes from an IDE rather than a real jar).
-     */
-    /**
      * Tries to acquire an exclusive lock on a small, dedicated lock file
      * (not the database itself) as the very first thing this process
      * does with the data directory. If another instance already holds
@@ -274,80 +270,29 @@ public class Main {
     }
 
     private static String defaultDataDir() {
-        // FIX: previously always resolved to the user's home directory,
-        // regardless of where the jar itself was run from. That's the
-        // right choice when the jar lives somewhere that might not be
-        // writable (e.g. a system-protected install location), which is
-        // exactly why this was moved away from resolving relative to
-        // the jar/classes location in the first place.
-        //
-        // But it also meant there was no way to make a node default to
-        // storing its (potentially very large -- tens of GB even this
-        // early in the chain) database next to a deliberately-chosen
-        // location, like a NAS or LAN drive, without an explicit
-        // command-line argument every single run. If the person places
-        // and runs the jar itself from such a location on purpose, the
-        // data belongs right there by default.
-        //
-        // So: prefer a .easy-handshake folder next to the running
-        // jar/classes, but only if that location is actually writable
-        // right now -- falling back to the home directory otherwise,
-        // preserving the original robustness this code was written for.
-        // This keeps the explicit command-line argument (see main()'s
-        // args[0] handling, a few lines up) as the one, already-existing
-        // way to fully override the location regardless of where the
-        // jar lives.
-        String jarAdjacent = jarAdjacentDataDir();
-        if (jarAdjacent != null && isWritableDataDir(jarAdjacent)) {
-            return jarAdjacent;
-        }
-        return Path.of(System.getProperty("user.home"), ".easy-handshake").toString();
+        // FIX: now always the user's home directory, not preferentially
+        // next to the running jar. That jar-adjacent preference existed
+        // to support deliberately running the jar from a chosen large
+        // storage location (a NAS, a LAN drive) without needing an
+        // explicit argument every run -- but it also meant the data
+        // directory's location depended on where the jar happened to be
+        // launched from, which stopped making sense once a companion
+        // wallet project needed a predictable, matching location of its
+        // own (see the folder name itself, changed alongside this same
+        // fix -- ".easy-handshake-node", not ".easy-handshake", so it
+        // sits consistently next to ".easy-handshake-wallet" on any
+        // machine running both). The NAS/LAN-drive use case doesn't
+        // disappear -- it's still fully served by the explicit
+        // command-line argument (see main()'s args[0] handling), which
+        // was always the more deliberate, more discoverable way to
+        // choose a non-default location anyway.
+        return Path.of(System.getProperty("user.home"), ".easy-handshake-node").toString();
     }
 
-    /** Returns a .easy-handshake path next to the running jar (or, in a
-     *  dev/IDE run, next to the compiled classes root), or null if that
-     *  location can't be determined at all -- some launch mechanisms
-     *  (certain application-packaging tools, some test runners) don't
-     *  expose a usable code source location, and falling back cleanly
-     *  is far better than failing startup over it. */
-    private static String jarAdjacentDataDir() {
-        try {
-            java.net.URI codeLocation = Main.class.getProtectionDomain()
-                    .getCodeSource().getLocation().toURI();
-            Path codePath = Path.of(codeLocation);
-            // A packaged jar's code source IS the jar file itself, so
-            // its parent is the containing folder. A dev/IDE run's code
-            // source is the classes ROOT DIRECTORY (e.g. target/classes)
-            // itself, which is already the directory we want -- no
-            // extra parent step there, or this would land one level too
-            // high (in target/ instead of alongside the actual run).
-            Path containingDir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
-            if (containingDir == null) return null;
-            return containingDir.resolve(".easy-handshake").toString();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /** Checks whether a data directory is actually usable right now --
-     *  by creating it (mkdirs is a no-op if it already exists) and
-     *  writing then deleting a small marker file, rather than trusting
-     *  any weaker signal. This is deliberately conservative: a NAS
-     *  that's temporarily unreachable, a read-only mount, or a
-     *  permissions issue should all cleanly fall back to the home
-     *  directory rather than fail startup outright. */
-    private static boolean isWritableDataDir(String dir) {
-        try {
-            Path dirPath = Path.of(dir);
-            Files.createDirectories(dirPath);
-            Path marker = dirPath.resolve(".write-test");
-            Files.writeString(marker, "");
-            Files.delete(marker);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
+    /** RE-ARCHITECTURE: no longer used -- isWritableDataDir() existed
+     *  solely to support the jar-adjacent data directory preference
+     *  removed alongside this same change (see defaultDataDir()'s own
+     *  comment). Removed rather than left as dead code. */
 
     /** Runs one shutdown step in isolation -- a failure here is reported
      *  but never prevents the remaining steps from running. See the

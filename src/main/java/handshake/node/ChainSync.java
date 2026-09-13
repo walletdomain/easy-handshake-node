@@ -67,6 +67,15 @@ public class ChainSync {
     private static final int MSG_TX          = 14;
     private static final int MSG_REJECT      = 15;
     private static final int MSG_MEMPOOL     = 16;
+    // FIX: added for wallet SPV support -- values verified directly
+    // against real hsd's own lib/net/packets.js (exports.types), not
+    // assumed from Bitcoin's BIP37 numbering, though in this case they
+    // happen to match exactly since hsd's packet enum is a direct,
+    // unmodified continuation of bcoin's own.
+    private static final int MSG_FILTERLOAD  = 17;
+    private static final int MSG_FILTERADD   = 18;
+    private static final int MSG_FILTERCLEAR = 19;
+    private static final int MSG_MERKLEBLOCK = 20;
 
     // Real hsd frame wrapper (goes INSIDE the Brontide-encrypted payload):
     // magic(4 LE) + cmd(1) + length(4 LE) + payload(N). No checksum, 9-byte
@@ -1320,12 +1329,86 @@ public class ChainSync {
                     serveGetData(conn, Arrays.copyOfRange(msg, 9, msg.length));
                 } else if (type == MSG_INV) {
                     handleInv(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                } else if (type == MSG_FILTERLOAD) {
+                    handleFilterLoad(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                } else if (type == MSG_FILTERADD) {
+                    handleFilterAdd(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                } else if (type == MSG_FILTERCLEAR) {
+                    conn.bloomFilter = null;
                 }
             }
         } catch (Exception e) {
             // connection error or timeout; fall through to close
         } finally {
             conn.close();
+        }
+    }
+
+    /** FIX: SPV wallet support -- installs a peer's requested bloom
+     *  filter for this connection. Wire format (varint-length-prefixed
+     *  filter bytes + u32 hash-function count + u32 tweak + u8 update
+     *  flag) verified directly against real bfilter's own
+     *  BloomFilter.write()/read() (bcoin-org/bfilter, the library hsd
+     *  itself depends on for this exact feature), not assumed from
+     *  general BIP37 familiarity. Size/hash-function limits (36,000
+     *  bytes, 50 hash functions) are the same real, documented policy
+     *  constants from that same source -- rejecting anything outside
+     *  them here, before ever constructing a filter, rather than
+     *  trusting a peer's claimed parameters. */
+    private void handleFilterLoad(PeerConnection conn, byte[] payload) {
+        BloomFilter parsed = parseFilterLoadPayload(payload, conn.ip);
+        if (parsed != null) conn.bloomFilter = parsed;
+    }
+
+    /** Pure parsing logic, split out from handleFilterLoad() so it can
+     *  be tested directly without needing a live PeerConnection --
+     *  takes a raw FILTERLOAD payload, returns a working BloomFilter or
+     *  null if the payload is malformed or violates policy limits. */
+    static BloomFilter parseFilterLoadPayload(byte[] payload, String peerIpForLogging) {
+        try {
+            int pos = 0;
+            int filterLen = (int) readVarint(payload, pos);
+            pos += varintSize(filterLen);
+            if (filterLen <= 0 || filterLen > 36_000) {
+                System.out.println("[ChainSync] Rejecting FILTERLOAD from " + peerIpForLogging
+                        + " -- filter length " + filterLen + " outside policy limits");
+                return null;
+            }
+            byte[] filterBytes = Arrays.copyOfRange(payload, pos, pos + filterLen);
+            pos += filterLen;
+            int hashFuncs = (int) readLE32(payload, pos); pos += 4;
+            int tweak = (int) readLE32(payload, pos); pos += 4;
+            // update flag (payload[pos]) intentionally unused -- see
+            // matchesFilter()'s own comment on why auto-update isn't
+            // implemented yet.
+            if (hashFuncs <= 0 || hashFuncs > 50) {
+                System.out.println("[ChainSync] Rejecting FILTERLOAD from " + peerIpForLogging
+                        + " -- hashFuncs " + hashFuncs + " outside policy limits");
+                return null;
+            }
+            return new BloomFilter(filterBytes, hashFuncs, tweak);
+        } catch (Exception e) {
+            System.out.println("[ChainSync] Malformed FILTERLOAD from " + peerIpForLogging + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** FIX: SPV wallet support -- adds one more element to a peer's
+     *  already-installed filter (BIP37's "filteradd"), letting a wallet
+     *  extend its watch set without resending the whole filter. Wire
+     *  format is a single varint-length-prefixed byte string, verified
+     *  against real bfilter/hsd's FilterAddPacket. A FILTERADD before
+     *  any FILTERLOAD is simply ignored -- there's nothing to add to. */
+    private void handleFilterAdd(PeerConnection conn, byte[] payload) {
+        if (conn.bloomFilter == null) return;
+        try {
+            int pos = 0;
+            int dataLen = (int) readVarint(payload, pos);
+            pos += varintSize(dataLen);
+            byte[] data = Arrays.copyOfRange(payload, pos, pos + dataLen);
+            conn.bloomFilter.add(data);
+        } catch (Exception e) {
+            System.out.println("[ChainSync] Malformed FILTERADD from " + conn.ip + ": " + e.getMessage());
         }
     }
 
@@ -1421,6 +1504,82 @@ public class ChainSync {
      * skipped rather than answered with NOTFOUND; the requesting peer's
      * own timeout handles that case the same way ours already does.
      */
+    /** FIX: SPV wallet support -- tests whether a parsed transaction
+     *  matches a peer's installed bloom filter, so serveGetData() (and
+     *  eventually mempool relay) can decide between a full BLOCK and a
+     *  filtered MERKLEBLOCK.
+     *
+     *  Checks, in order: the transaction's own txid; each output's
+     *  address hash (the primary "does this tx pay an address I'm
+     *  watching" case); and each input's previous outpoint, encoded as
+     *  hsd/BIP37 do -- 32-byte prev txid followed by a 4-byte
+     *  little-endian index -- covering "does this tx spend a UTXO I'm
+     *  watching".
+     *
+     *  Deliberately NOT implemented yet: BIP37's "auto-update" behavior
+     *  (BLOOM_UPDATE_ALL/PUBKEY_ONLY), where a node automatically adds a
+     *  matched output's own outpoint back into the filter so a LATER
+     *  spend of it is caught without the wallet re-sending FILTERADD.
+     *  That's a convenience optimization, not a correctness requirement
+     *  -- a wallet can always explicitly FILTERADD outpoints as it
+     *  discovers them from its own UTXO tracking. Scoped out
+     *  deliberately for this first pass, not an oversight. */
+    private static boolean matchesFilter(BloomFilter filter, TxParser.ParsedTx tx, byte[] txidRaw) {
+        if (filter.contains(txidRaw)) return true;
+
+        for (TxParser.Output out : tx.outputs) {
+            if (out.addrHash != null && filter.contains(out.addrHash)) return true;
+        }
+
+        for (TxParser.Input in : tx.inputs) {
+            if (in.isCoinbase()) continue;
+            byte[] outpoint = new byte[36];
+            System.arraycopy(in.prevHash, 0, outpoint, 0, 32);
+            outpoint[32] = (byte) in.prevIndex;
+            outpoint[33] = (byte) (in.prevIndex >>> 8);
+            outpoint[34] = (byte) (in.prevIndex >>> 16);
+            outpoint[35] = (byte) (in.prevIndex >>> 24);
+            if (filter.contains(outpoint)) return true;
+        }
+        return false;
+    }
+
+    /** FIX: SPV wallet support -- builds and sends a MERKLEBLOCK plus
+     *  the individual matching TX messages, in place of a full BLOCK,
+     *  for a peer with an active filter. Reuses MerkleProof (already
+     *  ported directly from real hsd's fromMatches()/extractTree() and
+     *  already verified to match hsd's own MerkleBlock wire format
+     *  field-for-field) and BlockProcessor.parseBlockTxs() (already
+     *  used for ordinary block validation) rather than introducing a
+     *  second, parallel way of walking a raw block's transactions. */
+    private void serveFilteredBlock(PeerConnection conn, byte[] rawBlock) throws Exception {
+        List<TxParser.ParsedTx> txs = BlockProcessor.parseBlockTxs(rawBlock);
+        byte[] header = Arrays.copyOf(rawBlock, Math.min(236, rawBlock.length));
+
+        boolean[] matches = new boolean[txs.size()];
+        List<byte[]> leaves = new ArrayList<>(txs.size());
+        List<byte[]> matchingRaw = new ArrayList<>();
+
+        for (int i = 0; i < txs.size(); i++) {
+            TxParser.ParsedTx tx = txs.get(i);
+            byte[] base = Arrays.copyOf(tx.raw, tx.baseSize);
+            byte[] txidRaw = Blake2b.hash256(base);
+            leaves.add(txidRaw);
+            if (matchesFilter(conn.bloomFilter, tx, txidRaw)) {
+                matches[i] = true;
+                matchingRaw.add(tx.raw);
+            }
+        }
+
+        MerkleProof.BuiltProof proof = MerkleProof.buildProof(leaves, matches);
+        byte[] merkleBlockPayload = MerkleProof.serialize(header, proof);
+        conn.sendMessage(MSG_MERKLEBLOCK, merkleBlockPayload);
+
+        for (byte[] rawTx : matchingRaw) {
+            conn.sendMessage(MSG_TX, rawTx);
+        }
+    }
+
     private void serveGetData(PeerConnection conn, byte[] payload) throws Exception {
         int pos = 0;
         int count = (int) readVarint(payload, pos);
@@ -1437,7 +1596,11 @@ public class ChainSync {
                 if (height < 0) continue;
                 byte[] rawBlock = db.getBlock(height);
                 if (rawBlock == null) continue; // header only, block not downloaded
-                conn.sendMessage(MSG_BLOCK, rawBlock);
+                if (conn.bloomFilter != null) {
+                    serveFilteredBlock(conn, rawBlock);
+                } else {
+                    conn.sendMessage(MSG_BLOCK, rawBlock);
+                }
             } else if (itemType == 1 && mempool != null) { // TX
                 byte[] rawTx = mempool.getRaw(hashHex);
                 if (rawTx == null) continue;
@@ -1515,6 +1678,17 @@ public class ChainSync {
         volatile long       bytesRecv = 0;
         volatile long       lastSendTime = 0;
         volatile long       lastRecvTime = 0;
+
+        // FIX: SPV wallet support -- a peer's active bloom filter, if
+        // any. null means no filter installed (serve full blocks, as
+        // before). Set by FILTERLOAD, updated by FILTERADD, cleared by
+        // FILTERCLEAR. volatile since FILTERLOAD/ADD/CLEAR arrive on
+        // this connection's own read thread, but a concurrent block
+        // relay (see serveGetData()/relay logic) reads it too -- same
+        // cross-thread-visibility reasoning already applied to
+        // UrkelNode.Internal's left/right and UrkelTree's
+        // awaitingNextCommit earlier this session, not a new pattern.
+        volatile BloomFilter bloomFilter = null;
 
         PeerConnection(Socket socket, InputStream in, OutputStream out,
                        BrontideState brontide, String ip) {

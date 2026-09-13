@@ -384,16 +384,26 @@ public class BlockProcessor {
     // ── Expiration ───────────────────────────────────────────────────────────
     // Mirrors namestate.js's state()/isExpired()/maybeExpire() exactly.
     // Mainnet timing constants, confirmed from networks.js:
-    private static final int TREE_INTERVAL_CONST = 36;
-    private static final int OPEN_PERIOD = TREE_INTERVAL_CONST + 1;     // 37
-    private static final int BIDDING_PERIOD = 5 * 144;                  // 720
-    private static final int REVEAL_PERIOD = 10 * 144;                  // 1440
-    private static final int RENEWAL_WINDOW = 2 * 365 * 144;            // 105120
-    private static final int AUCTION_MATURITY = (5 + 10 + 14) * 144;    // 4176
-    private static final int LOCKUP_PERIOD = 30 * 144;                  // 4320
+    static final int TREE_INTERVAL_CONST = 36;
+    static final int OPEN_PERIOD = TREE_INTERVAL_CONST + 1;     // 37
+    static final int BIDDING_PERIOD = 5 * 144;                  // 720
+    static final int REVEAL_PERIOD = 10 * 144;                  // 1440
+    static final int RENEWAL_WINDOW = 2 * 365 * 144;            // 105120
+    static final int AUCTION_MATURITY = (5 + 10 + 14) * 144;    // 4176
+    static final int LOCKUP_PERIOD = 30 * 144;                  // 4320
+    // FIX (Part 2, mempool covenant validation): NOT the same constant
+    // as LOCKUP_PERIOD above, despite the similar name -- that one is
+    // networks.js's `lockupPeriod` (claimed/reserved names' lockup
+    // before becoming spendable, 30 days). This is `transferLockup`
+    // (the wait between a TRANSFER and its FINALIZE, 2 days) -- a
+    // genuinely different, separately-named constant in real hsd's own
+    // networks.js that this codebase hadn't needed until now, since
+    // FINALIZE processing (see processNameCovenant()'s COV_FINALIZE
+    // case) only ever applied state, never validated timing.
+    static final int TRANSFER_LOCKUP = 2 * 144;                 // 288
 
     /** 0=OPENING,1=BIDDING,2=REVEAL,3=CLOSED,4=REVOKED,5=LOCKED */
-    private static int computeState(ChainDB.NameEntry e, int height) {
+    static int computeState(ChainDB.NameEntry e, int height) {
         if (e.revoked != 0) return 4; // REVOKED
         if (e.claimed != 0) return (height < e.height + LOCKUP_PERIOD) ? 5 : 3; // LOCKED : CLOSED
         if (height < e.height + OPEN_PERIOD) return 0; // OPENING
@@ -402,7 +412,7 @@ public class BlockProcessor {
         return 3; // CLOSED
     }
 
-    private static boolean isExpired(ChainDB.NameEntry e, int height) {
+    static boolean isExpired(ChainDB.NameEntry e, int height) {
         if (e.revoked != 0) {
             return height >= e.revoked + AUCTION_MATURITY;
         }
@@ -425,7 +435,7 @@ public class BlockProcessor {
     /** Matches real hsd's ns.maybeExpire(height, network) exactly --
      * called on every single covenant touch, before any type-specific
      * handling, confirmed directly from chain.js's verifyCovenants. */
-    private static void maybeExpire(ChainDB.NameEntry e, int height) {
+    static void maybeExpire(ChainDB.NameEntry e, int height) {
         if (isExpired(e, height)) {
             byte[] preservedData = e.resourceData; // reset() preserves data, confirmed from namestate.js's maybeExpire()
             e.height = height;

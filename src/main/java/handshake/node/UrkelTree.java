@@ -654,7 +654,19 @@ public class UrkelTree {
      *  machine at all. */
     public int removeDirectly(java.util.Set<UrkelNodeStore.HashKey> candidates) {
         if (nodeStore == null) return 0;
-        return nodeStore.removeKeys(new java.util.ArrayList<>(candidates));
+        // FIX: freezing the candidate set into the list that will
+        // actually be deleted must happen under the same lock
+        // unorphanIfPending() uses -- otherwise a resurrection could
+        // land in the gap between "candidates snapshotted" and
+        // "unorphanIfPending would have removed this key", still
+        // deleting a node that came back to life a moment too late to
+        // be caught. See these fields' own comment for the full
+        // reasoning and the direct reproduction that found this.
+        java.util.List<UrkelNodeStore.HashKey> frozen;
+        synchronized (orphanLock) {
+            frozen = new java.util.ArrayList<>(candidates);
+        }
+        return nodeStore.removeKeys(frozen);
     }
 
     /** Builds a proof for a key against an explicit root node, rather
@@ -814,6 +826,62 @@ public class UrkelTree {
     private volatile java.util.Set<UrkelNodeStore.HashKey> awaitingNextCommit =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** FIX: a real, reproduced, permanent-data-loss bug -- confirmed via
+     *  a direct, deterministic reproduction (insert V1, change to V2
+     *  (orphaning V1's leaf), let it age through both generations and
+     *  get returned by advanceOrphanGeneration() as "final", THEN
+     *  revert back to V1 -- a genuine content-addressed resurrection,
+     *  confirmed by an identical root hash before and after -- before
+     *  the actual removal runs; the resurrected node was deleted from
+     *  disk anyway, and reading it back after a simulated restart threw
+     *  "Missing Urkel tree node").
+     *
+     *  Root cause: unorphanIfPending() -- the safeguard that's supposed
+     *  to protect a superseded node if it's touched again -- can only
+     *  see pendingOrphans and awaitingNextCommit, both fields THIS
+     *  class owns. But advanceOrphanGeneration() hands candidates off
+     *  as "final" to the CALLER (UrkelNameTree's own
+     *  accumulatedOrphanCandidates in production), which can hold them
+     *  for a long time now -- the dynamic candidate threshold can wait
+     *  for hundreds of thousands of candidates before triggering
+     *  removal. From the moment of hand-off onward, there was zero
+     *  protection: a resurrection during that entire window went
+     *  completely undetected, and the background removal thread would
+     *  delete the live, resurrected node anyway.
+     *
+     *  Fix: let a caller register an external "still pending removal"
+     *  set so unorphanIfPending() can reach into it too, closing the
+     *  long-duration accumulation window entirely. The remaining,
+     *  much-narrower race -- a resurrection landing in the brief window
+     *  between the removal batch being frozen into a list and
+     *  unorphanIfPending() removing a key from the live set -- is
+     *  closed by orphanLock, held by both unorphanIfPending() and the
+     *  point where a removal batch gets frozen (see removeDirectly()
+     *  and UrkelNameTree's own registration calls). Held only briefly
+     *  in both places (a handful of set operations, not any disk I/O),
+     *  so contention is real only during the rare, short window an
+     *  actual removal batch is being frozen -- not on every ordinary
+     *  resolve() call. */
+    private final Object orphanLock = new Object();
+    private final java.util.List<java.util.Set<UrkelNodeStore.HashKey>> externallyTrackedPendingRemoval =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Registers an external set (e.g. UrkelNameTree's own
+     *  accumulatedOrphanCandidates, or a batch snapshot currently being
+     *  processed for removal) that unorphanIfPending() should also
+     *  check/remove from. Safe to register the same long-lived set
+     *  once and leave it registered indefinitely -- registering a
+     *  short-lived batch snapshot should be paired with
+     *  unregisterExternalPendingRemovalSet() once that batch's removal
+     *  completes, to avoid this list growing without bound. */
+    public void registerExternalPendingRemovalSet(java.util.Set<UrkelNodeStore.HashKey> set) {
+        externallyTrackedPendingRemoval.add(set);
+    }
+
+    public void unregisterExternalPendingRemovalSet(java.util.Set<UrkelNodeStore.HashKey> set) {
+        externallyTrackedPendingRemoval.remove(set);
+    }
+
     /** Records oldNode as a deletion candidate if (and only if) it was
      *  already persisted AND its hash actually differs from newNode's --
      *  called explicitly at each specific point in insert()/remove()
@@ -954,8 +1022,13 @@ public class UrkelTree {
      *  right up until the moment it's actually returned as confirmed. */
     private void unorphanIfPending(UrkelNode node) {
         UrkelNodeStore.HashKey key = new UrkelNodeStore.HashKey(node.hash());
-        pendingOrphans.remove(key);
-        awaitingNextCommit.remove(key);
+        synchronized (orphanLock) {
+            pendingOrphans.remove(key);
+            awaitingNextCommit.remove(key);
+            for (java.util.Set<UrkelNodeStore.HashKey> external : externallyTrackedPendingRemoval) {
+                external.remove(key);
+            }
+        }
     }
 
     /** Builds a proof for a key against the tree's current root --

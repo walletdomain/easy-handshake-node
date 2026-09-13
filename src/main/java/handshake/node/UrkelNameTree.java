@@ -218,7 +218,12 @@ public class UrkelNameTree {
                 : new UrkelNode.Hash(lastCommittedRoot);
     }
 
-    public UrkelNameTree() {}
+    public UrkelNameTree() {
+        // FIX: same registration as the other constructor -- see its
+        // own comment. Applied here too so the safeguard is active
+        // regardless of which constructor a caller (or a test) uses.
+        tree.registerExternalPendingRemovalSet(accumulatedOrphanCandidates);
+    }
 
     /** Resumes from persisted state -- liveRootHash/committedRootHash
      *  as read from ChainDB's own meta storage (all-zero means "never
@@ -231,6 +236,14 @@ public class UrkelNameTree {
      *  node reference only at the point something actually needs one. */
     public UrkelNameTree(UrkelNodeStore nodeStore, byte[] liveRootHash, byte[] committedRootHash) {
         tree.setNodeStore(nodeStore);
+        // FIX: registers this instance's own accumulatedOrphanCandidates
+        // with the tree's unorphan-resurrection safeguard -- see
+        // UrkelTree's own comment on registerExternalPendingRemovalSet()
+        // for the real, reproduced bug this closes. Registered once,
+        // for the lifetime of this tree, since accumulatedOrphanCandidates
+        // itself is a single, stable, concurrent-safe set that's only
+        // ever added to and cleared, never replaced.
+        tree.registerExternalPendingRemovalSet(accumulatedOrphanCandidates);
 
         if (liveRootHash != null && !java.util.Arrays.equals(liveRootHash, UrkelHash.ZERO)) {
             tree.inject(new UrkelNode.Hash(liveRootHash));
@@ -410,8 +423,17 @@ public class UrkelNameTree {
         // a disk read or a tree walk, so doing it synchronously doesn't
         // reintroduce the blocking cost that made the OLD full key
         // enumeration a real problem.
+        // FIX: must be a concurrent-safe set, not a plain HashSet --
+        // this is now registered with the tree's unorphan-resurrection
+        // safeguard for the deep-catch-up path specifically (see below),
+        // meaning the main thread's own resolve()/collectUnpersisted()
+        // calls can concurrently remove() from this exact set while the
+        // background removal below is still using it. A plain HashSet
+        // was never safe for that, same reasoning as pendingOrphans/
+        // awaitingNextCommit's own fix earlier this session.
         java.util.Set<UrkelNodeStore.HashKey> candidatesSnapshot =
-                new java.util.HashSet<>(accumulatedOrphanCandidates);
+                java.util.concurrent.ConcurrentHashMap.newKeySet();
+        candidatesSnapshot.addAll(accumulatedOrphanCandidates);
         accumulatedOrphanCandidates.clear();
 
         pruneExecutor.submit(() -> {
@@ -435,7 +457,26 @@ public class UrkelNameTree {
                     // RE-ARCHITECTURE: no walk at all during deep catch-
                     // up -- see UrkelTree.removeDirectly()'s own comment
                     // for the full reasoning on this trade-off.
-                    int removed = tree.removeDirectly(candidatesSnapshot);
+                    //
+                    // FIX: register this specific in-flight batch with
+                    // the tree's unorphan-resurrection safeguard for the
+                    // duration of the removal, and unregister it
+                    // immediately after (success or failure) via
+                    // try/finally -- without this, a resurrection
+                    // landing after accumulatedOrphanCandidates.clear()
+                    // above but before removeDirectly() actually deletes
+                    // this exact batch would go completely undetected.
+                    // reconcileAndRemove() below doesn't need this: it
+                    // independently re-verifies reachability against a
+                    // fresh walk at the moment of deletion, so it's
+                    // already immune regardless of this registration.
+                    tree.registerExternalPendingRemovalSet(candidatesSnapshot);
+                    int removed;
+                    try {
+                        removed = tree.removeDirectly(candidatesSnapshot);
+                    } finally {
+                        tree.unregisterExternalPendingRemovalSet(candidatesSnapshot);
+                    }
                     long millis = System.currentTimeMillis() - start;
                     System.out.printf("[UrkelNameTree] Reconciliation (started at height %d): "
                                     + "removed %d of %d candidates in %dms (no validation walk -- catch-up)%n",

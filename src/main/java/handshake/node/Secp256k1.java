@@ -6,12 +6,12 @@ import java.util.Arrays;
 
 /**
  * Secp256k1 — pure Java implementation of the secp256k1 elliptic curve.
-    * <p>
+ * <p>
  * Used for:
  *   - Deriving compressed public keys from private keys
  *   - ECDH shared secret computation (Brontide handshake)
  *   - Signature verification (transaction and block validation)
-    * <p>
+ * <p>
  * No external dependencies — everything is implemented using BigInteger.
  */
 public final class Secp256k1 {
@@ -22,7 +22,12 @@ public final class Secp256k1 {
 
     private static final BigInteger P =
             new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
-    private static final BigInteger N =
+    // FIX: public, not private -- the wallet project's own HDKey class
+    // (a separate package, handshake.wallet) needs the curve order for
+    // BIP32's "(parent + IL) mod n" child-key arithmetic, and should
+    // reuse this well-known constant rather than duplicate it in a
+    // second file where it could silently drift.
+    public static final BigInteger N =
             new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
     private static final BigInteger Gx =
             new BigInteger("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16);
@@ -93,7 +98,7 @@ public final class Secp256k1 {
     /**
      * Computes ECDH shared secret: privKey * pubKey → 32-byte X coordinate.
      * Used in Brontide handshake for key exchange.
-        * <p>
+     * <p>
      * @param compressedPubKey  33-byte compressed public key
      * @param privateKey        32-byte private key
      * @return                  32-byte shared secret (X coordinate)
@@ -101,7 +106,7 @@ public final class Secp256k1 {
     /**
      * Computes ECDH shared secret: SHA-256(compressed 33-byte shared point).
      * Used in Brontide handshake for key exchange.
-        * <p>
+     * <p>
      * Real hsd's ecdh() hashes the 33-byte COMPRESSED shared point (prefix
      * byte + X-coordinate) -- NOT the raw 32-byte X-coordinate alone. This
      * was verified directly against real bcrypto ground truth: for
@@ -109,7 +114,7 @@ public final class Secp256k1 {
      * the shared X is 9110f876...ec71, and SHA-256 of that raw X gives
      * 910dd636... (WRONG), while SHA-256 of the compressed point
      * 029110f876...ec71 gives dad01099...98ac6 (the real, confirmed value).
-        * <p>
+     * <p>
      * @param compressedPubKey  33-byte compressed public key
      * @param privateKey        32-byte private key
      * @return                  32-byte SHA-256(compressed shared point)
@@ -149,7 +154,7 @@ public final class Secp256k1 {
     /**
      * Verifies a DER-encoded ECDSA signature against a message hash and
      * compressed public key.
-        * <p>
+     * <p>
      * @param msgHash    32-byte message hash (SHA256d or Blake2b)
      * @param derSig     DER-encoded signature (variable length)
      * @param pubKey     33-byte compressed public key
@@ -226,7 +231,7 @@ public final class Secp256k1 {
      * hsd's own verifyMessage() brute-forces the recovery id (0-3) at
      * verification time instead of trusting one embedded in the
      * signature, so signing doesn't need to compute or embed one either.
-        * <p>
+     * <p>
      * Uses a fresh, securely-random per-signature nonce k, not RFC6979
      * deterministic nonce derivation (which real bcrypto likely uses) --
      * this doesn't affect correctness, since ECDSA's validity doesn't
@@ -234,7 +239,7 @@ public final class Secp256k1 {
      * uniformly random in [1, N-1]. It does mean this won't byte-for-byte
      * reproduce what bcrypto would produce for the same input, but that
      * was never a goal -- any valid signature verifies correctly.
-        * <p>
+     * <p>
      * Enforces low-S normalization (s <= N/2), matching the standard
      * malleability-prevention convention this project's own transaction
      * signature validation (TxVerify/common.js's isLowS check) already
@@ -272,6 +277,38 @@ public final class Secp256k1 {
         }
     }
 
+    /** FIX: kept in sync with the wallet project's own copy of this
+     *  file -- sign() above produces a raw 64-byte (r||s) signature,
+     *  correct for its own documented purpose (message signing) but not
+     *  the DER encoding a transaction's own signature needs (the same
+     *  format verify() above already expects). Discovered when the
+     *  wallet project first actually exercised sign() for real
+     *  transaction signing and a direct sign-then-verify round trip
+     *  failed -- nothing in this node project had ever needed to
+     *  PRODUCE a transaction signature before, only verify
+     *  already-real, externally-produced ones, so this mismatch had no
+     *  way to surface here on its own. See the wallet's own copy for
+     *  the full reasoning. */
+    public static byte[] signDER(byte[] msgHash, byte[] privateKey) {
+        byte[] raw = sign(msgHash, privateKey);
+        byte[] rBytes = new BigInteger(1, Arrays.copyOfRange(raw, 0, 32)).toByteArray();
+        byte[] sBytes = new BigInteger(1, Arrays.copyOfRange(raw, 32, 64)).toByteArray();
+
+        byte[] rEncoded = new byte[2 + rBytes.length];
+        rEncoded[0] = 0x02; rEncoded[1] = (byte) rBytes.length;
+        System.arraycopy(rBytes, 0, rEncoded, 2, rBytes.length);
+
+        byte[] sEncoded = new byte[2 + sBytes.length];
+        sEncoded[0] = 0x02; sEncoded[1] = (byte) sBytes.length;
+        System.arraycopy(sBytes, 0, sEncoded, 2, sBytes.length);
+
+        byte[] der = new byte[2 + rEncoded.length + sEncoded.length];
+        der[0] = 0x30; der[1] = (byte) (rEncoded.length + sEncoded.length);
+        System.arraycopy(rEncoded, 0, der, 2, rEncoded.length);
+        System.arraycopy(sEncoded, 0, der, 2 + rEncoded.length, sEncoded.length);
+        return der;
+    }
+
     /**
      * Recovers the compressed public key from a raw 64-byte (r || s)
      * signature, a 32-byte message hash, and a recovery id (0-3) --
@@ -280,7 +317,7 @@ public final class Secp256k1 {
      * correspond to a valid point for this r (the caller -- real hsd's
      * verifyMessage among them -- is expected to try all 4 values and
      * check which recovered key, if any, matches the expected address).
-        * <p>
+     * <p>
      * recoveryId bit 0 selects R's y-coordinate parity (0=even, 1=odd);
      * bit 1 would indicate r needed a +N adjustment (an extremely rare
      * case in practice, handled here for completeness even though it

@@ -4,7 +4,7 @@ import java.util.Arrays;
 
 /**
  * Mempool-level transaction signature verification.
-    * <p>
+ * <p>
  * Ported directly from real hsd source (lib/primitives/tx.js's
  * signatureHash(), lib/script/script.js's fromPubkeyhash(), and
  * lib/script/common.js's opcode/hashType constants) rather than assumed
@@ -14,7 +14,7 @@ import java.util.Arrays;
  * uses a Handshake-specific OP_BLAKE160 opcode (0xc0) rather than
  * Bitcoin's OP_HASH160 -- meaning the actual hash function is
  * Blake2b-160, not RIPEMD160(SHA256(x)).
-    * <p>
+ * <p>
  * Only handles the standard witness-pubkeyhash case (a 20-byte address
  * hash, matching a single [signature, pubkey] witness stack) -- this
  * covers the overwhelming majority of ordinary spends. Anything else
@@ -84,7 +84,11 @@ public class TxVerify {
      * "prev" script signatureHash() expects for a witness-pubkeyhash
      * input, NOT the raw (tiny) witness program itself.
      */
-    private static byte[] buildP2PKHScript(byte[] hash20) {
+    // FIX: package-visible, not private -- kept in sync with the wallet
+    // project's own copy of this file, which needs to build the
+    // identical prevScript when SIGNING (not just verifying) a
+    // transaction, from its own WalletTxBuilder class.
+    static byte[] buildP2PKHScript(byte[] hash20) {
         byte[] script = new byte[25];
         script[0] = (byte) OP_DUP;
         script[1] = (byte) OP_BLAKE160;
