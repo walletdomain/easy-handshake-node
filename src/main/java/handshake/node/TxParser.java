@@ -6,7 +6,7 @@ import java.util.List;
 
 /**
  * TxParser — lightweight parser for Handshake raw transactions.
-    * <p>
+ * <p>
  * Handshake transaction wire format:
  *   version    (4 bytes LE)
  *   input_count (varint)
@@ -17,7 +17,7 @@ import java.util.List;
  *              + covenant_items[] each: item_len(varint) + item_data(N)
  *   locktime   (4 bytes LE)
  *   witnesses  (not included in base transaction for txid computation)
-    * <p>
+ * <p>
  * The "base" transaction (used for txid) excludes witness data.
  * Witness data follows the locktime in the full transaction.
  */
@@ -87,10 +87,54 @@ public class TxParser {
      * Returns null if parsing fails.
      */
     public static ParsedTx parse(byte[] raw) {
+        ParsedTx tx = parseInternal(raw, 0);
+        // Existing behavior, deliberately unchanged for every caller
+        // already relying on it (Mempool, RpcServer, NodeSocketServer):
+        // tx.raw is the exact array passed in, not a trimmed copy.
+        if (tx != null) tx.raw = raw;
+        return tx;
+    }
+
+    /** FIX: added specifically to fix a real, confirmed OutOfMemoryError
+     *  in BlockProcessor.parseBlockTxs() -- that method used to call
+     *  plain parse() once per transaction, but had to hand it a byte[]
+     *  starting at that transaction's own offset, which meant copying
+     *  Arrays.copyOfRange(rawBlock, pos, rawBlock.length) -- the ENTIRE
+     *  REMAINING BLOCK -- before parsing even a single transaction from
+     *  it, every single time through the loop. For a block with N
+     *  transactions, that's N copies each averaging roughly half the
+     *  remaining block size: total bytes allocated scales with
+     *  N × blockSize, not just blockSize, and gets sharply worse for
+     *  blocks with more transactions -- confirmed as the actual OOM
+     *  site, in exactly the height range already known to carry
+     *  elevated transaction volume.
+     *
+     *  This parses directly from `data` starting at `offset`, with no
+     *  upfront copy at all -- the Parser below reads straight out of
+     *  the original array. tx.raw still ends up as this transaction's
+     *  own, correctly-sized bytes (needed for later use, e.g. txid
+     *  computation via Arrays.copyOf(tx.raw, tx.baseSize)), but now
+     *  copied exactly once, exactly tx.totalSize bytes, only after
+     *  parsing has determined that real size -- turning the total
+     *  copying cost for a whole block from O(N × blockSize) into
+     *  O(blockSize), the same total bytes the block itself contains. */
+    public static ParsedTx parse(byte[] data, int offset) {
+        ParsedTx tx = parseInternal(data, offset);
+        if (tx != null) tx.raw = Arrays.copyOfRange(data, offset, offset + tx.totalSize);
+        return tx;
+    }
+
+    /** Shared by both parse() entry points above -- the actual parsing
+     *  logic itself is identical either way; only how tx.raw gets
+     *  assigned differs, handled separately by each caller above rather
+     *  than duplicating everything below across two copies (exactly the
+     *  kind of divergence risk that caused real, confirmed parsing bugs
+     *  earlier in this project -- see this method's own inline history
+     *  further down for the varint and witness-size examples). */
+    private static ParsedTx parseInternal(byte[] data, int offset) {
         try {
-            Parser p = new Parser(raw);
+            Parser p = new Parser(data, offset);
             ParsedTx tx = new ParsedTx();
-            tx.raw = raw;
 
             // Version
             tx.version = (int) p.readLE32();
@@ -215,14 +259,24 @@ public class TxParser {
 
     private static class Parser {
         private final byte[] data;
+        private final int startOffset;
         private int pos;
 
-        Parser(byte[] data) {
+        Parser(byte[] data, int startOffset) {
             this.data = data;
-            this.pos  = 0;
+            this.startOffset = startOffset;
+            this.pos = startOffset;
         }
 
-        int position() { return pos; }
+        // position() stays RELATIVE to startOffset, not absolute within
+        // `data` -- this is what makes the offset support a purely
+        // additive change: every existing caller of position() (via
+        // startOffset=0, from the plain parse(byte[]) entry point)
+        // sees IDENTICAL values to before this change, since
+        // pos - 0 == pos. tx.baseSize and tx.totalSize both come from
+        // this, and both need to stay relative to the transaction's own
+        // start, not the containing block's.
+        int position() { return pos - startOffset; }
 
         int readByte() {
             return data[pos++] & 0xFF;

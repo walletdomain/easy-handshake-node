@@ -199,22 +199,33 @@ public class BlockProcessor {
         // committed root itself, comparing against whatever the last
         // commit already established.
         //
-        // Warn-only for now, not a hard rejection -- unlike the merkle
-        // check above (which earned blocking status only after being
-        // rigorously verified across real captured block data), this
-        // specific check has only been spot-verified against one name at
-        // one height so far, not proven across a wide range of real
-        // commit boundaries yet. Matches this project's own established
-        // pattern of starting new validation warn-only and upgrading to
-        // blocking once it's held up over more of the real chain.
+        // FIX: upgraded from warn-only to a hard stop. Continuing sync
+        // on top of a known-wrong tree just compounds whatever the
+        // actual problem is -- more blocks get processed against
+        // already-corrupted state, burying the real divergence height
+        // under a growing pile of also-technically-wrong data, and
+        // making the eventual investigation strictly harder than
+        // catching it here, immediately, would have been.
         byte[] claimedTreeRoot = HeaderUtil.treeRoot(headerBytes);
         byte[] ourCommittedRoot = db.getNameTree().committedRoot();
         if (!Arrays.equals(claimedTreeRoot, ourCommittedRoot)) {
             System.err.printf("[BlockProcessor] *** URKEL TREE ROOT MISMATCH at height %d *** "
-                            + "header claims %s, we computed %s -- name/covenant data may be silently "
-                            + "wrong from this point forward. Not rejecting the block yet (warn-only "
-                            + "phase), but this needs investigating.%n",
+                            + "header claims %s, we computed %s -- halting sync rather than continuing on "
+                            + "top of known-wrong tree state.%n",
                     height, hex(claimedTreeRoot), hex(ourCommittedRoot));
+            int firstRisky = db.getNameTree().firstDeepCatchUpDeletionHeight();
+            if (firstRisky != -1) {
+                System.err.printf("[BlockProcessor] A deep-catch-up (unvalidated) reconciliation first "
+                                + "deleted something at height %d -- this is a plausible, known, bounded "
+                                + "explanation (see UrkelTree.removeDirectly()'s own comment). "
+                                + "UrkelTreeRecovery can attempt to self-correct from before that point.%n",
+                        firstRisky);
+            } else {
+                System.err.printf("[BlockProcessor] No deep-catch-up reconciliation has ever run in "
+                        + "this session -- the known, bounded false-positive risk cannot explain this. "
+                        + "This needs direct investigation, not automatic recovery.%n");
+            }
+            throw new UrkelTreeMismatchException(height, claimedTreeRoot, ourCommittedRoot, firstRisky);
         }
 
         for (TxParser.ParsedTx tx : txs) {
@@ -774,8 +785,18 @@ public class BlockProcessor {
 
             // Parse each transaction
             for (int i = 0; i < txCount && pos < rawBlock.length; i++) {
-                byte[] remaining = Arrays.copyOfRange(rawBlock, pos, rawBlock.length);
-                TxParser.ParsedTx tx = TxParser.parse(remaining);
+                // FIX: previously copied Arrays.copyOfRange(rawBlock,
+                // pos, rawBlock.length) -- the entire remaining block --
+                // before parsing even a single transaction, every time
+                // through this loop. Confirmed as a real OutOfMemoryError
+                // site: for a block with N transactions this allocated
+                // N copies averaging roughly half the remaining block
+                // size each, a total cost scaling with N × blockSize
+                // rather than just blockSize. See TxParser.parse(byte[],
+                // int)'s own comment for the full fix -- this now parses
+                // directly out of rawBlock at the real offset, no
+                // upfront copy at all.
+                TxParser.ParsedTx tx = TxParser.parse(rawBlock, pos);
                 if (tx == null) break;
                 txs.add(tx);
                 // Advance past the full transaction, INCLUDING witness

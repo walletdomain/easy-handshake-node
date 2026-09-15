@@ -172,6 +172,22 @@ public class ChainSync {
 
     private volatile Mempool   mempool;
     private volatile boolean   running;
+
+    /** NEW: self-healing support. Set once, the moment a
+     *  UrkelTreeMismatchException is ever caught, and never cleared
+     *  automatically -- deliberately a SEPARATE flag from `running`,
+     *  not a reuse of it. Setting `running = false` alone would make
+     *  this look identical, from the outside, to an ordinary shutdown;
+     *  this exists so the node's own state genuinely reflects "halted
+     *  due to a data-integrity problem needing attention" rather than
+     *  "stopped normally." Holds the actual exception, not just a
+     *  boolean, so whatever eventually reports this (logs, RPC status,
+     *  a future recovery attempt) has the real height and root values
+     *  without needing to re-derive them. */
+    private volatile UrkelTreeMismatchException haltedDueToTreeMismatch = null;
+
+    public UrkelTreeMismatchException haltedDueToTreeMismatch() { return haltedDueToTreeMismatch; }
+
     /**
      * Set when syncHeaders() deliberately rotates away from a peer
      * (either a clear score-based switch or periodic forced
@@ -440,6 +456,20 @@ public class ChainSync {
 
     private void syncCycle() {
         if (!running) return;
+        if (haltedDueToTreeMismatch != null) {
+            // NEW: self-healing support. Without this, the scheduler
+            // would keep calling syncCycle() every POLL_INTERVAL_SEC
+            // forever regardless of the halt -- `running` alone doesn't
+            // stop it, since this is a separate, dedicated flag by
+            // design (see its own field comment for why). Logged once
+            // per cycle rather than silently, so it's visible in
+            // ongoing output that the node is sitting idle for a real
+            // reason, not just quiet.
+            System.err.println("[ChainSync] Not syncing -- halted due to an Urkel tree mismatch at "
+                    + "height " + haltedDueToTreeMismatch.height + ". Needs investigation or recovery "
+                    + "before sync can resume.");
+            return;
+        }
         try {
             // Loop internally (fast, NOT gated by the 60-second scheduler
             // interval) as long as real progress is being made. This is
@@ -494,6 +524,38 @@ public class ChainSync {
                     // Download missing blocks
                     downloadBlocks(peer);
 
+                } catch (UrkelTreeMismatchException e) {
+                    // Caught here, before the generic Exception handler
+                    // below, specifically so this never gets recorded as
+                    // a peer failure -- this peer sent perfectly valid
+                    // data; it's OUR computation that disagreed with an
+                    // already-validated header. haltedDueToTreeMismatch
+                    // is already set (from inside downloadBlocks(), the
+                    // moment this was caught) before it's ever re-thrown
+                    // up to here.
+                    System.err.println("[ChainSync] Sync cycle stopping -- halted due to an Urkel tree "
+                            + "mismatch. Attempting automatic recovery before deciding whether sync can "
+                            + "resume.");
+                    UrkelTreeRecovery.RecoveryResult result =
+                            UrkelTreeRecovery.attemptRecovery(db, config.getDataDir(), e, false);
+                    if (result.success) {
+                        System.out.println("[ChainSync] Recovery succeeded: " + result.message
+                                + " Clearing the halt and resuming normal sync.");
+                        // FIX: only recovery's own success clears this --
+                        // a plain retry or restart must NEVER silently
+                        // clear it on its own. See this field's own
+                        // comment for why it's deliberately separate
+                        // from `running`: an unresolved mismatch needs
+                        // to stay visibly, persistently halted until
+                        // something has actually verified the fix,
+                        // not just because sync was attempted again.
+                        haltedDueToTreeMismatch = null;
+                    } else {
+                        System.err.println("[ChainSync] Recovery did not resolve this: " + result.message
+                                + " Remaining halted -- this needs direct investigation, not another "
+                                + "automatic attempt.");
+                    }
+                    return;
                 } catch (Exception e) {
                     PeerScorecard.get().recordFailure(peer.ip,
                             e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -1081,9 +1143,30 @@ public class ChainSync {
                         handleNonBlockMessage(msg, peer);
                         continue;
                     }
-                    if (!processBlock(msg, height + received, peer.ip)) {
-                        batchFailed = true;
-                        break;
+                    // FIX: caught separately from a normal processBlock()
+                    // failure below -- an Urkel tree mismatch isn't a bad
+                    // peer sending bad data (which is what a false return
+                    // means, and what banning-and-retrying-with-a-
+                    // different-peer is the right response to). It's our
+                    // OWN computation disagreeing with a header that
+                    // itself already passed every other check. Banning
+                    // this peer and retrying with another would just
+                    // reproduce the exact same mismatch, since the peer
+                    // was never the problem. Sync stops entirely here,
+                    // deliberately -- see UrkelTreeMismatchException's
+                    // own fields for what a human or UrkelTreeRecovery
+                    // needs to decide what happens next.
+                    try {
+                        if (!processBlock(msg, height + received, peer.ip)) {
+                            batchFailed = true;
+                            break;
+                        }
+                    } catch (UrkelTreeMismatchException e) {
+                        System.err.printf("[ChainSync] Stopping sync entirely at height %d due to an "
+                                + "Urkel tree root mismatch -- this is not a peer problem, so no peer "
+                                + "was banned and no retry will happen automatically.%n", e.height);
+                        haltedDueToTreeMismatch = e;
+                        throw e;
                     }
                     received++;
                 }

@@ -35,6 +35,26 @@ public class ChainDB {
         return instance;
     }
 
+    /** NEW: self-healing support. A second, deliberately separate way
+     *  to construct a ChainDB, for UrkelTreeRecovery's scratch replay
+     *  specifically -- never touches the static `instance` field at
+     *  all, unlike open(). That distinction matters here in a way it
+     *  didn't for this project's earlier standalone diagnostic tools:
+     *  those always ran as a completely separate process, so briefly
+     *  nulling `instance` to open a second ChainDB was harmless. This
+     *  runs inside the SAME live JVM process as the real, already-open
+     *  node -- nulling `instance` here, even briefly, would be a real,
+     *  latent risk for anything that might ever call ChainDB.get()
+     *  while a recovery replay is in progress (confirmed nothing does
+     *  today, but that's not something safe to keep relying on for
+     *  something this consequential). This sidesteps the question
+     *  entirely: the real db's `instance` reference is never touched,
+     *  so it stays exactly as valid throughout a recovery attempt as
+     *  it would be if no recovery were happening at all. */
+    public static ChainDB openScratch(String path) {
+        return new ChainDB(path);
+    }
+
     public static ChainDB get() {
         if (instance == null) throw new IllegalStateException("ChainDB not opened");
         return instance;
@@ -45,8 +65,21 @@ public class ChainDB {
     private static final String META_HEADER_TIP    = "header_tip";
     private static final String META_BLOCK_TIP     = "block_tip";
     private static final String META_GENESIS_HASH  = "genesis_hash";
-    private static final String META_URKEL_LIVE_ROOT      = "urkel_live_root";
-    private static final String META_URKEL_COMMITTED_ROOT = "urkel_committed_root";
+    // FIX: package-visible, not private -- UrkelTreeRecovery (same
+    // package) needs to write these same two keys directly as part of
+    // its atomic swap, and referencing the exact same constants here
+    // rules out any chance of a typo-based mismatch between what
+    // ChainDB itself writes and what a recovery tool writes.
+    static final String META_URKEL_LIVE_ROOT      = "urkel_live_root";
+    static final String META_URKEL_COMMITTED_ROOT = "urkel_committed_root";
+    // NEW: resilience support -- see markCleanShutdown() and
+    // checkAndClearCleanShutdownMarker()'s own comments for the full
+    // design. Set only when the JVM shutdown hook actually runs to
+    // completion (confirmed: this never happens on a power loss,
+    // kill -9, or crash -- only on normal exit or SIGTERM/Ctrl+C),
+    // meaning its absence at the next startup is a genuine, reliable
+    // signal that the previous run did not exit cleanly.
+    static final String META_CLEAN_SHUTDOWN = "clean_shutdown";
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -74,6 +107,18 @@ public class ChainDB {
     private final UrkelNameTree nameTree;
 
     public UrkelNameTree getNameTree() { return nameTree; }
+
+    /** NEW: self-healing support. Direct, surgical access to the Urkel
+     *  tree's own node storage and the two meta keys that designate
+     *  which root is "official" -- used ONLY by UrkelTreeRecovery, to
+     *  perform the safe, atomic swap after an independently-verified
+     *  recovery replay (see that class's own comment for the full
+     *  design). A named, explicit method rather than reflection-based
+     *  private-field access, deliberately, given the consequence of
+     *  getting this wrong -- this should be easy to find and audit,
+     *  not something that has to be discovered by reading bytecode. */
+    public KVMap<String, byte[]> urkelNodesMapForRecovery() { return urkelNodes; }
+    public KVMap<String, String> metaMapForRecovery() { return meta; }
 
     /** Result of persistNameTreeState()'s two conceptually distinct
      *  phases, split out specifically to answer a real question: when
@@ -192,7 +237,50 @@ public class ChainDB {
     // ── Commit ────────────────────────────────────────────────────────────────
 
     public void commit() {
+        // FIX: wait for any in-flight background reconciliation to
+        // finish before flushing -- otherwise a commit can declare a
+        // height "safely durable" while a background removal is still
+        // mid-flight, writing to the SAME underlying database on a
+        // different thread. Those writes wouldn't be covered by this
+        // flush if they happen after it -- meaning an interruption
+        // (crash, power loss) right afterward could leave the database
+        // internally inconsistent despite this commit's own claim. A
+        // real, plausible explanation for a real, observed failure (a
+        // resumed run reporting a mismatch immediately after a genuine,
+        // uncontrolled power loss) -- see UrkelNameTree's own comment on
+        // waitForReconciliationToSettle() for the full reasoning.
+        nameTree.waitForReconciliationToSettle();
         store.commit();
+    }
+
+    /** NEW: resilience support. Called ONLY from the shutdown hook, once
+     *  every other shutdown step has already run -- marks this exit as
+     *  genuinely clean and durably commits that fact. Deliberately
+     *  self-contained (does its own commit() rather than relying on the
+     *  caller to do one afterward) so this can never accidentally end
+     *  up written but not yet flushed. */
+    public void markCleanShutdown() {
+        meta.put(META_CLEAN_SHUTDOWN, "true");
+        commit();
+    }
+
+    /** NEW: resilience support. Called once, early at startup (before
+     *  normal sync begins), to find out whether the PREVIOUS run exited
+     *  cleanly, then immediately clears the marker and commits that
+     *  change -- so if THIS run also fails to exit cleanly, the NEXT
+     *  startup correctly detects that too, rather than the marker
+     *  staying "true" from some much earlier clean exit and never being
+     *  updated again. Returns the marker's value as found, i.e.
+     *  whether the LAST shutdown (before this startup) was clean --
+     *  false (including on a genuinely fresh database, where the key
+     *  has simply never been set) means the previous run's on-disk
+     *  state was never confirmed consistent, and Main's own startup
+     *  sequence should verify it before proceeding normally. */
+    public boolean checkAndClearCleanShutdownMarker() {
+        boolean wasClean = "true".equals(meta.get(META_CLEAN_SHUTDOWN));
+        meta.put(META_CLEAN_SHUTDOWN, "false");
+        commit();
+        return wasClean;
     }
 
     /**

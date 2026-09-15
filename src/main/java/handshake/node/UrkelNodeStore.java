@@ -309,11 +309,66 @@ public class UrkelNodeStore {
      *  genuine stream rather than ever materializing the full key set
      *  here; see that method's own comment and KVSnapshot.forEachKey()'s
      *  for why. This is now just the batched-write step. */
+    // FIX: chunk size derived as a fraction of the already-verified,
+    // maxMemory()-scaled HARD_BACKPRESSURE_CAP, not a second,
+    // independent memory calculation. That constant's own meaning
+    // changed in the re-architecture that fixed the original OOM crash
+    // (see its own comment -- it's now a rare, emergency backstop, not
+    // the normal trigger for reconciliation), but it's still the right
+    // basis for THIS sizing decision: it's still the authoritative,
+    // maxMemory()-scaled answer to "how many of these can this machine
+    // comfortably hold at once," which is exactly what bounding a
+    // single store.removeAll() call's own size needs. This bounds how
+    // much of a given removal list gets converted to hex strings and
+    // handed to a single store.removeAll() call at once, which is where
+    // an earlier, separate crash happened: a real, reported case
+    // (Windows-specific "paging file too small" failure) traced
+    // directly to one large, sudden commit request, not to the JVM's
+    // own -Xmx ceiling being exceeded. /10 is a reasonable, conservative
+    // choice given the outer cap's own range (10K-3M), not a data-
+    // derived constant the way the 670-bytes-per-candidate figure is --
+    // there's no real, measured per-entry cost for this specific
+    // hex-conversion-plus-removeAll operation to calibrate against the
+    // way that earlier figure came from an actual production incident.
+    // Still scales automatically with whatever heap the JVM actually
+    // has, which is the property that actually matters here -- a
+    // beefier machine (or a larger maxMemory()) gets proportionally
+    // larger chunks, a modest one gets smaller ones, with nothing for a
+    // person to configure either way.
+    private static final int REMOVAL_CHUNK_SIZE =
+            Math.max(10_000, UrkelNameTree.HARD_BACKPRESSURE_CAP / 10);
+
     public int removeKeys(java.util.List<HashKey> toRemove) {
-        java.util.List<String> hexKeys = new java.util.ArrayList<>(toRemove.size());
-        for (HashKey key : toRemove) hexKeys.add(hex(key.bytes));
-        System.out.println("[UrkelNodeStore] Prune removal phase STARTING: " + hexKeys.size()
-                + " entries to remove (heap: " + UrkelNameTree.heapSnapshot() + ")");
-        return store.removeAll(hexKeys);
+        System.out.println("[UrkelNodeStore] Prune removal phase STARTING: " + toRemove.size()
+                + " entries to remove in chunks of " + REMOVAL_CHUNK_SIZE
+                + " (heap: " + UrkelNameTree.heapSnapshot() + ")");
+
+        int totalRemoved = 0;
+        int chunkNumber = 0;
+        int totalChunks = (toRemove.size() + REMOVAL_CHUNK_SIZE - 1) / REMOVAL_CHUNK_SIZE;
+
+        for (int start = 0; start < toRemove.size(); start += REMOVAL_CHUNK_SIZE) {
+            int end = Math.min(start + REMOVAL_CHUNK_SIZE, toRemove.size());
+            java.util.List<HashKey> chunk = toRemove.subList(start, end);
+
+            // Only this one chunk's worth of hex strings exists at any
+            // given moment -- the previous chunk's own list is eligible
+            // for GC as soon as this loop iteration moves on, rather
+            // than one list sized for the entire removal living in
+            // memory for the whole operation's duration.
+            java.util.List<String> hexKeys = new java.util.ArrayList<>(chunk.size());
+            for (HashKey key : chunk) hexKeys.add(hex(key.bytes));
+
+            chunkNumber++;
+            totalRemoved += store.removeAll(hexKeys);
+
+            if (totalChunks > 1) {
+                System.out.println("[UrkelNodeStore] Prune removal chunk " + chunkNumber + "/" + totalChunks
+                        + " complete (" + totalRemoved + "/" + toRemove.size() + " total, heap: "
+                        + UrkelNameTree.heapSnapshot() + ")");
+            }
+        }
+
+        return totalRemoved;
     }
 }

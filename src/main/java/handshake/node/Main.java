@@ -94,6 +94,55 @@ public class Main {
                 db.getUtxoCountEstimate(), db.getNameCountEstimate());
         db.backfillHashIndexIfNeeded();
 
+        // ── 3b. Resilience: verify consistency after an unclean shutdown ───────
+        // NEW: see ChainDB.commit()'s own comment for the real, plausible
+        // race this is a safety net for (a commit declaring a height
+        // "safe" while a background reconciliation task was still
+        // mid-write), and UrkelTreeRecovery's own comment for the full
+        // recovery design. checkAndClearCleanShutdownMarker() is cheap
+        // and safe to call unconditionally, every startup -- it only
+        // does real work (the consistency check below) when the
+        // PREVIOUS run's marker is missing, which the shutdown hook's
+        // own placement guarantees only happens after a crash, power
+        // loss, or kill -9, never a normal exit.
+        boolean previousShutdownWasClean = db.checkAndClearCleanShutdownMarker();
+        if (!previousShutdownWasClean) {
+            System.out.println("[Main] Previous run did not exit cleanly -- verifying on-disk "
+                    + "consistency before starting sync.");
+            int currentTip = db.getBlockTip();
+            byte[] currentHeader = currentTip >= 0 ? db.getHeader(currentTip) : null;
+            if (currentHeader != null) {
+                byte[] claimedRoot = HeaderUtil.treeRoot(currentHeader);
+                byte[] computedRoot = db.getNameTree().committedRoot();
+                if (!java.util.Arrays.equals(claimedRoot, computedRoot)) {
+                    System.err.println("[Main] Inconsistency confirmed at height " + currentTip
+                            + " -- attempting automatic recovery before allowing sync to start.");
+                    UrkelTreeMismatchException cause = new UrkelTreeMismatchException(
+                            currentTip, claimedRoot, computedRoot, db.getNameTree().firstDeepCatchUpDeletionHeight());
+                    UrkelTreeRecovery.RecoveryResult result =
+                            UrkelTreeRecovery.attemptRecovery(db, dataDir, cause, true);
+                    if (!result.success) {
+                        // Deliberately fatal: starting sync on top of
+                        // known-inconsistent state would risk compounding
+                        // whatever's actually wrong, the same reasoning
+                        // BlockProcessor's own mismatch handling is built
+                        // on. This needs a person, not a node that quietly
+                        // limps along on data it already knows is wrong.
+                        System.err.println("[Main] Automatic recovery did not succeed: " + result.message);
+                        System.err.println("[Main] Refusing to start sync on top of known-inconsistent "
+                                + "state. This needs direct investigation.");
+                        System.exit(1);
+                    }
+                    System.out.println("[Main] Recovery succeeded: " + result.message);
+                } else {
+                    System.out.println("[Main] On-disk state verified consistent at height " + currentTip
+                            + " -- no recovery needed.");
+                }
+            } else {
+                System.out.println("[Main] No blocks processed yet -- nothing to verify.");
+            }
+        }
+
         // ── 4. Node identity (Brontide keypair) ───────────────────────────────
         NodeIdentity identity = NodeIdentity.load(dataDir);
 
@@ -197,6 +246,14 @@ public class Main {
             safeShutdownStep("webAdmin.stop", webAdmin::stop);
             safeShutdownStep("socketServer.stop", socketServer::stop);
             safeShutdownStep("db.commit", db::commit);
+            // NEW: resilience support -- only reached if every step
+            // above ran without this hook itself having been skipped
+            // entirely (a power loss, kill -9, or crash never runs this
+            // hook at all -- confirmed, this is exactly what makes the
+            // marker meaningful). Placed after db.commit() specifically,
+            // so this reflects a state where everything else is already
+            // known-flushed, not just this one write.
+            safeShutdownStep("db.markCleanShutdown", db::markCleanShutdown);
             safeShutdownStep("db.close", db::close);
             safeShutdownStep("ConfigDB.commit", () -> ConfigDB.get().commit());
             safeShutdownStep("ConfigDB.close", () -> ConfigDB.get().close());

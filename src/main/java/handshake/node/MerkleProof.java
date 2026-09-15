@@ -14,7 +14,7 @@ import java.util.List;
  * hash primitives differ (Handshake's Blake2b leaf/internal/empty
  * scheme, already verified elsewhere in this project, rather than
  * Bitcoin's SHA256d-with-duplication).
-    * <p>
+ * <p>
  * A proof lets a verifier confirm a specific set of transactions were
  * included in a specific block's merkle root, without needing every
  * transaction in that block -- only enough sibling hashes to
@@ -48,6 +48,27 @@ public class MerkleProof {
      */
     public static BuiltProof buildProof(List<byte[]> leaves, boolean[] matches) {
         int totalTX = leaves.size();
+
+        // FIX: a genuinely empty transaction list (zero leaves) isn't
+        // expected on the real network (every real block has at least a
+        // coinbase transaction), but this is data arriving from an
+        // untrusted network peer, not something to assume is always
+        // well-formed -- a malformed or unusual block claiming zero
+        // transactions should degrade to an empty, harmless proof, not
+        // throw an uncaught IndexOutOfBoundsException from
+        // traverseBuild()/subtreeHash() trying to read leaves.get(0) on
+        // an empty list. Matches the same "empty tree" convention
+        // MerkleUtil.buildRoot() already establishes elsewhere in this
+        // project (EMPTY_HASH for zero leaves) rather than inventing a
+        // new one here.
+        if (totalTX == 0) {
+            BuiltProof empty = new BuiltProof();
+            empty.totalTX = 0;
+            empty.hashes = new ArrayList<>();
+            empty.flags = new byte[0];
+            return empty;
+        }
+
         List<Integer> bits = new ArrayList<>();
         List<byte[]> hashes = new ArrayList<>();
 
