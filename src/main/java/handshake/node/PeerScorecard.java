@@ -58,6 +58,12 @@ public class PeerScorecard {
     private static final int   SCORE_INVALID_DATA_PENALTY = 30; // heavier than a plain connection failure
     private static final int   SCORE_FAILURE_PENALTY  = 15;
     private static final int   SCORE_STALE_TIP_PENALTY = 3;
+    /** See recordImplausibleTip()'s own comment: a repeatable, cumulative
+     *  signal rather than a one-time judgment, so a modest penalty --
+     *  lighter than SCORE_FAILURE_PENALTY, since a single occurrence
+     *  could still just be an honestly-fast peer nothing has
+     *  corroborated yet. */
+    private static final int   SCORE_IMPLAUSIBLE_TIP_PENALTY = 5;
     private static final int   SCORE_MAX              = 100;
     private static final int   SCORE_BACKOFF_THRESHOLD = 25;
     private static final int   SCORE_BLACKLIST        = 0;
@@ -300,6 +306,58 @@ public class PeerScorecard {
         r.score = Math.max(0, r.score - SCORE_STALE_TIP_PENALTY);
         r.lastHeight = peerHeight;
         persist(r);
+    }
+
+    /**
+     * Records a claimed height that disagreed, with no corroboration,
+     * against the recent consensus of other peers (see ChainSync's
+     * crossCheckTip()). Deliberately a repeatable, cumulative signal
+     * rather than a one-time judgment call: a single occurrence could
+     * just be an honestly-fast peer that nothing has corroborated yet,
+     * so this only nudges the score rather than banning outright. A
+     * peer whose claims keep being implausible sinks in the weighted
+     * selection ordering over time as this accumulates across sessions
+     * (it's part of the same persisted score every other bonus/penalty
+     * here already survives a restart with) -- which is the actual
+     * "confidence built up over time, not a single live check" this
+     * project's PeerScorecard already exists to provide for every other
+     * kind of good/bad peer behavior.
+     */
+    public void recordImplausibleTip(String ip, int claimedHeight, int consensusHeight) {
+        PeerRecord r = getOrCreate(ip);
+        r.score = Math.max(0, r.score - SCORE_IMPLAUSIBLE_TIP_PENALTY);
+        persist(r);
+        System.out.printf("[PeerScore] %s: implausible height claim %d (recent consensus ~%d), "
+                        + "score now %d%n",
+                ip, claimedHeight, consensusHeight, r.score);
+    }
+
+    /**
+     * Every peer's most recently observed height, restricted to
+     * observations within maxAgeMs. This is what lets a height
+     * cross-check work using nothing but already-persisted history --
+     * covering every peer this process has successfully talked to
+     * recently, not just whichever ones happen to still be connected --
+     * without needing any connection to still be open, let alone a live
+     * keep-alive reader on it just to stop its snapshot going stale.
+     * <p>
+     * The age window matters a lot here: a height is a snapshot in
+     * time, and the real chain keeps growing (~1 block per ~10 minutes
+     * on Handshake mainnet), so comparing a live claim against anything
+     * more than a handful of minutes old risks flagging an honest,
+     * genuinely-further-along peer as suspicious just because this
+     * process's own record of "normal" is stale -- not because anything
+     * about that peer is actually wrong.
+     */
+    public List<PeerRecord> getRecentHeightObservations(long maxAgeMs) {
+        long now = System.currentTimeMillis();
+        List<PeerRecord> result = new ArrayList<>();
+        for (PeerRecord r : cache.values()) {
+            if (r.lastSuccessTime > 0 && (now - r.lastSuccessTime) <= maxAgeMs && r.lastHeight > 0) {
+                result.add(r);
+            }
+        }
+        return result;
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────

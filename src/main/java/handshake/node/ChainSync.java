@@ -116,6 +116,42 @@ public class ChainSync {
      */
     private static final int MAX_BATCHES_PER_PEER = 10;
 
+    /**
+     * Same purpose as MAX_BATCHES_PER_PEER, but for block-download
+     * batches -- header sync already rotated periodically, but block
+     * downloading had no equivalent at all. A single downloadBlocks()
+     * call can easily run for thousands of blocks in one continuous
+     * pass (confirmed directly: a real run stayed on one connection for
+     * over 6000 blocks with zero rotation), which meant the entire
+     * outbound pool built for crossCheckTip() sat unexercised for the
+     * whole duration once block downloading started. At MAX_BLOCK_BATCH
+     * (16) blocks per batch, this is roughly 1600 blocks per peer
+     * before a mandatory rotation -- deliberately higher than headers'
+     * ~20,000-headers-per-peer, since a block batch carries far more
+     * actual data (and far more validation work) per request than a
+     * header batch does, so rotating at the same batch *count* would
+     * mean rotating far more often in wall-clock terms.
+     */
+    private static final int MAX_BLOCK_BATCHES_PER_PEER = 100;
+
+    /**
+     * How far ahead of every other currently-pooled peer a sync
+     * candidate's claimed height can be before crossCheckTip() surfaces
+     * a warning. See crossCheckTip()'s own comment for why this is a
+     * warning threshold, not a hard limit.
+     */
+    private static final int TIP_DISAGREEMENT_THRESHOLD = 100;
+
+    /**
+     * How far back PeerScorecard's persisted height history counts as
+     * "recent enough to compare against" in crossCheckTip(). Kept tight
+     * (well under Handshake mainnet's ~10-minute block time) so this is
+     * comparing against what the network actually looked like a few
+     * minutes ago, not treating an hour-old snapshot as if it were
+     * still current.
+     */
+    private static final long TIP_HISTORY_WINDOW_MS = 15 * 60 * 1000;
+
     // NetAddress wire format (88 bytes exactly), used inside the VERSION payload.
     private static final int NET_ADDRESS_SIZE = 88;
 
@@ -202,6 +238,31 @@ public class ChainSync {
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "chain-sync");
+                t.setDaemon(true);
+                return t;
+            });
+
+    // FIX: maintainOutboundPool() was originally scheduled on the same
+    // single-threaded `scheduler` as syncCycle() itself, reasoning that
+    // sharing a thread made the two safely non-concurrent. That part
+    // was true, but it had a real side effect: syncCycle()'s inner loop
+    // can run for a long time without returning (it stays inside one
+    // continuous downloadBlocks() pass while there's real progress to
+    // make), and since they shared one thread, maintainOutboundPool()
+    // could never actually run *while* syncCycle() was busy -- which,
+    // during active block processing, is most of the time. Confirmed
+    // directly: a real run's outbound pool stayed at 0/8 for the entire
+    // visible log, never growing past the one connection syncCycle()
+    // itself opened via its own connectToBestPeer() fallback.
+    // <p>
+    // A separate thread is safe here: the only state maintainOutboundPool()
+    // touches -- connectedPeers (CopyOnWriteArrayList) and
+    // PeerScorecard's internal cache (ConcurrentHashMap) -- is already
+    // safe for concurrent access, and it never touches whichever specific
+    // connection syncCycle() currently has checked out for active use.
+    private final ScheduledExecutorService poolScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "chain-sync-pool");
                 t.setDaemon(true);
                 return t;
             });
@@ -301,6 +362,19 @@ public class ChainSync {
         running = true;
         scheduler.scheduleWithFixedDelay(
                 this::syncCycle, 0, POLL_INTERVAL_SEC, TimeUnit.SECONDS);
+        // NEW: actually enforces config.getMaxOutbound() (previously
+        // defined but never called anywhere -- the node held exactly
+        // one outbound connection at a time no matter what this said).
+        // Runs more often than the sync cycle itself so the pool fills
+        // promptly after startup rather than trickling in one connection
+        // per 60-second sync tick. See maintainOutboundPool()'s own
+        // comment for what this actually buys: it's what makes
+        // crossCheckTip() have other peers to compare against at all.
+        // On poolScheduler, not `scheduler` -- see poolScheduler's own
+        // field comment for why sharing syncCycle()'s thread here
+        // silently never ran this at all during active syncing.
+        poolScheduler.scheduleWithFixedDelay(
+                this::maintainOutboundPool, 2, 20, TimeUnit.SECONDS);
         // FIX (audit): PeerScorecard.applyDecay() existed, fully
         // implemented, matching this class's own documented design
         // principle ("Score decay: peers slowly recover over time"),
@@ -313,7 +387,11 @@ public class ChainSync {
         // to 100 in under two hours from decay alone -- the opposite
         // of "slowly." Every 5 minutes instead caps that same climb at
         // roughly 12 points per hour, which actually matches "slowly."
-        scheduler.scheduleWithFixedDelay(
+        // On poolScheduler for the same reason as maintainOutboundPool()
+        // above -- sharing `scheduler` with syncCycle() means this would
+        // silently never fire during active syncing either, which is
+        // most of the time.
+        poolScheduler.scheduleWithFixedDelay(
                 () -> PeerScorecard.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
     }
 
@@ -449,6 +527,7 @@ public class ChainSync {
     public void stop() {
         running = false;
         scheduler.shutdown();
+        poolScheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.out.println("[ChainSync] Sync cycle did not stop within 30s -- "
@@ -495,27 +574,32 @@ public class ChainSync {
             // scores this same sync just updated.
             while (running) {
                 int localTip = db.getHeaderTip();
-                System.out.printf("[ChainSync] Tip: %d | Blocks: %d%n",
-                        localTip, db.getBlockTip());
+                System.out.printf("[ChainSync] Tip: %d | Blocks: %d | Outbound pool: %d/%d%n",
+                        localTip, db.getBlockTip(), countOutboundPeers(), config.getMaxOutbound());
 
                 List<PeerDiscovery.ConnectTarget> candidates =
                         PeerDiscovery.get().getCandidates();
 
-                if (candidates.isEmpty()) {
+                if (candidates.isEmpty() && countOutboundPeers() == 0) {
                     System.out.println("[ChainSync] No peer candidates — retrying in "
                             + POLL_INTERVAL_SEC + "s.");
                     return;
                 }
 
-                // Try to connect to a peer for header sync
-                PeerConnection peer = connectToBestPeer(candidates, localTip);
+                // Prefer an already-open pooled connection (see
+                // maintainOutboundPool()) over connecting fresh -- this
+                // is what actually keeps several outbound connections
+                // alive across cycles instead of reconnecting from
+                // scratch every time.
+                PeerConnection peer = acquireSyncPeer(candidates, localTip);
                 if (peer == null) {
                     System.out.println("[ChainSync] No peers responded.");
                     return;
                 }
 
                 boolean madeProgress = false;
-                try (peer) {
+                boolean peerBroken = false;
+                try {
                     int peerHeight = peer.peerHeight;
                     // Brontide-only: every connection this project makes
                     // now always goes through the real Noise/Act1-2-3
@@ -524,6 +608,12 @@ public class ChainSync {
                     // from.
                     System.out.printf("[ChainSync] Connected to %s via BRONTIDE (h=%d, agent=%s)%n",
                             peer.ip, peerHeight, peer.agent);
+
+                    // See crossCheckTip()'s own comment -- this is the
+                    // actual reason to keep several outbound connections
+                    // open rather than just one: something to compare a
+                    // sync source's claimed height against.
+                    crossCheckTip(peer);
 
                     // Auto-rollback if we're far above all peers
                     if (localTip > peerHeight + 2016) {
@@ -540,8 +630,16 @@ public class ChainSync {
                         madeProgress = newTip > localTip;
                     }
 
-                    // Download missing blocks
-                    downloadBlocks(peer);
+                    // Download missing blocks. Its own return value feeds
+                    // into madeProgress too now (see downloadBlocks()'s
+                    // own comment) -- otherwise a cycle that only had
+                    // blocks left to download, no headers, would report
+                    // no progress and stop the outer loop after a single
+                    // call regardless of how much it actually downloaded,
+                    // silently defeating the block-download rotation
+                    // this now relies on to ever reconnect and continue.
+                    boolean blocksProgress = downloadBlocks(peer);
+                    madeProgress = madeProgress || blocksProgress;
 
                 } catch (UrkelTreeMismatchException e) {
                     // Caught here, before the generic Exception handler
@@ -580,10 +678,23 @@ public class ChainSync {
                     }
                     return;
                 } catch (Exception e) {
+                    peerBroken = true;
                     PeerScorecard.get().recordFailure(peer.ip,
                             e.getClass().getSimpleName() + ": " + e.getMessage());
                     System.out.printf("[ChainSync] Peer %s error: %s%n",
                             peer.ip, e.getMessage());
+                } finally {
+                    // NEW (outbound pooling): a peer that finished this
+                    // cycle without a connection-level error stays open
+                    // and stays in connectedPeers -- it's a genuine pool
+                    // member now, reused by a future cycle instead of
+                    // being reconnected from scratch. Only an actual
+                    // failure (read error, decrypt failure, timeout)
+                    // closes and drops it, since that's the case where
+                    // the connection itself is now known-broken.
+                    if (peerBroken) {
+                        peer.close();
+                    }
                 }
 
                 // Fully caught up, or this round made no progress at all
@@ -599,6 +710,152 @@ public class ChainSync {
     }
 
     // ── Peer connection ───────────────────────────────────────────────────────
+
+    /**
+     * Proactively keeps up to config.getMaxOutbound() outbound
+     * connections open concurrently, rather than the old one-at-a-time
+     * connect/sync/close cycle. This is what actually makes
+     * getMaxOutbound() do anything -- it was defined in NodeConfig but
+     * never called anywhere, so the node held exactly one outbound
+     * connection at a time no matter what it said. Just as importantly,
+     * it's what makes crossCheckTip() meaningful at all: "does another
+     * peer corroborate this height" only means something if other peers
+     * are usually actually connected, not just whichever one peer we
+     * most recently happened to be talking to.
+     * <p>
+     * Connections opened here are deliberately NOT closed when this
+     * method returns -- they stay in connectedPeers as a genuine pool,
+     * picked up by acquireSyncPeer() on the next sync cycle (or several
+     * cycles) instead of being reconnected from scratch every time.
+     */
+    private void maintainOutboundPool() {
+        if (!running) return;
+        try {
+            int target = config.getMaxOutbound();
+            if (countOutboundPeers() >= target) return;
+
+            List<PeerDiscovery.ConnectTarget> candidates = PeerDiscovery.get().getCandidates();
+            Set<String> alreadyConnected = new HashSet<>();
+            for (PeerInfo p : connectedPeers) alreadyConnected.add(p.ip());
+
+            for (PeerDiscovery.ConnectTarget cand : candidates) {
+                if (countOutboundPeers() >= target) break;
+                if (alreadyConnected.contains(cand.ip())) continue;
+                if (!PeerScorecard.get().isGood(cand.ip())) continue;
+                try {
+                    PeerConnection conn = connectPeer(cand);
+                    if (conn == null) continue;
+                    connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
+                    System.out.printf("[ChainSync] Outbound pool: added %s (h=%d) -- now %d/%d%n",
+                            conn.ip, conn.peerHeight, countOutboundPeers(), target);
+                } catch (Exception e) {
+                    PeerScorecard.get().recordFailure(cand.ip(),
+                            e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[ChainSync] Outbound pool maintenance error: " + e.getMessage());
+        }
+    }
+
+    private int countOutboundPeers() {
+        int n = 0;
+        for (PeerInfo p : connectedPeers) if (!p.inbound()) n++;
+        return n;
+    }
+
+    /**
+     * Picks a peer to sync from, preferring an already-open pooled
+     * outbound connection (see maintainOutboundPool()) over opening a
+     * new one. Falls back to connectToBestPeer()'s old connect-fresh
+     * behavior -- via the caller, acquireSyncPeer() -- only when the
+     * pool has nothing usable right now (e.g. just after startup,
+     * before maintainOutboundPool()'s first pass has run).
+     */
+    private PeerConnection pickPoolPeer(int ourTip) {
+        String skip = avoidPeerIp;
+        List<PeerInfo> usable = new ArrayList<>();
+        for (PeerInfo p : connectedPeers) {
+            if (p.inbound()) continue;
+            if (skip != null && p.ip().equals(skip)) continue;
+            if (!PeerScorecard.get().isGood(p.ip())) continue;
+            if (p.conn().peerHeight < ourTip) continue;
+            usable.add(p);
+        }
+        if (usable.isEmpty()) return null;
+        avoidPeerIp = null; // consumed -- same one-shot semantics connectToBestPeer itself uses
+        List<String> order = PeerScorecard.get().weightedOrder(
+                usable.stream().map(PeerInfo::ip).toList());
+        usable.sort(Comparator.comparingInt(p -> order.indexOf(p.ip())));
+        return usable.get(0).conn();
+    }
+
+    private PeerConnection acquireSyncPeer(List<PeerDiscovery.ConnectTarget> candidates, int ourTip) {
+        PeerConnection pooled = pickPoolPeer(ourTip);
+        if (pooled != null) return pooled;
+        return connectToBestPeer(candidates, ourTip);
+    }
+
+    /**
+     * Compares the peer we're about to sync from against two independent
+     * sources of "what everyone else has been seeing":
+     * <p>
+     * 1. Every OTHER currently-pooled outbound peer's last-known height
+     *    (a live, in-memory snapshot from whenever we first connected to
+     *    each one).
+     * 2. PeerScorecard's persisted height history -- every peer this
+     *    process has successfully synced with recently, whether or not
+     *    it's still connected right now. This is the layer that
+     *    actually solves the staleness problem live pooled connections
+     *    have on their own: it doesn't need a connection to still be
+     *    open, let alone a live keep-alive reader on it, since it's
+     *    reading data that was already being persisted for scoring
+     *    purposes regardless. See PeerScorecard.getRecentHeightObservations()
+     *    for why the age window there matters.
+     * <p>
+     * This is the actual point of maintaining several concurrent
+     * connections and a persistent peer database at all: a single peer
+     * -- malicious, or sitting on a compromised path -- could otherwise
+     * feed a plausible-looking but false view of the chain with nothing
+     * to catch it against. A lone peer claiming to be far ahead of
+     * everyone else recently observed, with no corroboration at all
+     * from either source, is exactly that signal.
+     * <p>
+     * Deliberately a WARNING plus a modest, cumulative score nudge
+     * (recordImplausibleTip()) rather than a hard refusal: a single
+     * occurrence here could still just be an honestly-fast peer nothing
+     * has corroborated yet, which is a normal, expected case -- not
+     * proof of anything wrong. But it's worth surfacing immediately,
+     * and worth remembering: a peer whose claims keep being implausible
+     * sinks in the weighted ordering over time as recordImplausibleTip()
+     * accumulates, the same way every other kind of peer behavior this
+     * class already tracks does.
+     */
+    private void crossCheckTip(PeerConnection selected) {
+        List<Integer> others = new ArrayList<>();
+        for (PeerInfo p : connectedPeers) {
+            if (p.inbound()) continue;
+            if (p.ip().equals(selected.ip)) continue;
+            others.add(p.conn().peerHeight);
+        }
+        for (PeerScorecard.PeerRecord r : PeerScorecard.get()
+                .getRecentHeightObservations(TIP_HISTORY_WINDOW_MS)) {
+            if (r.ip.equals(selected.ip)) continue;
+            others.add(r.lastHeight);
+        }
+        if (others.size() < 2) {
+            return; // not enough independent observations yet to compare against
+        }
+        int bestOther = Collections.max(others);
+        if (selected.peerHeight > bestOther + TIP_DISAGREEMENT_THRESHOLD) {
+            System.out.printf("[ChainSync] WARNING: %s claims height %d, but no other peer "
+                            + "connected or recently seen (best of %d observations: %d) corroborates "
+                            + "anywhere close to that -- syncing from it anyway, but this disagreement "
+                            + "is worth watching.%n",
+                    selected.ip, selected.peerHeight, others.size(), bestOther);
+            PeerScorecard.get().recordImplausibleTip(selected.ip, selected.peerHeight, bestOther);
+        }
+    }
 
     private PeerConnection connectToBestPeer(
             List<PeerDiscovery.ConnectTarget> candidates, int ourTip) {
@@ -1117,17 +1374,28 @@ public class ChainSync {
 
     // ── Block download ────────────────────────────────────────────────────────
 
-    private void downloadBlocks(PeerConnection peer) throws Exception {
+    /**
+     * @return true if at least one block was actually downloaded and
+     *         accepted this call. syncCycle() needs this: block-download
+     *         progress has to count as real progress the same way
+     *         header-sync progress already does, or the outer sync loop
+     *         would stop spinning the moment this method returns early
+     *         for a periodic rotation, defeating the point of adding
+     *         one here at all.
+     */
+    private boolean downloadBlocks(PeerConnection peer) throws Exception {
         int headerTip = db.getHeaderTip();
         int blockTip  = db.getBlockTip();
 
-        if (blockTip >= headerTip) return;
+        if (blockTip >= headerTip) return false;
 
         System.out.printf("[ChainSync] Downloading blocks %d → %d%n",
                 blockTip + 1, headerTip);
 
         int height = blockTip + 1;
         int blocksSinceCommit = 0;
+        int totalDownloaded = 0;
+        int batchesOnThisPeer = 0;
         try {
             while (height <= headerTip && running) {
                 // Request a batch of blocks
@@ -1196,6 +1464,7 @@ public class ChainSync {
 
                 height += received;
                 blocksSinceCommit += received;
+                totalDownloaded += received;
 
                 // Commit periodically rather than after every single block
                 // (BlockProcessor no longer does this itself -- see its own
@@ -1218,6 +1487,21 @@ public class ChainSync {
                 }
 
                 if (received == 0 || batchFailed) break;
+
+                // Periodic forced diversification -- see
+                // MAX_BLOCK_BATCHES_PER_PEER's own comment for why block
+                // downloading needed this exactly as much as header sync
+                // already had it. Same avoidPeerIp one-shot mechanism
+                // syncHeaders() uses: the caller's next peer-selection
+                // call skips this IP for one round, not a lasting ban.
+                batchesOnThisPeer++;
+                if (batchesOnThisPeer >= MAX_BLOCK_BATCHES_PER_PEER) {
+                    System.out.printf("[ChainSync] Rotating away from %s after %d block batches "
+                                    + "(periodic diversification, not a score judgment).%n",
+                            peer.ip, batchesOnThisPeer);
+                    avoidPeerIp = peer.ip;
+                    break;
+                }
             }
         } finally {
             // Guarantee whatever was accumulated gets committed even if
@@ -1229,6 +1513,7 @@ public class ChainSync {
             // behavior did, which would be a real regression.
             if (blocksSinceCommit > 0) db.commit();
         }
+        return totalDownloaded > 0;
     }
 
     private boolean processBlock(byte[] msg, int height, String fromIp) {

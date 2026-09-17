@@ -53,16 +53,16 @@ public final class WebAdminServerContent {
                         </section>
 
                         <section class="card">
-                            <h2>Configuration</h2>
-                            <p class="hint">Changes to the RPC host require a restart to take effect.</p>
-                            <form id="config-form">
-                                <label>
-                                    RPC host
-                                    <input type="text" name="rpc.host">
-                                </label>
-                                <button type="submit">Save</button>
-                            </form>
-                            <p id="config-message"></p>
+                            <h2>Mempool</h2>
+                            <p>Transactions: <span id="mempool-count">Loading...</span></p>
+                            <p>Size: <span id="mempool-bytes">Loading...</span></p>
+                            <p>Min relay fee: <span id="mempool-fee">Loading...</span></p>
+                        </section>
+
+                        <section class="card danger-zone">
+                            <h2>Danger zone</h2>
+                            <button id="stop-node-btn">Stop node</button>
+                            <p id="stop-message"></p>
                         </section>
                     </div>
 
@@ -78,13 +78,6 @@ public final class WebAdminServerContent {
                         </section>
 
                         <section class="card">
-                            <h2>Mempool</h2>
-                            <p>Transactions: <span id="mempool-count">Loading...</span></p>
-                            <p>Size: <span id="mempool-bytes">Loading...</span></p>
-                            <p>Min relay fee: <span id="mempool-fee">Loading...</span></p>
-                        </section>
-
-                        <section class="card">
                             <h2>Banned Peers</h2>
                             <table id="bans-table">
                                 <thead>
@@ -94,17 +87,20 @@ public final class WebAdminServerContent {
                             </table>
                             <button id="clear-bans-btn">Clear all bans</button>
                         </section>
-
-                        <section class="card danger-zone">
-                            <h2>Danger zone</h2>
-                            <button id="stop-node-btn">Stop node</button>
-                            <p id="stop-message"></p>
-                        </section>
                     </div>
 
                     <div class="column">
                         <section class="card">
                             <h2>RPC Operations</h2>
+                            <p class="hint">Changes to the RPC host require a restart to take effect.</p>
+                            <form id="config-form">
+                                <label>
+                                    RPC host
+                                    <input type="text" name="rpc.host">
+                                </label>
+                                <button type="submit">Save</button>
+                            </form>
+                            <p id="config-message"></p>
                             <p class="hint">Test any RPC method directly, without a separate terminal or curl command.</p>
                             <label>
                                 Method
@@ -638,7 +634,7 @@ public final class WebAdminServerContent {
                     }
                     tbody.innerHTML = peers.map(p => `
                         <tr>
-                            <td>${escapeHtml(p.addr || "")}</td>
+                            <td>${escapeHtml(addrHost(p.addr))}</td>
                             <td>${escapeHtml(p.subver || "")}</td>
                             <td>${p.bestheight ?? ""}</td>
                             <td>${p.inbound ? "inbound" : "outbound"}</td>
@@ -647,6 +643,18 @@ public final class WebAdminServerContent {
                 } catch (e) {
                     tbody.innerHTML = "<tr><td colspan=\\"4\\">Failed to load.</td></tr>";
                 }
+            }
+
+            // Strips ":<port>" for display. Outbound peers are always
+            // :44806 (brontide-only, nothing else to connect to), and an
+            // inbound peer's port here is just its remote ephemeral source
+            // port for that TCP connection, not its actual listening
+            // port -- neither is meaningful to show, so this applies to
+            // both the same way rather than special-casing outbound.
+            function addrHost(addr) {
+                if (!addr) return "";
+                const i = addr.lastIndexOf(":");
+                return i === -1 ? addr : addr.slice(0, i);
             }
 
             async function loadMempool() {
