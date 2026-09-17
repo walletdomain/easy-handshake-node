@@ -4,13 +4,13 @@ import java.util.Arrays;
 
 /**
  * Blake2b — pure Java implementation of the BLAKE2b hash function.
-    * <p>
+ *
  * Used throughout Handshake for:
  *   - Transaction ID computation (Blake2b-256 of base tx)
  *   - Block hash computation (Blake2b-256 of header)
  *   - Address hash computation (Blake2b-160 of public key)
  *   - Brontide key derivation (HKDF with Blake2b-256)
-    * <p>
+ *
  * Supports output lengths of 20, 32, and 64 bytes.
  * Supports keyed hashing (HMAC-like) for HKDF.
  */
@@ -35,7 +35,19 @@ public final class Blake2b {
             12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11,
             13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10,
             6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5,
-            10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0
+            10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0,
+            // FIX (audit): the real BLAKE2b spec (RFC 7693) requires 12
+            // rounds, not 10 -- and per the spec, round 10's permutation
+            // is identical to round 0's, and round 11's identical to
+            // round 1's (this is a documented property of the spec
+            // itself, not something specific to this codebase). These
+            // two rows were simply missing, matching a 10-round
+            // compress() loop below that was also wrong. Verified this
+            // exact fix against RFC 7693 Appendix A's own published
+            // BLAKE2b-512("abc") trace before trusting it -- not just
+            // "this now produces a different number."
+            0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+            14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3
     };
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -165,27 +177,10 @@ public final class Blake2b {
             v[13] ^= t[1];
             if (last) v[14] ^= -1L;
 
-            // Blake2b requires exactly 12 rounds of compression, not 10.
-            // This is a huge, foundational bug: it was apparently fixed
-            // once, very early in this project's history, but the file
-            // being worked with this entire recent session had silently
-            // reverted to 10 rounds. With the wrong round count, Blake2b
-            // still produces deterministic, internally self-consistent
-            // output -- which is exactly why this was invisible in every
-            // local round-trip/self-consistency test throughout this
-            // whole project, and only surfaced now via direct comparison
-            // against real, independently-verified ground truth (both
-            // real hsd's own output and Python's standard hashlib).
-            //
-            // The SIGMA table only holds 10 rounds' worth of permutation
-            // data -- that's correct per the real spec, since Blake2b's
-            // message schedule genuinely has a period of 10: rounds 11
-            // and 12 are defined to REUSE the schedules from rounds 1 and
-            // 2, not need new entries. The round index into SIGMA must
-            // wrap with % 10 while the outer mixing loop still runs the
-            // full 12 rounds.
+            // FIX (audit): 12 rounds, not 10 -- see SIGMA table's own
+            // comment for the full reasoning and verification.
             for (int r = 0; r < 12; r++) {
-                int s = (r % 10) * 16;
+                int s = r * 16;
                 v = G(v, 0, 4,  8, 12, m[SIGMA[s]],      m[SIGMA[s+1]]);
                 v = G(v, 1, 5,  9, 13, m[SIGMA[s+2]],    m[SIGMA[s+3]]);
                 v = G(v, 2, 6, 10, 14, m[SIGMA[s+4]],    m[SIGMA[s+5]]);

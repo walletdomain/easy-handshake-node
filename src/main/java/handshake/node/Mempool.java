@@ -49,10 +49,6 @@ public class Mempool {
             this.height  = height;
         }
 
-        public double getFeeRate() {
-            return size > 0 ? (double) fee / size * 1000 : 0;
-        }
-
         public String toJson(boolean verbose) {
             if (!verbose) return "\"" + txid + "\"";
             return "{"
@@ -318,12 +314,6 @@ public class Mempool {
 
     public Collection<MempoolEntry> getAll() {
         return Collections.unmodifiableCollection(entries.values());
-    }
-
-    public List<byte[]> getAllRaw() {
-        List<byte[]> list = new ArrayList<>();
-        for (MempoolEntry e : entries.values()) list.add(e.raw);
-        return list;
     }
 
     public String toJson(boolean verbose) {

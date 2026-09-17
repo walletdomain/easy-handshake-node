@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * PeerDiscovery — tracks peers discovered via ADDR messages and inbound
  * connections, making them available for outbound connection attempts.
-    * <p>
+ * <p>
  * Design principles:
  *   - Seeds (from SeedDatabase) are always available regardless of discovery
  *   - Discovered peers supplement seeds — more peers = better connectivity
@@ -114,23 +114,19 @@ public class PeerDiscovery {
     }
 
     /**
-     * Adds a cleartext-only peer (no Brontide key).
-     * Used for peers that only support cleartext on port 12038.
-     */
-    public void addCleartext(String ip) {
-        addDiscovered("", ip, 12038, "cleartext");
-    }
-
-    /**
      * Processes an ADDR message received from a peer, extracting new peer
      * IPs. Uses the real 88-byte NetAddress-per-entry format (matching
      * ChainSync.writeNetAddress exactly: time(8)+services(4)+hiServices(4)
-     * +addrType(1)+raw(16)+reserved(20)+port(2)+key(33)) -- this replaces
-     * an earlier, simplified 30-byte-per-entry format that had no room
-     * for an actual key at all, meaning every discovered peer silently
-     * carried an empty brontide key regardless of what the real message
-     * contained. Accepts both port 44806 (Brontide, keyed) and 12038
-     * (cleartext) entries now, rather than only 44806.
+     * +addrType(1)+raw(16)+reserved(20)+port(2)+key(33)).
+     * <p>
+     * Brontide-only: an entry is only ever added if it carries a real
+     * (non-zero) key AND is on port 44806, the Brontide port. Anything
+     * else -- a keyless entry, a keyed entry on the wrong port, or a
+     * cleartext (12038) entry -- is silently dropped rather than tracked.
+     * Real hsd's own HostList.add() has no such requirement, so this
+     * doesn't reduce our own discoverability by other real nodes; it
+     * only means we never bother remembering a peer we could never
+     * connect to securely in the first place.
      */
     public void onAddrMessage(byte[] msg, String fromIp) {
         try {
@@ -154,15 +150,10 @@ public class PeerDiscovery {
                         + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
                 if (!isValidIp(ip)) continue;
 
-                boolean hasKey = !isAllZero(keyBytes);
-                if (hasKey && port == 44806) {
-                    String base32Key = NodeIdentity.base32Encode(keyBytes);
-                    addDiscovered(base32Key, ip, port, "addr:" + fromIp);
-                } else if (!hasKey && port == 12038) {
-                    addDiscovered("", ip, port, "addr:" + fromIp);
-                }
-                // else: an unrecognized combination (e.g. keyed port 12038),
-                // skip rather than guess.
+                if (port != 44806 || isAllZero(keyBytes)) continue;
+
+                String base32Key = NodeIdentity.base32Encode(keyBytes);
+                addDiscovered(base32Key, ip, port, "addr:" + fromIp);
             }
         } catch (Exception ignored) {}
     }
@@ -177,14 +168,18 @@ public class PeerDiscovery {
     /**
      * Returns available peers for outbound connection attempts, seeds
      * FIRST as a group (weighted among themselves), followed by
-     * discovered peers (Brontide and cleartext) as a group after them.
-     * This is a genuine two-tier priority, not one flat weighted pool --
-     * with true weighted sampling, a large enough number of low-scored
-     * discovered peers can still statistically dominate selection over a
-     * handful of high-scored seeds purely by sheer count, which doesn't
-     * match the actual expectation that the node connects quickly via
-     * the known-good curated seeds by default, falling back to
-     * discovered peers only when seeds aren't working.
+     * discovered peers as a group after them. This is a genuine two-tier
+     * priority, not one flat weighted pool -- with true weighted
+     * sampling, a large enough number of low-scored discovered peers can
+     * still statistically dominate selection over a handful of
+     * high-scored seeds purely by sheer count, which doesn't match the
+     * actual expectation that the node connects quickly via the
+     * known-good curated seeds by default, falling back to discovered
+     * peers only when seeds aren't working.
+     * <p>
+     * Every candidate returned here always carries a real Brontide key --
+     * see onAddrMessage()'s class comment for why a keyless peer never
+     * makes it into `discovered` in the first place.
      */
     public List<ConnectTarget> getCandidates() {
         List<ConnectTarget> seedCandidates = new ArrayList<>();
@@ -206,7 +201,6 @@ public class PeerDiscovery {
                         peer.ip(), peer.port(), keyBytes, "discovered"));
             }
         }
-        discoveredCandidates.addAll(getCleartextCandidates());
 
         List<ConnectTarget> candidates = new ArrayList<>();
         candidates.addAll(weightedOrderCandidates(seedCandidates));
@@ -223,42 +217,19 @@ public class PeerDiscovery {
     }
 
     /**
-     * Returns cleartext-only candidates (port 12038, no Brontide key).
-     */
-    public List<ConnectTarget> getCleartextCandidates() {
-        List<ConnectTarget> candidates = new ArrayList<>();
-        for (DiscoveredPeer peer : discovered.values()) {
-            if (peer.port() == 12038 && !peer.hasBrontideKey()) {
-                if (!PeerScorecard.get().shouldSkip(peer.ip())) {
-                    candidates.add(new ConnectTarget(
-                            peer.ip(), peer.port(), null, "cleartext"));
-                }
-            }
-        }
-        return candidates;
-    }
-
-    /**
-     * A peer we can attempt to connect to.
+     * A peer we can attempt to connect to. brontideKey is always a real
+     * 33-byte key -- every source that constructs a ConnectTarget
+     * (seeds, ADDR-discovered peers) only ever does so with one already
+     * confirmed present.
      */
     public record ConnectTarget(
             String ip,
             int    port,
-            byte[] brontideKey,  // null for cleartext
+            byte[] brontideKey,
             String label
-    ) {
-        public boolean isBrontide() {
-            return brontideKey != null && brontideKey.length == 33;
-        }
-    }
+    ) {}
 
     // ── Queries ───────────────────────────────────────────────────────────────
-
-    public int getDiscoveredCount() { return discovered.size(); }
-
-    public boolean isKnown(String ip) {
-        return SeedDatabase.get().isSeed(ip) || discovered.containsKey(ip);
-    }
 
     // ── Persistence ───────────────────────────────────────────────────────────
 

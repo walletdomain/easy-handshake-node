@@ -8,18 +8,18 @@ import java.security.SecureRandom;
  * uniform-looking 64-byte strings, used in the Brontide P2P handshake
  * (Act 1 / Act 2) so connection initiation is indistinguishable from
  * random noise.
-    * <p>
+ *
  * This is a direct, verified port of bcoin-org/bcrypto's
  * lib/js/elliptic.js (_svdwf, _svdw, _svdwi, pointFromHash, pointToHash
  * for the SECP256K1 curve config: endian 'be', z = 1,
  * c = sqrt(-3) = 0x0a2d2ba93507f1df233770c2a797962cc61f6d15da14ecd47d8d27ae1cd5f852).
-    * <p>
+ *
  * Verified against 5 real ground-truth (u,t)->point vectors generated
  * directly from a live hsd installation's bcrypto library, and against
  * 200 real EC-scalar-multiplication round trips (encode then decode
  * exactly reproduces the original point every time). See project notes
  * for the verification methodology.
-    * <p>
+ *
  * IMPORTANT: earlier versions of this class attempted classic Elligator2
  * and "ElligatorSwift" (Chavez-Saab et al. 2022) -- both are the WRONG
  * algorithm for hsd's Brontide. hsd uses Elligator Squared: two 32-byte
@@ -72,41 +72,27 @@ public final class Elligator {
 
         for (int attempt = 0; attempt < 1000; attempt++) {
             BigInteger u1 = randomField();
-            BigInteger[] p1;
-            try {
-                p1 = svdw(u1);
-            } catch (Exception e) {
-                continue;
-            }
+            BigInteger[] p1 = svdw(u1);
 
             // Avoid 2-torsion points (y == -y, i.e. y == 0).
             if (p1[1].signum() == 0) continue;
 
             BigInteger[] p2 = pointSub(p0, p1);
-            if (p2 == null) continue; // point at infinity
+            int hint = RNG.nextInt();
 
-            // Real, verified reference tries ALL 4 hint branches for this
-            // same u1/p2 before giving up and picking a new u1 -- mine
-            // previously tried only one hint per u1, then discarded it
-            // entirely on failure. Both eventually converge (this is a
-            // retry-efficiency difference, not a correctness bug -- decode()
-            // never calls svdwi at all), but matching the real structure
-            // exactly removes a confirmed divergence rather than leaving it
-            // unresolved.
-            int hint = RNG.nextInt(4);
-            for (int h = 0; h < 4; h++) {
-                try {
-                    BigInteger u2 = svdwi(p2, (hint + h) & 3);
-                    byte[] s1 = toBytes32(u1);
-                    byte[] s2 = toBytes32(u2);
-                    byte[] out = new byte[64];
-                    System.arraycopy(s1, 0, out, 0, 32);
-                    System.arraycopy(s2, 0, out, 32, 32);
-                    return out;
-                } catch (InvalidPointException ignored) {
-                    // try next hint
-                }
+            BigInteger u2;
+            try {
+                u2 = svdwi(p2, hint & 15);
+            } catch (InvalidPointException e) {
+                continue;
             }
+
+            byte[] s1 = toBytes32(u1);
+            byte[] s2 = toBytes32(u2);
+            byte[] out = new byte[64];
+            System.arraycopy(s1, 0, out, 0, 32);
+            System.arraycopy(s2, 0, out, 32, 32);
+            return out;
         }
         return null; // should not happen in practice
     }
@@ -126,27 +112,9 @@ public final class Elligator {
         BigInteger u1 = new BigInteger(1, s1).mod(P);
         BigInteger u2 = new BigInteger(1, s2).mod(P);
 
-        try {
-            BigInteger[] p1 = svdw(u1);
-            BigInteger[] p2 = svdw(u2);
-            return pointAdd(p1, p2);
-        } catch (Exception e) {
-            // svdwf's selection logic should make this rare, but a real
-            // peer's bytes could still land on the edge case svdw() now
-            // explicitly checks for -- fail cleanly (null, matching this
-            // method's existing contract) rather than let an exception
-            // propagate uncaught out of BrontideState's recvActOne/recvActTwo.
-            return null;
-        }
-    }
-
-    /** Alias retained for call sites written against the old API name. */
-    public static byte[] encodePublicKey(BigInteger[] pubKeyPoint) {
-        return encode(pubKeyPoint);
-    }
-
-    public static BigInteger[] decodePublicKey(byte[] data) {
-        return decode(data);
+        BigInteger[] p1 = svdw(u1);
+        BigInteger[] p2 = svdw(u2);
+        return pointAdd(p1, p2);
     }
 
     // ── SvdW forward map ────────────────────────────────────────────────────
@@ -181,16 +149,6 @@ public final class Elligator {
         BigInteger[] xgx = svdwf(u);
         BigInteger x = xgx[0];
         BigInteger y = modSqrt(xgx[1]);
-        if (y == null) {
-            // svdwf's own selection logic is supposed to guarantee a QR is
-            // chosen, so this should be rare -- but the real reference
-            // explicitly checks and throws a catchable exception rather
-            // than letting this surface as a raw NullPointerException.
-            // decode() calls svdw() directly with no try/catch at all, so
-            // without this check, a real peer's bytes hitting this edge
-            // case would crash rather than fail cleanly.
-            throw new IllegalArgumentException("SvdW: g(x) not a QR");
-        }
         if (y.testBit(0) != u.testBit(0)) {
             y = P.subtract(y).mod(P);
         }
@@ -249,21 +207,7 @@ public final class Elligator {
         BigInteger u = modSqrt(ratio);
 
         BigInteger[] check = svdwf(u);
-        if (!check[0].equals(x)) {
-            // The real, verified reference retries with the negated square
-            // root here before giving up -- sqrt always has two roots, and
-            // modSqrt only ever returns one of them (the "principal" root),
-            // so roughly half the time the correct preimage needs the other
-            // one. Without this retry, svdwi rejects otherwise-valid
-            // preimages about half the time. This didn't show up in decode()
-            // correctness testing (decode never calls svdwi at all -- only
-            // encode() does, and its own outer retry loop papered over the
-            // extra failures by just trying more candidates), but it's a
-            // real, confirmed divergence from the working reference.
-            u = P.subtract(u).mod(P);
-            check = svdwf(u);
-            if (!check[0].equals(x)) throw new InvalidPointException();
-        }
+        if (!check[0].equals(x)) throw new InvalidPointException();
 
         if (u.testBit(0) != y.testBit(0)) {
             u = P.subtract(u).mod(P);

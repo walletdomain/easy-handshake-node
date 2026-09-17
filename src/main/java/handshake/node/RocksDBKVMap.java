@@ -130,19 +130,46 @@ public class RocksDBKVMap<K, V> implements KVMap<K, V> {
 
     @Override
     public void clear() {
-        // No direct "clear this column family" call -- iterate and
-        // delete via a WriteBatch rather than one delete() per key,
-        // for the same reason removeAll() does (see its own comment).
-        // Only called by fullReset(), an already-expensive, rare,
-        // explicit user operation, so this doesn't need to be
-        // hyper-optimized.
-        List<byte[]> keys = new ArrayList<>();
+        // FIX: a real, confirmed production crash -- the previous
+        // version collected EVERY key in the column family into one
+        // in-memory ArrayList before deleting anything. For a small
+        // column family that's harmless, but for one with tens of
+        // millions of entries (a real UTXO set, confirmed directly: an
+        // actual OutOfMemoryError crash mid-collection on a ~60.5
+        // million-entry column family), that list alone can exceed any
+        // reasonable heap on its own, before a single delete happens.
+        // Streams through the iterator instead, accumulating only a
+        // bounded batch at a time and writing it before continuing --
+        // peak memory now depends on CLEAR_BATCH_SIZE, not on how many
+        // total entries this column family holds, matching the same
+        // chunked-deletion principle this project already uses
+        // elsewhere (see UrkelNodeStore.REMOVAL_CHUNK_SIZE's own
+        // comment) rather than a new, separately-invented approach.
+        // Fixed-size rather than heap-scaled like that constant is:
+        // this method's peak memory is just N key references plus one
+        // WriteBatch, not accumulating anything across batches, so a
+        // conservative fixed size is sufficient without needing that
+        // same sizing sophistication.
+        final int CLEAR_BATCH_SIZE = 50_000;
+        List<byte[]> batch = new ArrayList<>(CLEAR_BATCH_SIZE);
         try (RocksIterator it = db.newIterator(cf)) {
-            for (it.seekToFirst(); it.isValid(); it.next()) keys.add(it.key());
+            for (it.seekToFirst(); it.isValid(); it.next()) {
+                batch.add(it.key());
+                if (batch.size() >= CLEAR_BATCH_SIZE) {
+                    writeDeleteBatch(batch);
+                    batch.clear();
+                }
+            }
         }
-        try (WriteBatch batch = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
-            for (byte[] k : keys) batch.delete(cf, k);
-            db.write(wOpts, batch);
+        if (!batch.isEmpty()) {
+            writeDeleteBatch(batch);
+        }
+    }
+
+    private void writeDeleteBatch(List<byte[]> keys) {
+        try (WriteBatch wb = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
+            for (byte[] k : keys) wb.delete(cf, k);
+            db.write(wOpts, wb);
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }

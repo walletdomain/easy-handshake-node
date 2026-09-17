@@ -117,6 +117,10 @@ public class Main {
                 if (!java.util.Arrays.equals(claimedRoot, computedRoot)) {
                     System.err.println("[Main] Inconsistency confirmed at height " + currentTip
                             + " -- attempting automatic recovery before allowing sync to start.");
+                    PersistentLog.logError(dataDir, String.format(
+                            "Startup consistency check found a mismatch at height %d after an unclean "
+                                    + "shutdown -- header claims %s, we computed %s",
+                            currentTip, hex(claimedRoot), hex(computedRoot)));
                     UrkelTreeMismatchException cause = new UrkelTreeMismatchException(
                             currentTip, claimedRoot, computedRoot, db.getNameTree().firstDeepCatchUpDeletionHeight());
                     UrkelTreeRecovery.RecoveryResult result =
@@ -131,13 +135,38 @@ public class Main {
                         System.err.println("[Main] Automatic recovery did not succeed: " + result.message);
                         System.err.println("[Main] Refusing to start sync on top of known-inconsistent "
                                 + "state. This needs direct investigation.");
+                        PersistentLog.logError(dataDir,
+                                "Startup recovery FAILED, refusing to start sync: " + result.message);
                         System.exit(1);
                     }
+                    PersistentLog.logWarn(dataDir, "Startup recovery succeeded: " + result.message);
                     System.out.println("[Main] Recovery succeeded: " + result.message);
                 } else {
                     System.out.println("[Main] On-disk state verified consistent at height " + currentTip
                             + " -- no recovery needed.");
                 }
+            } else if (currentTip >= 0) {
+                // FIX: a real, confirmed production incident -- this
+                // branch used to be reached whenever currentHeader was
+                // null for ANY reason, including a genuinely fresh
+                // install (currentTip == -1, the expected, safe case)
+                // -- but it couldn't tell that apart from currentTip
+                // claiming a real height while the header there is
+                // simply missing, which is exactly what a fullReset()
+                // interrupted partway through used to leave behind
+                // (see ChainDB.fullReset()'s own fix). That's not
+                // "nothing to verify" -- it's the same "can't trust
+                // this data" situation the genesis and tip-linkage
+                // checks already respond to with a full reset, just
+                // discovered here instead. Only currentTip < 0 is the
+                // genuinely fresh, nothing-to-verify case now.
+                System.err.println("[Main] Tip metadata claims height " + currentTip
+                        + " but no header exists there -- this data can't be trusted. "
+                        + "Performing a full reset before allowing sync to start.");
+                PersistentLog.logError(dataDir, "Startup found tip=" + currentTip
+                        + " with a missing header -- likely an interrupted previous reset. Resetting fully.");
+                db.fullReset();
+                System.out.println("[Main] Full reset complete -- starting sync fresh.");
             } else {
                 System.out.println("[Main] No blocks processed yet -- nothing to verify.");
             }
@@ -152,9 +181,8 @@ public class Main {
 
         // ── 6. Seed database ──────────────────────────────────────────────────
         SeedDatabase seeds = SeedDatabase.get();
-        System.out.printf("[Main] Seeds loaded: %d Brontide, %d cleartext%n",
-                seeds.getBrontideSeeds().size(),
-                seeds.getCleartextSeeds().size());
+        System.out.printf("[Main] Seeds loaded: %d Brontide (brontide-only)%n",
+                seeds.getBrontideSeeds().size());
 
         // ── 7. RPC server ─────────────────────────────────────────────────────
         RpcServer rpc = new RpcServer(config, db);
@@ -369,5 +397,11 @@ public class Main {
     @FunctionalInterface
     private interface ShutdownStep {
         void run() throws Exception;
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) sb.append(String.format("%02x", x));
+        return sb.toString();
     }
 }

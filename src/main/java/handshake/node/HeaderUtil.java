@@ -4,21 +4,21 @@ import java.math.BigInteger;
 
 /**
  * Utilities for parsing the 236-byte Handshake block header format.
-    * <p>
+ * <p>
  * Field order confirmed against a real, dedicated implementation
  * ("hns_header_consensus", documented as "Canonical 236-byte Handshake
  * headers and proof-of-work consensus") -- its encode() method writes
  * fields in this exact order, all little-endian:
-    * <p>
+ * <p>
  *   nonce(4) + time(8) + prevBlock(32) + treeRoot(32) + extraNonce(24)
  *   + reservedRoot(32) + witnessRoot(32) + merkleRoot(32) + version(4)
  *   + bits(4) + mask(32) = 236 bytes
-    * <p>
+ * <p>
  * This directly contradicts an earlier assumption elsewhere in this
  * codebase (RpcServer previously read "time" from offset 100 and
  * "version" as if it were the first field) -- those were wrong and are
  * fixed to use these confirmed offsets.
-    * <p>
+ * <p>
  * The block hash uses Handshake's real "share hash" scheme -- a
  * deliberately expensive, ASIC-resistant construction involving Blake2b
  * at two different output sizes, SHA3-256, and an XOR mask -- NOT a
@@ -202,7 +202,7 @@ public class HeaderUtil {
      * sequence is trivial; fabricating one that also satisfies real
      * mainnet difficulty at every step is not, which is exactly the
      * property that makes this check meaningful.
-        * <p>
+     * <p>
      * Target decoding matches Bitcoin/hsd's standard compact ("nBits")
      * encoding: top byte = exponent, next bit = sign, low 23 bits =
      * mantissa. hash(header), interpreted as a big-endian unsigned

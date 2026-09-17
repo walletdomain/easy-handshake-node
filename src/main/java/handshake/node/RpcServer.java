@@ -1096,21 +1096,53 @@ public class RpcServer {
      * close -- it's accepted but is a no-op beyond that, which is an
      * honest limitation given this project's connection model, not a
      * missing feature.
+     * <p>
+     * Brontide-only: accepts the same "key@host:port" format real hsd
+     * uses everywhere else a peer is identified by address (its own
+     * getinfo output, DNS seed entries, ADDR gossip) -- e.g.
+     *   addnode "aonetsezqp4m52w4jpfq2gv3dggy2wqfwqtkfjyttgdidbvhgp5as@165.22.151.242:44806" add
+     * Previously this always passed an empty key to addDiscovered(),
+     * which meant an added peer could never actually appear in
+     * PeerDiscovery.getCandidates() at all (that requires a real key) --
+     * a real, pre-existing bug, not something this cleanup introduces.
+     * A bare "host[:port]" with no key is still accepted without error
+     * (matching real hsd's own tolerance of keyless addnode targets),
+     * but -- consistent with the rest of this project now -- it's
+     * registered without a key and so never becomes a connectable
+     * candidate; only a properly-keyed address actually results in a
+     * peer we'll ever try to reach.
      */
     private String addNode(String params) throws RpcException {
         String addr = parseStringParam(params, 0);
         String cmd  = parseStringParam(params, 1);
         if (addr == null || cmd == null) throw new RpcException(-1,
                 "addnode \"validator\" \"add|remove|onetry\"");
-        String[] parts = addr.split(":");
-        String ip = parts[0];
-        int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 44806;
         if ("remove".equals(cmd)) {
             // No persistent "added nodes" list separate from discovered
             // peers in this project; nothing to explicitly remove.
             return "null";
         }
-        PeerDiscovery.get().addDiscovered("", ip, port, "rpc-addnode");
+
+        String key = "";
+        String hostPart = addr;
+        int at = addr.indexOf('@');
+        if (at >= 0) {
+            String keyStr = addr.substring(0, at);
+            hostPart = addr.substring(at + 1);
+            byte[] keyBytes = NodeIdentity.base32Decode(keyStr);
+            if (keyBytes.length == 33) {
+                key = keyStr;
+            }
+            // else: malformed key -- fall through and register keyless,
+            // same as a bare host with no "@" at all, rather than
+            // rejecting the whole call over a bad key.
+        }
+
+        String[] parts = hostPart.split(":");
+        String ip = parts[0];
+        int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 44806;
+
+        PeerDiscovery.get().addDiscovered(key, ip, port, "rpc-addnode");
         return "null";
     }
 

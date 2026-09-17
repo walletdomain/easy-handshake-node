@@ -28,6 +28,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *     class deciding to blacklist something itself.
  *   - New seeds discovered at runtime are persisted back into the same
  *     "seeds" map (isBuiltin=false) so they survive restarts.
+ *   - Brontide-only: this project never tracks or connects to a keyless
+ *     (cleartext) peer. Real hsd's own HostList.add() -- the code path
+ *     that actually propagates a peer through the real network via ADDR
+ *     gossip -- has no brontide-key requirement at all, so being
+ *     keyed-only here doesn't reduce our own discoverability by other
+ *     real nodes; it only means we don't bother tracking peers we could
+ *     never connect to securely in the first place.
  */
 public class SeedDatabase {
 
@@ -36,10 +43,11 @@ public class SeedDatabase {
     /**
      * A known seed validator.
      * <p>
-     * @param brontideKey  Base32-encoded compressed secp256k1 public key (33 bytes)
-     *                     Empty string for cleartext-only peers (port 12038)
+     * @param brontideKey  Base32-encoded compressed secp256k1 public key (33 bytes).
+     *                     Always required -- see the class comment on why this
+     *                     project no longer tracks keyless (cleartext) seeds.
      * @param ip           IPv4 or IPv6 address
-     * @param port         P2P port (44806 for Brontide, 12038 for cleartext)
+     * @param port         P2P port (always 44806, the Brontide port)
      * @param label        Human-readable label for logging
      * @param builtin      Whether this came from the curated seed set vs. runtime discovery
      */
@@ -52,10 +60,6 @@ public class SeedDatabase {
     ) {
         public boolean hasBrontideKey() {
             return brontideKey != null && !brontideKey.isBlank();
-        }
-
-        public boolean isCleartext() {
-            return port == 12038 || !hasBrontideKey();
         }
 
         String toStorage() {
@@ -177,22 +181,10 @@ public class SeedDatabase {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /** Returns all seeds (loaded + any added at runtime). */
-    public List<Seed> getSeeds() {
-        return Collections.unmodifiableList(seeds);
-    }
-
     /** Returns only Brontide-capable seeds. */
     public List<Seed> getBrontideSeeds() {
         return seeds.stream()
                 .filter(Seed::hasBrontideKey)
-                .toList();
-    }
-
-    /** Returns only cleartext seeds. */
-    public List<Seed> getCleartextSeeds() {
-        return seeds.stream()
-                .filter(Seed::isCleartext)
                 .toList();
     }
 

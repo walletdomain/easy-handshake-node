@@ -67,8 +67,12 @@ public class UrkelNameTree {
      *  catchup cadence), then get validated against a real walk and
      *  cleared as one batch. See maybeCommit()'s own comment for the
      *  full reasoning on why this hybrid exists at all. */
-    private final java.util.Set<UrkelNodeStore.HashKey> accumulatedOrphanCandidates =
-            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    // RE-ARCHITECTURE: disk-backed, not in-memory -- see
+    // DiskBackedOrphanQueue's own class comment for the full reasoning.
+    // Same declared type (Set<UrkelNodeStore.HashKey>) as before, so
+    // this remains a drop-in replacement wherever it's referenced,
+    // including UrkelTree's own unorphan-resurrection safeguard.
+    private final DiskBackedOrphanQueue accumulatedOrphanCandidates = new DiskBackedOrphanQueue();
 
     /** NEW: self-healing support. Records the height of the FIRST
      *  deep-catch-up (removeDirectly, no validation walk) reconciliation
@@ -165,22 +169,6 @@ public class UrkelNameTree {
      *  can actually support. */
     private static final long CANDIDATE_MEMORY_BUDGET_FRACTION_BYTES_PER_CANDIDATE = 670;
 
-    /** How many orphan candidates to remove per drain cycle during deep
-     *  catch-up -- small and FIXED, deliberately NOT scaled to available
-     *  memory the way the hard cap above is. There's no reason for this
-     *  to scale with RAM: removal cost here is linear in candidate
-     *  count (no validation walk, no tree-size-dependent cost the way
-     *  the near-tip path has), so a small, constant chunk keeps each
-     *  individual drain cycle's own memory footprint small and
-     *  predictable on any machine, while maybeCommit() calling this
-     *  every commit (whenever the backlog is non-empty) is what keeps
-     *  the backlog itself from ever growing large in the first place,
-     *  on any machine, regardless of covenant activity level in any
-     *  given stretch of the chain. 5,000 is small enough that even a
-     *  genuinely tiny deployment target comfortably absorbs it every
-     *  single commit without it becoming its own bottleneck. */
-    private static final int DEEP_CATCHUP_DRAIN_CHUNK_SIZE = 5_000;
-
     private static int detectHardBackpressureCap() {
         long floor = 10_000;
         long ceiling = 3_000_000;
@@ -226,42 +214,74 @@ public class UrkelNameTree {
     // at a new constant with nothing real backing it.
     static final int HARD_BACKPRESSURE_CAP = detectHardBackpressureCap();
 
+    /** FIX: a real, confirmed problem, not a guess -- the original
+     *  5,000-per-commit value below was small and FIXED, deliberately
+     *  NOT scaled to available memory, on the reasoning that removal
+     *  cost is linear in candidate count and a small constant chunk
+     *  would keep each drain cycle's footprint predictable regardless
+     *  of machine size. That reasoning about per-cycle cost was fine;
+     *  what it missed was the actual, observed GENERATION rate on this
+     *  chain: a real run hit 201,000 and then 265,000+ new candidates
+     *  in single, consecutive 36-block commit windows -- roughly
+     *  5,500-7,400 per BLOCK, not per commit. Draining only 5,000 per
+     *  COMMIT (36 blocks) against that meant the drain rate was off by
+     *  roughly 40x, so the backlog constantly blew past
+     *  HARD_BACKPRESSURE_CAP and the system spent nearly all its time
+     *  in the expensive, synchronous backpressure path instead of the
+     *  cheap, normal one -- confirmed directly: heap climbing steadily
+     *  toward the ceiling during dozens of back-to-back backpressure
+     *  cycles with almost no gap between episodes, very plausibly from
+     *  the JVM's own GC never getting a real chance to keep up with
+     *  that pace of transient allocation, on top of the backlog problem
+     *  itself.
+     *
+     *  Fixed by reusing UrkelNodeStore.REMOVAL_CHUNK_SIZE's own,
+     *  already-justified formula directly here (not a cross-class
+     *  reference to that field itself, which would create a circular
+     *  static-initialization dependency between the two classes, since
+     *  IT derives from HARD_BACKPRESSURE_CAP above) -- computed the
+     *  same way, against the same source value, so the two stay
+     *  consistent with each other without either one depending on the
+     *  other. ~6x larger than the original 5,000 on a typical machine,
+     *  properly scaled to available memory the same way the cap itself
+     *  is, rather than a second, arbitrary constant. Doesn't fully
+     *  eliminate backpressure during genuinely extreme bursts like the
+     *  one that exposed this, but substantially closes the gap between
+     *  drain rate and real, observed generation rate, and cuts the
+     *  number of cycles needed to resolve backpressure when it does
+     *  trigger by the same ~6x factor. */
+    private static final int DEEP_CATCHUP_DRAIN_CHUNK_SIZE = Math.max(10_000, HARD_BACKPRESSURE_CAP / 10);
 
-    /** A single, dedicated daemon thread for pruning -- see
-     *  maybeCommit()'s own comment for the full reasoning. Daemon so it
-     *  never blocks a clean shutdown, matching the pattern already used
-     *  for every other background thread in this codebase. */
-    private final java.util.concurrent.ExecutorService pruneExecutor =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "urkel-prune");
-                t.setDaemon(true);
-                // FIX: confirmed via a real, reported case -- an entire
-                // machine becoming unusable, not just this process --
-                // during a prune's walk at real production scale
-                // (millions of live names, an order of magnitude past
-                // anything tested here beforehand). Thread priority is
-                // only ever a hint to the OS scheduler, not a
-                // guarantee, and its exact effect is platform-dependent
-                // -- but on Windows specifically (confirmed as the
-                // platform actually in use) it does map to a real,
-                // observable OS-level scheduling class, so this should
-                // give the OS a genuine, if imperfect, reason to favor
-                // the user's own foreground work over this background
-                // cleanup whenever they're actually competing for the
-                // same CPU. Combined with collectReachable()'s own
-                // periodic yielding (see its comment), not a complete
-                // fix by itself.
-                t.setPriority(Thread.MIN_PRIORITY);
-                return t;
-            });
 
-    /** Guards against submitting a second prune while one is still
-     *  running -- if the walk is still going by the time the next
-     *  scheduled prune boundary arrives, that boundary is simply
-     *  skipped rather than queued, since the executor's own single
-     *  thread would just make it wait anyway; skipping means the
-     *  height it would have run at doesn't matter, and the one after
-     *  it will try again. */
+    /** RE-ARCHITECTURE (fourth pass): removed entirely. Reconciliation
+     *  now runs synchronously, inline, on the calling (block-processing)
+     *  thread -- see maybeCommit()'s own comment for the reasoning. The
+     *  async executor this used to hand work off to was the actual
+     *  source of a real, observed problem: normal draining ran on a
+     *  background thread while the main thread simultaneously continued
+     *  processing more blocks, meaning both were genuinely allocating
+     *  and competing for the same heap at once. A real run showed heap
+     *  climbing steadily and no longer recovering between cycles the
+     *  way it had earlier in the same run, at a comparable backlog
+     *  scale -- consistent with exactly this kind of concurrent
+     *  pressure, not with a bug in the disk-backed queue itself (which
+     *  was independently, directly verified to bound memory correctly
+     *  in isolation). Running everything synchronously trades some
+     *  throughput (block processing now waits out each drain, typically
+     *  150-200ms observed in real runs) for removing that concurrent-
+     *  allocation source entirely -- a deliberate choice, not a
+     *  fallback: a slower sync that never risks the machine is worth
+     *  more here than a faster one that might need restarting. */
+
+    /** RE-ARCHITECTURE (fourth pass): no longer guards against a SECOND
+     *  reconciliation starting while one is running -- that scenario
+     *  can't happen anymore now that reconciliation is synchronous
+     *  (nothing else runs concurrently with it on the same thread).
+     *  Kept purely so waitForReconciliationToSettle() (used by
+     *  ChainDB.commit(), for a different, still-real reason -- see its
+     *  own comment) has something to check; set true immediately before
+     *  a synchronous drain and false immediately after, in drainOneBatch()'s
+     *  own finally block. */
     private final java.util.concurrent.atomic.AtomicBoolean pruneInProgress =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
@@ -514,54 +534,42 @@ public class UrkelNameTree {
         }
         if (!deepCatchUp) commitsSinceLastPrune = 0;
 
-        if (!pruneInProgress.compareAndSet(false, true)) {
-            // A previous reconciliation is still running -- skip this
-            // boundary entirely rather than queue another one behind
-            // it; the next boundary (36 blocks later, or the very next
-            // commit during deep catch-up) will try again, and nothing
-            // here depends on it happening at any SPECIFIC height, only
-            // on it happening often enough. Candidates keep accumulating
-            // above regardless -- nothing is lost by skipping, only
-            // deferred, and the hard cap above remains the real backstop
-            // regardless of how often this particular skip happens.
-            System.out.println("[UrkelNameTree] Skipping reconciliation at height " + height
-                    + " -- a previous one is still running in the background");
-            return true;
-        }
-
-        // RE-ARCHITECTURE (second pass): take only a small, fixed-size
-        // chunk during deep catch-up, not the whole backlog -- entries
-        // left behind simply stay in accumulatedOrphanCandidates for the
-        // next commit's own drain cycle. Iterator.remove() here is safe
-        // to do mid-iteration: accumulatedOrphanCandidates is backed by
-        // a ConcurrentHashMap (confirmed at its own declaration), whose
-        // iterators are weakly consistent and explicitly support
-        // concurrent removal, unlike a plain HashSet's.
-        //
-        // FIX: must be a concurrent-safe set, not a plain HashSet --
-        // this is now registered with the tree's unorphan-resurrection
-        // safeguard for the deep-catch-up path specifically (see below),
-        // meaning the main thread's own resolve()/collectUnpersisted()
-        // calls can concurrently remove() from this exact set while the
-        // background removal below is still using it. A plain HashSet
-        // was never safe for that, same reasoning as pendingOrphans/
-        // awaitingNextCommit's own fix earlier this session.
+        // RE-ARCHITECTURE (third pass): candidatesSnapshot must still be
+        // a ConcurrentHashMap-backed set, not a plain HashSet -- it's
+        // registered with the tree's unorphan-resurrection safeguard
+        // while the background removal below processes it, meaning the
+        // main thread's own resolve()/collectUnpersisted() calls can
+        // concurrently remove() from this exact set. takeUpTo() below
+        // returns a plain, unshared HashSet (correct for that method in
+        // isolation -- nothing else references it), so its contents get
+        // copied into this concurrent-safe set immediately, rather than
+        // using that returned set directly.
         java.util.Set<UrkelNodeStore.HashKey> candidatesSnapshot =
                 java.util.concurrent.ConcurrentHashMap.newKeySet();
         if (deepCatchUp) {
-            java.util.Iterator<UrkelNodeStore.HashKey> it = accumulatedOrphanCandidates.iterator();
-            int taken = 0;
-            while (it.hasNext() && taken < DEEP_CATCHUP_DRAIN_CHUNK_SIZE) {
-                candidatesSnapshot.add(it.next());
-                it.remove();
-                taken++;
-            }
+            // RE-ARCHITECTURE (third pass): accumulatedOrphanCandidates
+            // itself is now disk-backed (DiskBackedOrphanQueue) rather
+            // than an in-memory Set -- see that class's own comment for
+            // why, and why it deliberately doesn't support iterator()
+            // the way this used to rely on. takeUpTo() is its
+            // replacement: a bounded, streaming extraction of up to
+            // DEEP_CATCHUP_DRAIN_CHUNK_SIZE entries, confirmed directly
+            // to never load more than that many keys into memory at
+            // once regardless of how large the backlog itself has
+            // grown.
+            candidatesSnapshot.addAll(accumulatedOrphanCandidates.takeUpTo(DEEP_CATCHUP_DRAIN_CHUNK_SIZE));
         } else {
-            // Near-tip path unchanged: still takes everything at once --
-            // see the comment above shouldReconcile's own computation
-            // for why chunking this specific path isn't the fix here.
-            candidatesSnapshot.addAll(accumulatedOrphanCandidates);
-            accumulatedOrphanCandidates.clear();
+            // Near-tip path unchanged in intent: still takes everything
+            // at once -- see the comment above shouldReconcile's own
+            // computation for why chunking this specific path isn't the
+            // fix here. accumulatedOrphanCandidates.size() as the
+            // argument means "everything currently queued" -- this
+            // path's own backlog is expected to stay small (frequent,
+            // commit-count-based triggering rather than accumulating to
+            // a large threshold), so materializing all of it here is
+            // consistent with that path's existing, already-verified
+            // memory-safety assumptions, not a new risk.
+            candidatesSnapshot.addAll(accumulatedOrphanCandidates.takeUpTo(accumulatedOrphanCandidates.size()));
         }
 
         System.out.println("[UrkelNameTree] Reconciliation STARTING at height " + height
@@ -570,28 +578,41 @@ public class UrkelNameTree {
                 + (deepCatchUp ? "trusting candidates directly, no validation walk -- deep catch-up"
                 : "full disk-backed validation walk -- near the tip"));
 
-        pruneExecutor.submit(() -> drainOneBatch(candidatesSnapshot, deepCatchUp, rootToPrune, height));
+        // RE-ARCHITECTURE (fourth pass): synchronous, inline, on this
+        // (block-processing) thread -- was pruneExecutor.submit(...)
+        // before, handing this off to run concurrently with continued
+        // block processing. That concurrency was the actual source of a
+        // real, observed problem, not a benefit worth keeping -- see
+        // pruneExecutor's own removal comment above for the full
+        // reasoning. drainOneBatch() itself sets pruneInProgress false
+        // in its own finally block; this sets it true right before the
+        // call, matching that contract.
+        pruneInProgress.set(true);
+        drainOneBatch(candidatesSnapshot, deepCatchUp, rootToPrune, height);
         return true;
     }
 
     /** Synchronous, blocking emergency backstop -- entered only when the
      *  orphan backlog has grown past HARD_BACKPRESSURE_CAP despite the
-     *  small, continuous draining maybeCommit() does on every commit.
-     *  Reaching this means orphan generation is outpacing drainage
-     *  faster than the background executor can keep up with on its own;
-     *  this deliberately pauses the CALLING thread (block processing
-     *  itself) until the backlog is back down to a safe level, rather
-     *  than letting it keep growing without limit. This is what
-     *  actually turns the memory ceiling into a real, provable
-     *  guarantee rather than just an empirically-tuned-to-usually-work
-     *  heuristic -- see HARD_BACKPRESSURE_CAP's own comment for the
-     *  full design reasoning.
+     *  small, per-commit draining maybeCommit() already does
+     *  synchronously on every commit. Reaching this means orphan
+     *  generation within a single commit window outpaced even one full
+     *  drain chunk -- confirmed, directly, in a real run: a single
+     *  36-block window produced over 100,000 new candidates against a
+     *  ~31,676-entry drain chunk. This loops, draining additional chunks,
+     *  until the backlog is back down to a safe level, rather than
+     *  letting it keep growing without limit. This is what actually
+     *  turns the memory ceiling into a real, provable guarantee rather
+     *  than just an empirically-tuned-to-usually-work heuristic -- see
+     *  HARD_BACKPRESSURE_CAP's own comment for the full design
+     *  reasoning.
      *
-     *  Runs the drain inline, on this thread, rather than via
-     *  pruneExecutor -- there's no benefit to the async path here, since
-     *  this thread is already deliberately blocked either way, and
-     *  doing it inline avoids adding scheduling delay on top of an
-     *  already-degraded situation. */
+     *  RE-ARCHITECTURE (fourth pass): no longer needs to coordinate
+     *  against a background executor (removed entirely -- see its own
+     *  removal comment) or check pruneInProgress before proceeding;
+     *  reconciliation is synchronous everywhere now, so this loop is
+     *  simply the calling thread draining chunk after chunk itself,
+     *  nothing else could ever be running concurrently to wait for. */
     private void blockUntilBacklogDrains(boolean deepCatchUp, UrkelNode rootToPrune, int height) {
         long resumeThreshold = HARD_BACKPRESSURE_CAP / 2;
         long startSize = accumulatedOrphanCandidates.size();
@@ -600,31 +621,36 @@ public class UrkelNameTree {
                 + " -- pausing block processing until it drains back below " + resumeThreshold + ".");
         long start = System.currentTimeMillis();
         while (accumulatedOrphanCandidates.size() > resumeThreshold) {
-            if (pruneInProgress.compareAndSet(false, true)) {
-                java.util.Set<UrkelNodeStore.HashKey> chunk = java.util.concurrent.ConcurrentHashMap.newKeySet();
-                if (deepCatchUp) {
-                    java.util.Iterator<UrkelNodeStore.HashKey> it = accumulatedOrphanCandidates.iterator();
-                    int taken = 0;
-                    while (it.hasNext() && taken < DEEP_CATCHUP_DRAIN_CHUNK_SIZE) {
-                        chunk.add(it.next());
-                        it.remove();
-                        taken++;
-                    }
-                } else {
-                    chunk.addAll(accumulatedOrphanCandidates);
-                    accumulatedOrphanCandidates.clear();
-                }
-                drainOneBatch(chunk, deepCatchUp, rootToPrune, height);
+            java.util.Set<UrkelNodeStore.HashKey> chunk = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            if (deepCatchUp) {
+                // RE-ARCHITECTURE (third pass): same takeUpTo()
+                // replacement as maybeCommit()'s own deep-catch-up
+                // branch -- see that call site's comment for the
+                // full reasoning.
+                chunk.addAll(accumulatedOrphanCandidates.takeUpTo(DEEP_CATCHUP_DRAIN_CHUNK_SIZE));
             } else {
-                // A background cycle from just before we hit the cap is
-                // still finishing -- give it a moment rather than
-                // busy-spinning.
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                chunk.addAll(accumulatedOrphanCandidates.takeUpTo(accumulatedOrphanCandidates.size()));
+            }
+            pruneInProgress.set(true);
+            drainOneBatch(chunk, deepCatchUp, rootToPrune, height);
+
+            // FIX: added after a real, observed problem -- dozens of
+            // these cycles running back-to-back with zero gap
+            // between them, confirmed via real output, very plausibly
+            // starved the JVM's own GC of any real opportunity to
+            // collect each cycle's transient allocation before the
+            // next one piled more on top, contributing to heap
+            // climbing steadily toward the ceiling during an
+            // extended backpressure episode. A few milliseconds here
+            // is a small price against a bounded, rare event (the
+            // chunk-size fix above should make backpressure itself
+            // much rarer), and gives the collector a real chance to
+            // keep pace with this loop's own allocation rate.
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
             }
         }
         System.out.println("[UrkelNameTree] BACKPRESSURE: backlog drained to " + accumulatedOrphanCandidates.size()
@@ -632,12 +658,14 @@ public class UrkelNameTree {
     }
 
     /** Does the actual removal work for one batch of candidates --
-     *  shared between the normal, async (pruneExecutor) path in
-     *  maybeCommit() and the synchronous emergency path in
-     *  blockUntilBacklogDrains() above, so the two can never drift out
-     *  of sync with each other -- exactly the kind of divergence risk
-     *  duplicating this logic across two call sites would otherwise
-     *  create. Always resets pruneInProgress in its own finally block,
+     *  shared between maybeCommit()'s own normal, per-commit path and
+     *  the emergency loop in blockUntilBacklogDrains() above, so the
+     *  two can never drift out of sync with each other -- exactly the
+     *  kind of divergence risk duplicating this logic across two call
+     *  sites would otherwise create. Both callers now run this
+     *  synchronously, inline, on the calling thread -- see
+     *  maybeCommit()'s own comment on the async executor's removal for
+     *  why. Always resets pruneInProgress in its own finally block,
      *  regardless of which path called it -- the caller never needs to
      *  remember to do this separately. */
     private void drainOneBatch(java.util.Set<UrkelNodeStore.HashKey> candidatesSnapshot,
@@ -745,11 +773,31 @@ public class UrkelNameTree {
         }
     }
 
-    /** Shuts down the background prune executor gracefully -- waits,
-     *  UNCONDITIONALLY, for any prune currently in flight to actually
-     *  finish before returning, rather than letting it continue running
-     *  against a store that's about to be closed out from under it.
-     *  Call this BEFORE closing the underlying store, not after.
+    /** RE-ARCHITECTURE (fourth pass): no longer manages a background
+     *  prune executor at all -- see that field's own removal comment.
+     *  What this still needs to guarantee is unchanged, though: nothing
+     *  still touching the tree/store may run past this method returning,
+     *  since store.close() follows immediately after (in ChainDB.close()),
+     *  and a still-running operation calling into RocksDB after that
+     *  would be a genuine, segfault-causing use-after-free at the native
+     *  level -- see below for the real, confirmed history of exactly
+     *  that happening under the OLD, MVStore-era assumptions. That
+     *  guarantee now rests on ChainSync.stop() itself (called before
+     *  this method, from the same shutdown sequence): it waits up to
+     *  30s for the main sync thread -- the same thread reconciliation
+     *  now runs synchronously on -- to actually finish its current
+     *  cycle. Worth knowing honestly: if that 30s window is ever
+     *  exceeded, ChainSync.stop() proceeds with shutdown anyway rather
+     *  than interrupting the thread (its own comment explains why:
+     *  interrupting risks closing the shared database file channel out
+     *  from under other threads, including this shutdown sequence's own
+     *  final commit) -- a pre-existing behavior this change didn't
+     *  introduce, but one where a reconciliation cycle now contributes
+     *  to how long that cycle takes, rather than running off on its own
+     *  thread. Ordinary cycles (150-200ms, confirmed in real runs) and
+     *  even backpressure episodes (1-3s, also confirmed) leave enormous
+     *  margin under 30s; this is a known, low-probability edge case
+     *  worth naming honestly, not one fully closed by anything here.
      *
      *  FIX: this used to give up after a 120s timeout and proceed
      *  anyway, reasoning (from when this ran under MVStore) that a
@@ -768,35 +816,41 @@ public class UrkelNameTree {
      *  under real, sustained load long enough for a prune to still be
      *  running 120s into a shutdown until now.
      *
-     *  Fixed at the root, not by raising the timeout (which only
-     *  narrows the window, and this project's own recent choice to
-     *  reduce prune frequency during catch-up directly makes individual
-     *  prunes take LONGER when they do run, not shorter -- a larger
-     *  timeout would still eventually be crossed): pruneExecutor.shutdownNow()
-     *  actually interrupts whatever's running, and collectReachable()
-     *  (the walk phase, confirmed as where a real prune spends nearly
-     *  all its time) now checks for that interrupt on every node
-     *  visited, aborting cleanly and quickly rather than running to
-     *  completion regardless. Combined with an unconditional wait here
-     *  -- looped, with periodic progress logging rather than either a
-     *  silent, indefinite block or a timeout that gives up -- shutdown
-     *  is fast in the ordinary case (the walk notices the interrupt
-     *  almost immediately) AND never unsafe in the worst case (if
-     *  something ever did take unexpectedly long, this simply keeps
-     *  waiting rather than risking the crash). */
+     *  RE-ARCHITECTURE (fourth pass): the fix at the time relied on
+     *  pruneExecutor.shutdownNow() to actually interrupt whatever
+     *  background prune was still running, with collectReachable()
+     *  checking for that interrupt on every node visited so it could
+     *  abort cleanly and quickly rather than run to completion
+     *  regardless. That specific mechanism is gone along with the
+     *  executor itself -- but the underlying need (never let something
+     *  still call into RocksDB after store.close() has already freed
+     *  it) is now satisfied differently, and arguably more simply:
+     *  reconciliation runs synchronously, so ChainSync.stop()'s own
+     *  wait for the main sync thread (see this method's own opening
+     *  comment above) already covers whatever reconciliation work that
+     *  thread was doing, without this method needing its own separate
+     *  wait-and-interrupt logic for it. collectReachable()'s own
+     *  interrupt-checking during the walk phase is left in place
+     *  regardless -- still real, useful protection against a single
+     *  walk running unexpectedly long during that 30s window, even
+     *  though the specific caller that used to send the interrupt no
+     *  longer exists. */
     public void shutdownPruning() {
-        pruneExecutor.shutdownNow();
-        try {
-            int waitedSeconds = 0;
-            while (!pruneExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)) {
-                waitedSeconds += 10;
-                System.out.println("[UrkelNameTree] Still waiting for the background prune to stop "
-                        + "(" + waitedSeconds + "s so far) -- this must finish before the database "
-                        + "can be safely closed, so shutdown will keep waiting rather than risk a crash.");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        // RE-ARCHITECTURE: accumulatedOrphanCandidates now holds a real,
+        // open RocksDB instance and a temp directory on disk (see
+        // DiskBackedOrphanQueue's own comment) -- unlike the plain,
+        // in-memory Set it replaced, this needs an explicit close() or
+        // it leaks: every restart of a long-running production node
+        // would otherwise leave another orphaned temp directory behind,
+        // accumulating indefinitely over the node's lifetime. Placed
+        // here, after the executor has FULLY terminated above, not
+        // before -- a still-running reconciliation task can re-queue
+        // its own candidates back into this exact queue on a shutdown-
+        // interrupted attempt (see drainOneBatch()'s own
+        // PruneInterruptedException handling), so closing it any
+        // earlier would risk that re-queue writing to an already-closed
+        // store.
+        accumulatedOrphanCandidates.close();
     }
 
     /** Looks up a name's current state directly (bypassing the

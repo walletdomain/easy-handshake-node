@@ -84,6 +84,7 @@ public class ChainDB {
     // ── Storage ───────────────────────────────────────────────────────────────
 
     private final KVStore                  store;
+    private final String                   dataDir;
     private final KVMap<Long,   byte[]>    headers;
     private final KVMap<Long,   byte[]>    blocks;
     private final KVMap<Long,   byte[]>    chainwork;
@@ -203,6 +204,14 @@ public class ChainDB {
         // and every one of its own callers, goes through the
         // KVStore/KVMap interfaces and needed zero other changes.
         this.store = new RocksDBKVStore(path, readOnly);
+        this.dataDir = path;
+
+        /** NEW: exposes the directory this database lives in, so code
+         *  that only has a ChainDB reference (not the original config
+         *  or path string) -- e.g. BlockProcessor's mismatch handling --
+         *  can still write to a plain log file alongside it, without
+         *  needing that path threaded through every intervening method
+         *  signature. */
 
         this.headers   = store.openLongBytesMap("headers");
         this.blocks    = store.openLongBytesMap("blocks");
@@ -235,6 +244,10 @@ public class ChainDB {
     }
 
     // ── Commit ────────────────────────────────────────────────────────────────
+
+    public String getDataDir() {
+        return dataDir;
+    }
 
     public void commit() {
         // FIX: wait for any in-flight background reconciliation to
@@ -417,14 +430,35 @@ public class ChainDB {
         System.out.println("[ChainDB] Performing a full reset -- headers, blocks, "
                 + "UTXOs, names, and the hash index are all being cleared, not just "
                 + "headers, since the stored data as a whole can't be trusted.");
+        // FIX: a real, confirmed production incident -- this used to
+        // mark the tip metadata as reset (-1) only AFTER every clear()
+        // call below succeeded. When clear() then crashed partway
+        // through (a real OutOfMemoryError, on a column family with
+        // tens of millions of entries -- see RocksDBKVMap.clear()'s
+        // own fix), that left the worst possible combination: headers
+        // and blocks already wiped, but header_tip/block_tip still
+        // pointing at their old, now-invalid height. The startup
+        // consistency check in Main.java then reads that stale
+        // non-negative tip, finds no header there (since it's already
+        // gone), and -- unable to tell "genuinely fresh, tip is -1"
+        // apart from "tip claims data that no longer exists" -- treats
+        // it as an ordinary fresh install with nothing to verify, and
+        // would have gone on to sync on top of a database with zero
+        // headers but potentially millions of orphaned UTXO/name
+        // entries underneath. Marking the tips reset FIRST means any
+        // failure during the clear() calls below -- this one or a
+        // different one entirely -- leaves metadata that honestly
+        // reflects "nothing here can be trusted," which the startup
+        // check already treats correctly as a genuine fresh start.
+        meta.put(META_HEADER_TIP, "-1");
+        meta.put(META_BLOCK_TIP, "-1");
+        store.commit();
         headers.clear();
         chainwork.clear();
         blocks.clear();
         utxos.clear();
         names.clear();
         hashIndex.clear();
-        meta.put(META_HEADER_TIP, "-1");
-        meta.put(META_BLOCK_TIP, "-1");
         store.commit();
         // Given this just cleared potentially the entire database's worth
         // of data at once, give compaction a real, larger time budget
@@ -442,10 +476,6 @@ public class ChainDB {
 
     public byte[] getBlock(int height) {
         return blocks.get((long) height);
-    }
-
-    public boolean hasBlock(int height) {
-        return blocks.containsKey((long) height);
     }
 
     /**
@@ -467,10 +497,6 @@ public class ChainDB {
     }
 
     // ── Chainwork ─────────────────────────────────────────────────────────────
-
-    public void saveChainwork(int height, BigInteger work) {
-        chainwork.put((long) height, work.toByteArray());
-    }
 
     public BigInteger getChainwork(int height) {
         byte[] b = chainwork.get((long) height);
@@ -526,10 +552,6 @@ public class ChainDB {
 
     public void removeUtxo(String txid, int index) {
         utxos.remove(txid + ":" + index);
-    }
-
-    public boolean hasUtxo(String txid, int index) {
-        return utxos.containsKey(txid + ":" + index);
     }
 
     /** Returns all UTXOs at a given address hash (requires address index). */
@@ -749,24 +771,11 @@ public class ChainDB {
         peers.put(ip, data);
     }
 
-    public String getPeer(String ip) {
-        return peers.get(ip);
-    }
-
     public java.util.Map<String, String> getAllPeers() {
         return peers.asUnmodifiableMap();
     }
 
     // ── Meta operations ───────────────────────────────────────────────────────
-
-    public String getMeta(String key) {
-        return meta.get(key);
-    }
-
-    public void setMeta(String key, String value) {
-        meta.put(key, value);
-        store.commit();
-    }
 
     // ── Statistics ────────────────────────────────────────────────────────────
 

@@ -22,11 +22,15 @@ public final class Secp256k1 {
 
     private static final BigInteger P =
             new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
-    // FIX: public, not private -- the wallet project's own HDKey class
-    // (a separate package, handshake.wallet) needs the curve order for
-    // BIP32's "(parent + IL) mod n" child-key arithmetic, and should
-    // reuse this well-known constant rather than duplicate it in a
-    // second file where it could silently drift.
+    // FIX (wallet key derivation): public, not private -- BIP32
+    // non-hardened/hardened child key derivation both need the curve
+    // order for the final "(parent + IL) mod n" step, and HDKey needs
+    // to perform that arithmetic itself rather than duplicating this
+    // well-known constant a second time in a second file. Public rather
+    // than package-private mainly for parity with the node project's
+    // own copy of this file, which does need public visibility there
+    // (HDKey originally lived in a separate handshake.wallet package
+    // from this class, before both were unified into one package here).
     public static final BigInteger N =
             new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
     private static final BigInteger Gx =
@@ -275,38 +279,6 @@ public final class Secp256k1 {
             System.arraycopy(toBytes32(s), 0, result, 32, 32);
             return result;
         }
-    }
-
-    /** FIX: kept in sync with the wallet project's own copy of this
-     *  file -- sign() above produces a raw 64-byte (r||s) signature,
-     *  correct for its own documented purpose (message signing) but not
-     *  the DER encoding a transaction's own signature needs (the same
-     *  format verify() above already expects). Discovered when the
-     *  wallet project first actually exercised sign() for real
-     *  transaction signing and a direct sign-then-verify round trip
-     *  failed -- nothing in this node project had ever needed to
-     *  PRODUCE a transaction signature before, only verify
-     *  already-real, externally-produced ones, so this mismatch had no
-     *  way to surface here on its own. See the wallet's own copy for
-     *  the full reasoning. */
-    public static byte[] signDER(byte[] msgHash, byte[] privateKey) {
-        byte[] raw = sign(msgHash, privateKey);
-        byte[] rBytes = new BigInteger(1, Arrays.copyOfRange(raw, 0, 32)).toByteArray();
-        byte[] sBytes = new BigInteger(1, Arrays.copyOfRange(raw, 32, 64)).toByteArray();
-
-        byte[] rEncoded = new byte[2 + rBytes.length];
-        rEncoded[0] = 0x02; rEncoded[1] = (byte) rBytes.length;
-        System.arraycopy(rBytes, 0, rEncoded, 2, rBytes.length);
-
-        byte[] sEncoded = new byte[2 + sBytes.length];
-        sEncoded[0] = 0x02; sEncoded[1] = (byte) sBytes.length;
-        System.arraycopy(sBytes, 0, sEncoded, 2, sBytes.length);
-
-        byte[] der = new byte[2 + rEncoded.length + sEncoded.length];
-        der[0] = 0x30; der[1] = (byte) (rEncoded.length + sEncoded.length);
-        System.arraycopy(rEncoded, 0, der, 2, rEncoded.length);
-        System.arraycopy(sEncoded, 0, der, 2 + rEncoded.length, sEncoded.length);
-        return der;
     }
 
     /**

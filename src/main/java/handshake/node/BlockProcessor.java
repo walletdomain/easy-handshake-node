@@ -213,6 +213,16 @@ public class BlockProcessor {
                             + "header claims %s, we computed %s -- halting sync rather than continuing on "
                             + "top of known-wrong tree state.%n",
                     height, hex(claimedTreeRoot), hex(ourCommittedRoot));
+            // FIX: this exact line -- height, claimed root, computed
+            // root -- is precisely what days of manual, live-console-
+            // watching diagnostic runs existed to eventually produce.
+            // Logged here, durably, immediately, means any future
+            // occurrence answers the "which block?" question the
+            // moment it happens, from a plain file, with no diagnostic
+            // tool, live monitoring, or lucky timing required.
+            PersistentLog.logError(db.getDataDir(), String.format(
+                    "Urkel tree root mismatch at height %d -- header claims %s, we computed %s",
+                    height, hex(claimedTreeRoot), hex(ourCommittedRoot)));
             int firstRisky = db.getNameTree().firstDeepCatchUpDeletionHeight();
             if (firstRisky != -1) {
                 System.err.printf("[BlockProcessor] A deep-catch-up (unvalidated) reconciliation first "

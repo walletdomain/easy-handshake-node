@@ -181,13 +181,29 @@ public class WebAdminServer {
                 syncPercentField = "null";
             }
 
+            // FIX (audit): halted-due-to-tree-mismatch status existed
+            // internally in ChainSync (set/cleared/checked there) but
+            // its public accessor was never called anywhere -- meaning
+            // if the node ever actually halted on a data-integrity
+            // problem, that was visible only in console/log output,
+            // never in this status endpoint. Same null-safety pattern
+            // as networkHeight above: chainSync can be null very early
+            // during startup.
+            UrkelTreeMismatchException halt = (chainSync != null) ? chainSync.haltedDueToTreeMismatch() : null;
+            String haltedField = (halt != null)
+                    ? "{\"height\":" + halt.height
+                        + ",\"claimedRoot\":\"" + jsonEscape(toHex(halt.claimedRoot))
+                        + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
+                    : "null";
+
             String json = "{"
                     + "\"version\":\"" + jsonEscape(NodeConfig.VERSION) + "\","
                     + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
                     + "\"blockHeight\":" + blockHeight + ","
                     + "\"networkHeight\":" + networkHeight + ","
                     + "\"syncPercent\":" + syncPercentField + ","
-                    + "\"dbSizeGB\":" + String.format(java.util.Locale.ROOT, "%.2f", dbSizeGB)
+                    + "\"dbSizeGB\":" + String.format(java.util.Locale.ROOT, "%.2f", dbSizeGB) + ","
+                    + "\"halted\":" + haltedField
                     + "}";
             respondJson(ex, 200, json);
         } finally {
@@ -209,6 +225,13 @@ public class WebAdminServer {
         if (days > 0 || hours > 0) sb.append(hours).append("h ");
         if (days > 0 || hours > 0 || minutes > 0) sb.append(minutes).append("m ");
         sb.append(seconds).append("s");
+        return sb.toString();
+    }
+
+    private static String toHex(byte[] b) {
+        if (b == null) return "";
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) sb.append(String.format("%02x", x));
         return sb.toString();
     }
 

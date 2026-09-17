@@ -159,14 +159,4 @@ public final class UrkelBits {
         for (int i = 0; i < size; i++) sb.append(get(i) ? '1' : '0');
         return sb.toString();
     }
-
-    public static UrkelBits fromString(String str) {
-        UrkelBits b = alloc(str.length());
-        for (int i = 0; i < str.length(); i++) {
-            char ch = str.charAt(i);
-            if (ch != '0' && ch != '1') throw new IllegalArgumentException("Invalid bit char: " + ch);
-            b.set(i, ch == '1');
-        }
-        return b;
-    }
 }

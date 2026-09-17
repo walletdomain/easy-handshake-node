@@ -201,32 +201,22 @@ public class PeerScorecard {
 
     // ── Score updates ─────────────────────────────────────────────────────────
 
-    public void recordAttempt(String ip) {
+    /** Records a successful connection. Every connection this project
+     *  makes is Brontide (authenticated/encrypted), so the bonus that
+     *  used to distinguish Brontide from cleartext is now just part of
+     *  the flat success bonus. */
+    public void recordSuccess(String ip, String agent, int height) {
         PeerRecord r = getOrCreate(ip);
-        r.lastAttemptTime = System.currentTimeMillis();
-        persist(r);
-    }
-
-    /** Records a successful connection. Brontide connections get a small
-     *  bonus over cleartext, since they're authenticated/encrypted and
-     *  therefore more trustworthy as a data source. */
-    public void recordSuccess(String ip, String agent, int height, boolean brontide) {
-        PeerRecord r = getOrCreate(ip);
-        int bonus = SCORE_SUCCESS_BONUS + (brontide ? SCORE_BRONTIDE_BONUS : 0);
+        int bonus = SCORE_SUCCESS_BONUS + SCORE_BRONTIDE_BONUS;
         r.score         = Math.min(SCORE_MAX, r.score + bonus);
         r.successCount++;
         r.lastSuccessTime = System.currentTimeMillis();
         r.lastAgent     = agent;
         r.lastHeight    = height;
-        r.usesBrontide  = brontide;
+        r.usesBrontide  = true;
         r.backoffLevel  = Math.max(0, r.backoffLevel - 1);
         r.backoffUntil  = 0;
         persist(r);
-    }
-
-    /** Backward-compatible overload defaulting to non-brontide (cleartext). */
-    public void recordSuccess(String ip, String agent, int height) {
-        recordSuccess(ip, agent, height, false);
     }
 
     /**
@@ -368,22 +358,9 @@ public class PeerScorecard {
         }
     }
 
-    public boolean isBanned(String ip) {
-        PeerRecord r = cache.get(ip);
-        return r != null && r.banned;
-    }
-
     public boolean isGood(String ip) {
         PeerRecord r = cache.get(ip);
         return r == null || (!r.isBackedOff() && r.score >= SCORE_BACKOFF_THRESHOLD);
-    }
-
-    public PeerRecord getRecord(String ip) {
-        return cache.get(ip);
-    }
-
-    public List<PeerRecord> getAllRecords() {
-        return new ArrayList<>(cache.values());
     }
 
     public List<PeerRecord> getRankedPeers() {

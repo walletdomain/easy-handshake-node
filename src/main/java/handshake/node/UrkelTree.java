@@ -41,29 +41,6 @@ public class UrkelTree {
         this.nodeStore = nodeStore;
     }
 
-    /** Exposes a lightweight, O(1) point-in-time snapshot handle from
-     *  the configured node store -- see UrkelNodeStore.openSnapshot()'s
-     *  own comment for the full reasoning, and KVMap.openSnapshot()'s
-     *  for why this specific split (cheap handle now, expensive
-     *  enumeration deferred) exists at all. Callers (specifically
-     *  UrkelNameTree.maybeCommit()) capture this SYNCHRONOUSLY, at the
-     *  same instant as the committed root itself, then defer the
-     *  actual key() enumeration to a background thread -- see
-     *  pruneUnreachableFrom()'s own comment for why the SYNCHRONOUS
-     *  capture specifically still matters, even though it's now cheap.
-     *  Returns a snapshot whose keys() is an empty set if no node
-     *  store is configured, matching pruneUnreachableFrom()'s own
-     *  no-op-when-unconfigured behavior. */
-    public KVMap.KVSnapshot<UrkelNodeStore.HashKey> openStoreSnapshot() {
-        if (nodeStore == null) {
-            return new KVMap.KVSnapshot<UrkelNodeStore.HashKey>() {
-                @Override public java.util.Set<UrkelNodeStore.HashKey> keys() { return java.util.Set.of(); }
-                @Override public void close() { }
-            };
-        }
-        return nodeStore.openSnapshot();
-    }
-
     /** Resolves a node if it's a lazy Hash placeholder, otherwise
      *  returns it unchanged. Called at the top of every traversal step
      *  so a placeholder anywhere in the tree gets transparently
@@ -390,10 +367,21 @@ public class UrkelTree {
      *  reduce PEAK memory even though it should ease CPU contention;
      *  the progress logging above is what will actually show, directly,
      *  whether that tradeoff is landing well in practice or not, rather
-     *  than continuing to guess. Combined with the prune thread's own
-     *  lowered OS priority (see pruneExecutor's own comment) -- two
-     *  different angles on the same problem, neither a complete fix
-     *  alone. */
+     *  than continuing to guess.
+     *
+     *  RE-ARCHITECTURE (fourth pass): this used to be complemented by a
+     *  second mitigation -- a dedicated background thread running this
+     *  walk at deliberately lowered OS priority, so the OS would favor
+     *  other work when they competed for the same CPU. That thread is
+     *  gone now: reconciliation (including this walk) runs synchronously
+     *  on the main, block-processing thread instead, specifically
+     *  because running it concurrently with continued block processing
+     *  was itself a real, observed source of memory pressure (see
+     *  UrkelNameTree's own comment on the async executor's removal).
+     *  This yielding below is the only mitigation left for this
+     *  specific concern -- there's no longer a separate thread whose
+     *  priority could be lowered, since there's no longer a separate
+     *  thread at all. */
     private void collectReachable(UrkelNode node, java.util.Set<UrkelNodeStore.HashKey> out, WalkState state) {
         if (Thread.currentThread().isInterrupted()) throw new PruneInterruptedException();
         if (node.isNull()) return;
@@ -878,8 +866,30 @@ public class UrkelTree {
         externallyTrackedPendingRemoval.add(set);
     }
 
+    /** FIX: a real, confirmed bug, reproduced directly in isolation
+     *  before this fix -- the original List.remove(set) here relies on
+     *  equals() to find the matching entry, and accumulatedOrphanCandidates
+     *  (a DiskBackedOrphanQueue, permanently registered here alongside
+     *  short-lived candidatesSnapshot chunks) is registered in the SAME
+     *  list. Whenever some OTHER, ordinary Set happened to be the same
+     *  size as the queue at unregister time -- confirmed to actually
+     *  happen, at real, low heights, in a real run -- that other set's
+     *  own equals() would call containsAll() against the queue,
+     *  iterating it, which the queue deliberately refuses to support
+     *  (see DiskBackedOrphanQueue's own comment on why). Overriding
+     *  equals()/hashCode() on the queue itself only fixes the direction
+     *  where the queue is the RECEIVER of the comparison, not where
+     *  it's the ARGUMENT to some other set's own equals() -- confirmed
+     *  directly, by isolating exactly which side of the comparison
+     *  actually throws, that THIS direction (queue as argument) is
+     *  what real removal calls hit. The actual, robust fix is here:
+     *  find the entry to remove by REFERENCE identity, manually,
+     *  rather than delegating to List.remove(Object)'s equals()-based
+     *  search at all -- this never calls equals() or iterator() on any
+     *  registered set, regardless of what any of them are or how they
+     *  implement those methods. */
     public void unregisterExternalPendingRemovalSet(java.util.Set<UrkelNodeStore.HashKey> set) {
-        externallyTrackedPendingRemoval.remove(set);
+        externallyTrackedPendingRemoval.removeIf(s -> s == set);
     }
 
     /** Records oldNode as a deletion candidate if (and only if) it was

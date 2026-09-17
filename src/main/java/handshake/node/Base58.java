@@ -70,14 +70,6 @@ public final class Base58 {
         }
     }
 
-    public static String encodeCheck(byte[] payload) {
-        byte[] checksum = Arrays.copyOf(hash256(payload), 4);
-        byte[] full = new byte[payload.length + 4];
-        System.arraycopy(payload, 0, full, 0, payload.length);
-        System.arraycopy(checksum, 0, full, payload.length, 4);
-        return encode(full);
-    }
-
     /** Returns the payload (with checksum verified and stripped), or
      *  throws if the checksum doesn't match. */
     public static byte[] decodeCheck(String input) {

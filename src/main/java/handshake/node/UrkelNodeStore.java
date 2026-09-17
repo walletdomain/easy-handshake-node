@@ -335,7 +335,13 @@ public class UrkelNodeStore {
     // beefier machine (or a larger maxMemory()) gets proportionally
     // larger chunks, a modest one gets smaller ones, with nothing for a
     // person to configure either way.
-    private static final int REMOVAL_CHUNK_SIZE =
+    // FIX: package-visible, not private -- UrkelNameTree now reuses
+    // this exact value as its own deep-catch-up drain chunk size (see
+    // that field's own comment for why), rather than maintaining a
+    // second, separately-chosen constant that could drift out of sync
+    // with the one already-justified "how much is safe to hand to one
+    // removal operation" answer this represents.
+    static final int REMOVAL_CHUNK_SIZE =
             Math.max(10_000, UrkelNameTree.HARD_BACKPRESSURE_CAP / 10);
 
     public int removeKeys(java.util.List<HashKey> toRemove) {

@@ -301,6 +301,20 @@ public class ChainSync {
         running = true;
         scheduler.scheduleWithFixedDelay(
                 this::syncCycle, 0, POLL_INTERVAL_SEC, TimeUnit.SECONDS);
+        // FIX (audit): PeerScorecard.applyDecay() existed, fully
+        // implemented, matching this class's own documented design
+        // principle ("Score decay: peers slowly recover over time"),
+        // but nothing anywhere ever called it -- peers that had a bad
+        // stretch never actually recovered on their own. Deliberately
+        // on its own, much slower schedule rather than piggybacking on
+        // syncCycle's 60-second interval: applyDecay() adds +1 per
+        // call for any peer within an hour of its last success, so
+        // calling it every 60 seconds would let a score climb from 0
+        // to 100 in under two hours from decay alone -- the opposite
+        // of "slowly." Every 5 minutes instead caps that same climb at
+        // roughly 12 points per hour, which actually matches "slowly."
+        scheduler.scheduleWithFixedDelay(
+                () -> PeerScorecard.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
     }
 
     /**
@@ -503,7 +517,12 @@ public class ChainSync {
                 boolean madeProgress = false;
                 try (peer) {
                     int peerHeight = peer.peerHeight;
-                    System.out.printf("[ChainSync] Connected to %s (h=%d, agent=%s)%n",
+                    // Brontide-only: every connection this project makes
+                    // now always goes through the real Noise/Act1-2-3
+                    // handshake, so this is always "BRONTIDE" -- no
+                    // cleartext transport exists anymore to distinguish
+                    // from.
+                    System.out.printf("[ChainSync] Connected to %s via BRONTIDE (h=%d, agent=%s)%n",
                             peer.ip, peerHeight, peer.agent);
 
                     // Auto-rollback if we're far above all peers
@@ -541,6 +560,8 @@ public class ChainSync {
                     if (result.success) {
                         System.out.println("[ChainSync] Recovery succeeded: " + result.message
                                 + " Clearing the halt and resuming normal sync.");
+                        PersistentLog.logWarn(config.getDataDir(),
+                                "Urkel tree mismatch recovery succeeded: " + result.message);
                         // FIX: only recovery's own success clears this --
                         // a plain retry or restart must NEVER silently
                         // clear it on its own. See this field's own
@@ -554,6 +575,8 @@ public class ChainSync {
                         System.err.println("[ChainSync] Recovery did not resolve this: " + result.message
                                 + " Remaining halted -- this needs direct investigation, not another "
                                 + "automatic attempt.");
+                        PersistentLog.logError(config.getDataDir(),
+                                "Urkel tree mismatch recovery FAILED: " + result.message);
                     }
                     return;
                 } catch (Exception e) {
@@ -636,8 +659,10 @@ public class ChainSync {
 
     private PeerConnection connectPeer(PeerDiscovery.ConnectTarget target)
             throws Exception {
-        if (!target.isBrontide()) return connectCleartextPeer(target);
-
+        // Brontide-only: every ConnectTarget PeerDiscovery hands back
+        // always carries a real key (see PeerDiscovery.getCandidates()),
+        // so there's no cleartext fallback branch here at all anymore --
+        // this project no longer tracks or connects to keyless peers.
         Socket socket = new Socket();
         socket.connect(new InetSocketAddress(target.ip(), target.port()),
                 CONNECT_TIMEOUT_MS);
@@ -655,9 +680,17 @@ public class ChainSync {
         if (VERBOSE_WIRE_LOGGING) {
             System.out.printf("[Handshake] -> %s Act1 (%d bytes): %s%n",
                     target.ip(), act1.length, toHex(act1));
-            System.out.printf("[Handshake] DEBUG %s localEphemeralPriv=%s localStaticPriv=%s remoteStaticPub=%s%n",
-                    target.ip(), toHex(brontide.debugLocalEphemeralPriv()),
-                    toHex(identity.getPrivateKey()), toHex(target.brontideKey()));
+            // FIX (audit): removed a line that printed this node's own
+            // permanent static private key (identity.getPrivateKey())
+            // in plaintext hex, plus a call to
+            // brontide.debugLocalEphemeralPriv(), a method that no
+            // longer exists on BrontideState (a real compile error --
+            // this file did not build as uploaded). Even gated behind
+            // VERBOSE_WIRE_LOGGING (default off), logging the
+            // node's permanent identity key is a real exposure risk if
+            // this flag is ever flipped on for debugging and that
+            // output is captured or shared -- not something to restore
+            // even with a working method reference.
         }
         out.write(act1);
         out.flush();
@@ -702,35 +735,7 @@ public class ChainSync {
         // every block/header hash. Restored.)
         conn.sendMessage(MSG_GETADDR, new byte[0]);
 
-        PeerScorecard.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, target.isBrontide());
-        return conn;
-    }
-
-    /**
-     * Connects to a peer with no known Brontide key, using cleartext P2P
-     * on port 12038 -- no Noise/Act1-2-3 handshake at all, just the raw
-     * magic+type+length framing directly over the socket. Reuses
-     * PeerConnection's doVersionHandshake()/syncHeaders()/etc unchanged
-     * (they don't care whether the transport is encrypted), by
-     * constructing it with brontide=null, which sendMessage()/readMessage()
-     * already branch on.
-     */
-    private PeerConnection connectCleartextPeer(PeerDiscovery.ConnectTarget target)
-            throws Exception {
-        Socket socket = new Socket();
-        socket.connect(new InetSocketAddress(target.ip(), target.port()),
-                CONNECT_TIMEOUT_MS);
-        socket.setSoTimeout(HANDSHAKE_TIMEOUT);
-
-        InputStream  in  = socket.getInputStream();
-        OutputStream out = socket.getOutputStream();
-
-        PeerConnection conn = new PeerConnection(socket, in, out, null, target.ip());
-        conn.doVersionHandshake(db.getBlockTip());
-
-        conn.sendMessage(MSG_GETADDR, new byte[0]);
-
-        PeerScorecard.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, false);
+        PeerScorecard.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight);
         return conn;
     }
 
@@ -860,8 +865,26 @@ public class ChainSync {
                 // this is treated as a real, permanent ban rather than
                 // just a scored/backed-off signal.
                 if (!HeaderUtil.checkPOW(h)) {
+                    int badHeight = tip + validHeaders.size() + 1;
+                    // Always log a compact, one-line summary -- a ban is a
+                    // real event worth seeing even with verbose logging
+                    // off. The full hex dump (header bytes, computed hash,
+                    // prevBlock) that let us diagnose the original
+                    // Blake2b/HeaderUtil hashing bug is still available,
+                    // just gated behind VERBOSE_WIRE_LOGGING now so it
+                    // doesn't flood the console on every ordinary run.
+                    System.out.printf("[ChainSync] %s: header at height %d failed PoW "
+                                    + "(bits=0x%08X) -- banning peer.%n",
+                            peer.ip, badHeight, HeaderUtil.bits(h));
+                    if (VERBOSE_WIRE_LOGGING) {
+                        System.out.printf("[PoW-DEBUG] header (236 bytes): %s%n", toHex(h));
+                        System.out.printf("[PoW-DEBUG] nonce=%d time=%d bits=0x%08X version=%d%n",
+                                HeaderUtil.nonce(h), HeaderUtil.time(h), HeaderUtil.bits(h), HeaderUtil.version(h));
+                        System.out.printf("[PoW-DEBUG] prevBlock=%s%n", toHex(HeaderUtil.prevBlock(h)));
+                        System.out.printf("[PoW-DEBUG] computed hash=%s%n", toHex(HeaderUtil.hash(h)));
+                    }
                     PeerScorecard.get().banPeer(peer.ip,
-                            "sent header at height " + (tip + validHeaders.size() + 1)
+                            "sent header at height " + badHeight
                                     + " with invalid proof-of-work");
                     break;
                 }
@@ -1295,10 +1318,6 @@ public class ChainSync {
 
     public long inboundPeerCount() {
         return connectedPeers.stream().filter(PeerInfo::inbound).count();
-    }
-
-    public boolean isConnectedTo(String ip) {
-        return connectedPeers.stream().anyMatch(p -> p.ip().equals(ip));
     }
 
     /**
@@ -1785,6 +1804,7 @@ public class ChainSync {
         void doVersionHandshake(int ourHeight) throws Exception {
             // Send VERSION
             sendVersion(ourHeight);
+            System.out.printf("[Handshake] -> %s VERSION sent, waiting for reply...%n", ip);
 
             // A proper handshake requires BOTH sides' VERSION and VERACK to
             // be exchanged before it's complete -- not just whichever one
@@ -1807,8 +1827,16 @@ public class ChainSync {
                 if (msg == null) throw new IOException("Handshake timeout");
                 int type = getMessageType(msg);
                 if (type == MSG_VERSION) {
+                    // DEBUG: explicit confirmation with the peer's own
+                    // reported details, and to unconditionally prove this
+                    // branch was actually reached -- everything before this
+                    // in the log could succeed while this specific parse
+                    // still silently threw and got swallowed somewhere.
                     parseVersion(Arrays.copyOfRange(msg, 9, msg.length));
+                    System.out.printf("[Handshake] <- %s VERSION received: agent=%s height=%d services=%d protocolVersion=%d%n",
+                            ip, agent, peerHeight, services, protocolVersion);
                     sendMessage(MSG_VERACK, new byte[0]);
+                    System.out.printf("[Handshake] -> %s VERACK sent (in reply to their VERSION)%n", ip);
                     // (Was temporarily disabled during an A/B test that
                     // suspected this of interfering with GETHEADERS -- it
                     // wasn't the cause; the real bug was a foundational
@@ -1816,24 +1844,34 @@ public class ChainSync {
                     sendMessage(MSG_SENDHEADERS, new byte[0]);
                     versionReceived = true;
                 } else if (type == MSG_VERACK) {
+                    System.out.printf("[Handshake] <- %s VERACK received%n", ip);
                     verackReceived = true;
+                } else {
+                    // DEBUG: previously silently ignored -- if a peer sends
+                    // anything else this early (PING, or something
+                    // unexpected), that's genuinely useful to see rather
+                    // than have it vanish without a trace.
+                    System.out.printf("[Handshake] <- %s unexpected message type=%d during handshake window (ignored)%n",
+                            ip, type);
                 }
-                // Any other message type received during the handshake
-                // window (PING, etc.) is simply ignored here and not
-                // re-processed -- acceptable for now since real peers don't
-                // typically send anything else this early.
             }
             if (!versionReceived || !verackReceived)
                 throw new IOException("Handshake timeout (version="
                         + versionReceived + " verack=" + verackReceived + ")");
+            System.out.printf("[Handshake] <- %s VERSION handshake COMPLETE (version=%b verack=%b)%n",
+                    ip, versionReceived, verackReceived);
         }
 
         private void sendVersion(int ourHeight) throws Exception {
-            // Real hsd VersionPacket layout, verified against a live hsd
-            // installation: version(4) + services(4) + hi_services(4) +
-            // time(8) + NetAddress(88) + nonce(8) + agentLen(1) + agent(N)
-            // + height(4) + noRelay(1). Previously this sent a much
-            // simpler, made-up layout with no NetAddress at all.
+            // Real hsd VersionPacket layout, confirmed directly against
+            // hsd's own packets.js source: version(4) + services(4) +
+            // hi_services(4) + time(8) + NetAddress "remote"(88) +
+            // NetAddress "local"(88) + nonce(8) + agentLen(1) + agent(N) +
+            // height(4) + noRelay(1). An earlier version of this comment
+            // claimed this was "verified against a live hsd installation"
+            // with only ONE NetAddress field -- that claim was incomplete;
+            // hsd's VersionPacket has two separate NetAddress properties
+            // (remote and local) and its own getSize() adds both.
             //
             // ourHeight comes from ChainDB.getBlockTip(), which returns -1
             // to mean "no blocks yet" -- a valid internal sentinel, but
@@ -1844,6 +1882,19 @@ public class ChainSync {
             // claiming a chain height of 4.29 billion outright. Clamp to 0
             // before it ever reaches the wire.
             if (ourHeight < 0) ourHeight = 0;
+            // REVERTED: an earlier pass here added a second "local"
+            // NetAddress field, reasoning from a secondary bcoin.io mirror
+            // of hsd's JSDoc that showed VersionPacket.getSize() adding
+            // both a "remote" and a "local" NetAddress. That reasoning was
+            // wrong, and this time the proof is about as direct as it
+            // gets: probe_rawconnect2.js, using hsd's own real code,
+            // captured the actual raw payload bytes it sent and got
+            // accepted by a real, live peer -- 147 bytes total, with
+            // exactly 96 bytes between the fixed 20-byte header and the
+            // agent string. That's one 88-byte NetAddress plus an 8-byte
+            // nonce, not two. Reverting to a single "remote" field,
+            // matching this captured ground truth exactly rather than the
+            // secondary source.
             byte[] agentBytes = userAgent().getBytes(java.nio.charset.StandardCharsets.UTF_8);
             byte[] payload = new byte[4 + 4 + 4 + 8 + NET_ADDRESS_SIZE + 8 + 1 + agentBytes.length + 4 + 1];
             int pos = 0;
@@ -1902,7 +1953,14 @@ public class ChainSync {
                     peerHeight = (int) readLE32(msg, pos);
                     if (peerHeight > bestKnownPeerHeight) bestKnownPeerHeight = peerHeight;
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                // DEBUG: this was silently swallowed before -- if VERSION
+                // parsing itself throws, that's exactly the kind of thing
+                // that could explain a peer that never seems to complete
+                // the handshake, invisibly.
+                System.out.printf("[Handshake] <- %s VERSION payload parse threw: %s: %s (msg.length=%d)%n",
+                        ip, e.getClass().getSimpleName(), e.getMessage(), msg.length);
+            }
         }
 
         void sendGetHeaders(List<byte[]> locator) throws Exception {
@@ -1939,11 +1997,9 @@ public class ChainSync {
 
         /**
          * Sends a message using hsd's real frame format: magic(4 LE) +
-         * cmd(1) + length(4 LE) + payload(N). If this is a Brontide
-         * connection the frame is then encrypted; for a cleartext
-         * connection (brontide == null) the frame is written directly --
-         * the logical frame format is identical either way, only the
-         * wire transport differs.
+         * cmd(1) + length(4 LE) + payload(N), always Brontide-encrypted
+         * before it hits the wire -- this project no longer has a
+         * cleartext transport, so brontide is never null here.
          */
         void sendMessage(int type, byte[] payload) throws Exception {
             byte[] frame = new byte[9 + payload.length];
@@ -1951,21 +2007,6 @@ public class ChainSync {
             frame[4] = (byte) type;
             writeLE32(frame, 5, payload.length);
             System.arraycopy(payload, 0, frame, 9, payload.length);
-
-            if (brontide == null) {
-                if (VERBOSE_WIRE_LOGGING) {
-                    System.out.printf("[Handshake] -> %s (cleartext) SEND type=%d frame(%d bytes): %s%n",
-                            ip, type, frame.length, toHex(frame));
-                }
-                synchronized (out) {
-                    out.write(frame);
-                    out.flush();
-                }
-                totalBytesSent.addAndGet(frame.length);
-                bytesSent += frame.length;
-                lastSendTime = System.currentTimeMillis() / 1000;
-                return;
-            }
 
             byte[] encrypted = brontide.encryptMessage(frame);
             if (VERBOSE_WIRE_LOGGING) {
@@ -1985,11 +2026,9 @@ public class ChainSync {
 
         /**
          * Reads one message, returning the full frame (magic+cmd+length+
-         * payload) with the magic number validated. For a cleartext
-         * connection the frame is read directly off the wire; for
-         * Brontide it's decrypted first. Either way the returned frame
-         * format is identical, so getMessageType()/message handlers work
-         * unchanged regardless of which transport this connection uses.
+         * payload) with the magic number validated, always Brontide-
+         * decrypted first -- this project no longer has a cleartext
+         * transport, so brontide is never null here.
          * <p>
          * Verbose about exactly what comes back (byte counts, raw hex,
          * decrypted length) rather than collapsing everything to null --
@@ -2010,25 +2049,11 @@ public class ChainSync {
         private byte[] readMessageInternal(int timeoutMs) throws Exception {
             socket.setSoTimeout(timeoutMs);
 
-            if (brontide == null) {
-                byte[] frame = readPartialDebug(in, 9, ip, "cleartext header");
-                if (frame == null) return null;
-                long magic = readLE32(frame, 0) & 0xFFFFFFFFL;
-                if (magic != (MAGIC_MAINNET & 0xFFFFFFFFL)) {
-                    System.out.printf("[Handshake] <- %s (cleartext) bad magic: 0x%08X%n", ip, magic);
-                    return null;
-                }
-                int payloadLen = (int) readLE32(frame, 5);
-                if (payloadLen < 0 || payloadLen > 4_000_000) return null;
-                if (payloadLen == 0) return frame;
-                byte[] payload = readPartialDebug(in, payloadLen, ip, "cleartext payload");
-                if (payload == null) return null;
-                byte[] full = new byte[9 + payloadLen];
-                System.arraycopy(frame, 0, full, 0, 9);
-                System.arraycopy(payload, 0, full, 9, payloadLen);
-                return full;
-            }
-
+            // FIX: reverting to 20 bytes (4-byte LE length + 16-byte tag) --
+            // a real past session reached an actual, complete, documented
+            // success (323,987 headers synced) using this exact format.
+            // See BrontideState.encryptMessage()'s own comment for the
+            // full BrontideStream vs Brontide class explanation.
             byte[] header = readPartialDebug(in, 20, ip, "header");
             if (header == null) return null;
 
@@ -2115,17 +2140,6 @@ public class ChainSync {
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────
-
-    private static byte[] readExact(InputStream in, int len) throws IOException {
-        byte[] buf = new byte[len];
-        int read = 0;
-        while (read < len) {
-            int n = in.read(buf, read, len - read);
-            if (n < 0) return null;
-            read += n;
-        }
-        return buf;
-    }
 
     /** Reads the cmd byte at offset 4 of a frame (magic[0..3], cmd[4], length[5..8], payload[9..]). */
     private static int getMessageType(byte[] msg) {

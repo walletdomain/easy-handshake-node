@@ -32,6 +32,10 @@ public final class WebAdminServerContent {
                     <h1>Easy Handshake Node</h1>
                     <p class="subtitle">Local admin interface &middot; v<span id="version">...</span></p>
                 </header>
+                <div id="halt-banner" style="display:none; background:#7a1f1f; color:#fff; padding:12px 20px; font-weight:bold;">
+                    Node halted -- Urkel tree root mismatch at height <span id="halt-height"></span>.
+                    This needs investigation or recovery before sync can safely resume.
+                </div>
                 <main>
                     <div class="column">
                         <section class="card">
@@ -605,6 +609,19 @@ public final class WebAdminServerContent {
                             + data.blockHeight + " of " + data.networkHeight + ")";
                     }
                     document.getElementById("db-size").textContent = data.dbSizeGB + " GB";
+
+                    // FIX (audit): the backend already tracked and exposed
+                    // this halt state (ChainSync.haltedDueToTreeMismatch())
+                    // internally, but nothing ever surfaced it here -- a
+                    // real halt would previously only be visible in
+                    // console/log output, never in this admin panel.
+                    const haltBanner = document.getElementById("halt-banner");
+                    if (data.halted) {
+                        document.getElementById("halt-height").textContent = data.halted.height;
+                        haltBanner.style.display = "block";
+                    } else {
+                        haltBanner.style.display = "none";
+                    }
                 } catch (e) {
                     document.getElementById("uptime").textContent = "Unavailable";
                 }

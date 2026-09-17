@@ -60,9 +60,6 @@ public final class ConfigDB {
     public KVMap<String, String> settingsMap() { return settings; }
     public KVMap<String, String> seedsMap() { return seeds; }
     public KVMap<String, String> peerScoresMap() { return peerScores; }
-    public KVMap<String, String> discoveredPeersMap() { return discoveredPeers; }
-
-    public Map<String, String> settingsSnapshot() { return settings.asUnmodifiableMap(); }
 
     public void commit() {
         store.commit();

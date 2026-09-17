@@ -224,37 +224,6 @@ public class TxParser {
         return hex(Blake2b.hash256(base));
     }
 
-    /**
-     * Returns the name hash from a covenant output (item[0]).
-     * Returns null if no name hash is present.
-     */
-    public static byte[] getNameHash(Output output) {
-        if (output.covenant == null) return null;
-        if (output.covenant.items.isEmpty()) return null;
-        return output.covenant.items.get(0).data;
-    }
-
-    /**
-     * Returns the name bytes from a covenant output (item[2] for most types).
-     */
-    public static byte[] getNameBytes(Output output) {
-        if (output.covenant == null) return null;
-        List<CovenantItem> items = output.covenant.items;
-        switch (output.covenant.type) {
-            case COV_OPEN:
-            case COV_BID:
-            case COV_REGISTER:
-            case COV_UPDATE:
-            case COV_RENEW:
-            case COV_TRANSFER:
-            case COV_FINALIZE:
-            case COV_REVOKE:
-                return items.size() > 2 ? items.get(2).data : null;
-            default:
-                return null;
-        }
-    }
-
     // ── Internal parser ───────────────────────────────────────────────────────
 
     private static class Parser {
