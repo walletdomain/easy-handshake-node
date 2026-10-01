@@ -192,8 +192,8 @@ public class WebAdminServer {
             UrkelTreeMismatchException halt = (chainSync != null) ? chainSync.haltedDueToTreeMismatch() : null;
             String haltedField = (halt != null)
                     ? "{\"height\":" + halt.height
-                        + ",\"claimedRoot\":\"" + jsonEscape(toHex(halt.claimedRoot))
-                        + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
+                    + ",\"claimedRoot\":\"" + jsonEscape(toHex(halt.claimedRoot))
+                    + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
                     : "null";
 
             String json = "{"
@@ -230,9 +230,7 @@ public class WebAdminServer {
 
     private static String toHex(byte[] b) {
         if (b == null) return "";
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     private void handlePeers(HttpExchange ex) throws IOException {
@@ -503,15 +501,14 @@ public class WebAdminServer {
      *  than silently coercing or storing something invalid that would
      *  only surface as a confusing failure on next restart. */
     private String validate(String key, String value) {
+        // FIX: a "p2p.port"/"rpc.port" branch used to live here too, but
+        // it was dead code -- validate() is only ever reached (see the
+        // handleConfig() loop above) for a key that already passed
+        // EDITABLE_KEYS.contains(key), and EDITABLE_KEYS has contained
+        // only "rpc.host" since both ports were deliberately made
+        // non-editable (see EDITABLE_KEYS's own comment for why).
+        // Removed as part of the project's dead-code cleanup pass.
         return switch (key) {
-            case "p2p.port", "rpc.port" -> {
-                try {
-                    int port = Integer.parseInt(value);
-                    yield (port >= 1 && port <= 65535) ? null : "Port must be between 1 and 65535";
-                } catch (NumberFormatException e) {
-                    yield "Port must be a number";
-                }
-            }
             case "rpc.host" -> value.isBlank() ? "Host cannot be empty" : null;
             default -> "Unknown key";
         };
@@ -576,14 +573,12 @@ public class WebAdminServer {
     }
 
     private static String jsonEscape(String s) {
-        StringBuilder sb = new StringBuilder();
-        for (char c : s.toCharArray()) {
-            switch (c) {
-                case '"'  -> sb.append("\\\"");
-                case '\\' -> sb.append("\\\\");
-                default   -> sb.append(c);
-            }
-        }
-        return sb.toString();
+        // FIX: a real, confirmed bug -- this used to escape only '"' and
+        // '\\', leaving '\n' and '\r' completely unescaped. Any admin
+        // config value containing a literal newline would be emitted as
+        // invalid, line-broken JSON (not a parse error client-side,
+        // potentially an outright broken response). Now delegates to the
+        // single shared, complete implementation.
+        return JsonUtil.escape(s);
     }
 }

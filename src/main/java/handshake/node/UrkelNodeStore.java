@@ -158,9 +158,7 @@ public class UrkelNodeStore {
     }
 
     static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     /** Compact, immutable wrapper around a 32-byte node hash, used only
@@ -208,11 +206,7 @@ public class UrkelNodeStore {
     }
 
     private static byte[] unhex(String s) {
-        byte[] b = new byte[s.length() / 2];
-        for (int i = 0; i < b.length; i++) {
-            b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-        }
-        return b;
+        return HexUtil.decode(s);
     }
 
     /** Opens a lightweight, O(1) snapshot handle representing this

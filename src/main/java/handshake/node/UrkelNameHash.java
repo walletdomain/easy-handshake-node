@@ -25,14 +25,24 @@ public final class UrkelNameHash {
 
     private UrkelNameHash() {}
 
-    /** Matches rules.hashString(): the name string, written as plain
-     *  ASCII bytes, then SHA3-256'd -- confirmed from rules.js's own
+    /** Matches rules.hashString(): the name string, LOWERCASED first
+     *  (confirmed directly from real hsd's own rules.js -- and from
+     *  hs-names-2023's locked.js, the reference data this project's
+     *  ICANN-lockup reserved-name lookup is built from, which does the
+     *  exact same name.toLowerCase() before hashing; this method
+     *  previously skipped that step, a real, if narrow, latent gap --
+     *  every existing caller happens to already pass lowercase names in
+     *  practice, but an RPC caller typing a name with different casing
+     *  would have silently computed the wrong hash and failed to find
+     *  an existing name, rather than correctly normalizing first the
+     *  way real hsd always does), written as plain ASCII bytes, then
+     *  SHA3-256'd -- confirmed from rules.js's own
      *  "slab.write(name, 0, slab.length, 'ascii')" followed by
      *  hashBinary(buf). */
     public static byte[] hashName(String name) {
         try {
             MessageDigest sha3 = MessageDigest.getInstance("SHA3-256");
-            return sha3.digest(name.getBytes(StandardCharsets.US_ASCII));
+            return sha3.digest(name.toLowerCase().getBytes(StandardCharsets.US_ASCII));
         } catch (NoSuchAlgorithmException e) {
             // SHA3-256 has been a standard JDK algorithm since Java 9;
             // this project targets 21+, so this should be unreachable.

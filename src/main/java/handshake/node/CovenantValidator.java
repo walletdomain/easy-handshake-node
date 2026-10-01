@@ -199,8 +199,6 @@ public class CovenantValidator {
     }
 
     private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 }

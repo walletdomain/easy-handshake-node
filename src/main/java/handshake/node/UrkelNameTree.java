@@ -98,6 +98,25 @@ public class UrkelNameTree {
 
     public int firstDeepCatchUpDeletionHeight() { return firstDeepCatchUpDeletionHeight; }
 
+    /** Restores knowledge of a deep-catch-up deletion from a PAST
+     *  session -- see ChainDB's own META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT
+     *  comment for why this needs to exist at all (this field, on its
+     *  own, has no memory across a restart). Only ever moves this from
+     *  -1 to a real height, never overwrites an already-known one --
+     *  if THIS session also independently detects its own deletion
+     *  later, the historically-first height (whichever was truly
+     *  earlier) is what actually matters for recovery's own rollback
+     *  target, and loading a persisted value always happens at
+     *  construction, before this session could have detected anything
+     *  of its own yet, so there's no ordering hazard in practice --
+     *  the guard exists for correctness under that invariant, not to
+     *  paper over a race. */
+    public void setFirstDeepCatchUpDeletionHeight(int height) {
+        if (this.firstDeepCatchUpDeletionHeight == -1) {
+            this.firstDeepCatchUpDeletionHeight = height;
+        }
+    }
+
     /** Formats current JVM heap usage for diagnostic logging -- used
      *  and maxMemory (the -Xmx ceiling), not free/total (which reflect
      *  the JVM's CURRENT allocated heap size, not its actual ceiling,
@@ -458,9 +477,54 @@ public class UrkelNameTree {
      *  by removing the walk from the deep-catch-up path entirely (see
      *  MAX_CANDIDATES_BEFORE_RECONCILIATION), then by disk-backing the
      *  walk that remains near the tip (see DiskBackedHashKeySet). */
+    // Diagnostic-only, opt-in, defaults to false -- production behavior
+    // (the real node, ManualUrkelRecoveryTool) is completely unchanged
+    // unless a tool explicitly calls setPruningDisabled(true). See its
+    // own comment for the full reasoning: orphan pruning/reconciliation
+    // only ever reclaims disk space for already-logically-removed
+    // entries (confirmed directly from UrkelTree.removeDirectly() and
+    // reconcileAndRemove(), which call nothing but
+    // nodeStore.removeKeys() -- never touching liveRoot/committedRoot
+    // at all), so a pure, throwaway-scratch-database diagnostic tool
+    // that only needs correct ROOTS, never a space-reclaimed store,
+    // can skip it entirely with zero effect on what root gets computed
+    // at any height.
+    private boolean pruningDisabled = false;
+
+    /** Skips ALL orphan-backlog accumulation, backpressure, and
+     *  reconciliation/pruning inside maybeCommit() -- see this field's
+     *  own comment for why that's always safe for a diagnostic tool
+     *  and never appropriate for the real node or ManualUrkelRecoveryTool,
+     *  both of which need their scratch or real database to actually
+     *  stay space-reclaimed since their results get kept, not thrown
+     *  away. Confirmed as the actual bottleneck in both existing
+     *  from-genesis replay tools: neither has any network-imposed
+     *  pacing at all, so both generate orphan-candidate backlog at the
+     *  same unthrottled rate regardless of deep-catch-up vs. fully-
+     *  validated pacing, making the reconciliation work itself -- not
+     *  which pacing mode triggers it -- the real cost. */
+    public void setPruningDisabled(boolean disabled) {
+        this.pruningDisabled = disabled;
+    }
+
     public boolean maybeCommit(int height, int bestKnownPeerHeight) {
         if (height % TREE_INTERVAL != 0) return false;
         lastCommittedRoot = tree.rootHash().clone();
+
+        if (pruningDisabled) {
+            // Still call advanceOrphanGeneration() -- NOT skipping this
+            // too -- so UrkelTree's own internal orphan tracker doesn't
+            // itself accumulate unboundedly across a long diagnostic
+            // run; its return value is simply discarded here rather
+            // than being accumulated into the expensive backpressure/
+            // reconciliation machinery below. The underlying KVStore
+            // just keeps every node ever written, live and orphaned
+            // alike, for the rest of this run -- irrelevant for a
+            // scratch database that gets deleted when this tool exits
+            // either way.
+            tree.advanceOrphanGeneration();
+            return true;
+        }
 
         // RE-ARCHITECTURE: accumulate this window's orphan candidates
         // EVERY commit, regardless of whether this specific commit also
@@ -634,6 +698,34 @@ public class UrkelNameTree {
             pruneInProgress.set(true);
             drainOneBatch(chunk, deepCatchUp, rootToPrune, height);
 
+            // FIX: a real, confirmed OutOfMemoryError crash, root-caused
+            // directly, not guessed at -- HARD_BACKPRESSURE_CAP's own
+            // "provable ceiling" claim only ever bounded the orphan
+            // CANDIDATE list's own size. It said nothing about the
+            // modified/dirty Urkel tree nodes each removal generates as
+            // a side effect -- and this loop, before this fix, never
+            // persisted or collapsed any of them: that only happened
+            // back in persistBlock(), once per BLOCK, after this entire
+            // loop had already returned. A single backpressure episode
+            // can span many consecutive drain chunks (confirmed
+            // directly: a real crash showed 5+ consecutive 31,676-entry
+            // chunks, all before the backlog even got back under the
+            // resume threshold once) -- every one of those chunks was
+            // piling fully-materialized dirty nodes on top of the last,
+            // with nothing ever collapsed to the lightweight placeholder
+            // persistFrom() otherwise provides for exactly this purpose
+            // (see its own comment: "this is what actually bounds this
+            // project's in-memory footprint"), until heap simply ran
+            // out. Calling the same persistLive() persistBlock() already
+            // calls once per block -- here too, once per CHUNK -- closes
+            // this gap directly: every chunk's dirty nodes are now
+            // written and collapsed before the next chunk can add more,
+            // so peak memory during an extended backpressure episode is
+            // now actually bounded by one chunk's worth of dirty nodes,
+            // not by however many chunks a single episode happens to
+            // need.
+            tree.persistLive();
+
             // FIX: added after a real, observed problem -- dozens of
             // these cycles running back-to-back with zero gap
             // between them, confirmed via real output, very plausibly
@@ -691,6 +783,20 @@ public class UrkelNameTree {
                 // up -- see UrkelTree.removeDirectly()'s own comment
                 // for the full reasoning on this trade-off.
                 //
+                // FIX: discard the validated-mode reachable cache (see
+                // UrkelTree.persistentReachable's own field comment) if
+                // this is a trip BACK into deep catch-up after already
+                // having left it once -- removeDirectly() below deletes
+                // directly from nodeStore without any involvement from
+                // that cache, so leaving it in place would let it drift
+                // silently out of sync with what's actually still on
+                // disk. A no-op on every ordinary deep-catch-up cycle
+                // (nothing to discard yet, since this field is never
+                // built until the node leaves deep catch-up for the
+                // first time) -- this only ever does real work on that
+                // one, rare return trip.
+                tree.discardPersistentReachableCache();
+
                 // FIX: register this specific in-flight batch with
                 // the tree's unorphan-resurrection safeguard for the
                 // duration of the removal, and unregister it
@@ -851,6 +957,16 @@ public class UrkelNameTree {
         // earlier would risk that re-queue writing to an already-closed
         // store.
         accumulatedOrphanCandidates.close();
+
+        // FIX: same leak shape as accumulatedOrphanCandidates just above
+        // -- persistentReachable (see UrkelTree's own field comment) is
+        // now a real, potentially long-lived RocksDB instance and temp
+        // directory too, once the node has run long enough to leave
+        // deep catch-up. Without this, every restart of a long-running
+        // node would leave another one of these behind on disk forever.
+        // Safe to call even if it was never built at all (e.g. a node
+        // that never made it out of deep catch-up before this shutdown).
+        tree.closePersistentReachableCache();
     }
 
     /** Looks up a name's current state directly (bypassing the

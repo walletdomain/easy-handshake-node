@@ -363,21 +363,14 @@ public class DnsResource {
     }
 
     private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder();
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     private static String jsonEscape(String s) {
-        StringBuilder sb = new StringBuilder();
-        for (char c : s.toCharArray()) {
-            switch (c) {
-                case '"'  -> sb.append("\\\"");
-                case '\\' -> sb.append("\\\\");
-                case '\n' -> sb.append("\\n");
-                default   -> sb.append(c);
-            }
-        }
-        return sb.toString();
+        // FIX: used to escape '"', '\\', and '\n', but not '\r' --
+        // confirmed as a real gap during the project's JSON-escape
+        // consolidation audit. Now delegates to the single shared,
+        // complete implementation.
+        return JsonUtil.escape(s);
     }
 }

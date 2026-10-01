@@ -178,8 +178,28 @@ public class RpcServer {
      * of sync with reality. A test (see RpcMethodListTest, run manually,
      * not part of the build) parses this file's real dispatch() cases
      * and confirms this array matches them exactly in both directions.
+     *
+     * FIX: a second, separate drift risk existed alongside this one --
+     * WebAdminServerContent's own RPC_METHODS_JS (the richer, per-
+     * parameter metadata list the admin UI's dropdown/form is built
+     * from) is hand-maintained independently of this array, with nothing
+     * keeping the two in sync. Generating RPC_METHODS_JS's JS object
+     * literal FROM this array at runtime was considered and rejected
+     * here: RPC_METHODS_JS carries real per-parameter metadata (names,
+     * types, which are required, defaults) this array has no equivalent
+     * of, so "generate one from the other" would mean inventing a new
+     * Java-side metadata model for every one of the 53 methods just to
+     * re-derive a JS literal that already exists and is already correct
+     * -- a much larger, higher-risk change than this cleanup pass
+     * intended, for a form of drift that's cosmetic (a stale admin UI
+     * dropdown) rather than a working-method/consensus risk. Instead,
+     * RpcMethodListSyncTest (same manual-run convention as
+     * RpcMethodListTest, in the same package) cross-checks this array's
+     * method names against RPC_METHODS_JS's own keys in both directions,
+     * so a drift between them is at least discoverable by running the
+     * test, rather than silently invisible the way it was before.
      */
-    private static final String[] RPC_METHODS = {
+    static final String[] RPC_METHODS = {
             "addnode",
             "clearbanned",
             "createmultisig",
@@ -572,22 +592,7 @@ public class RpcServer {
         byte[] addrHash = (byte[]) decoded[2];
         if (version != 0 || addrHash.length != 20) return "false";
 
-        byte[] sig;
-        try {
-            sig = Base64.getDecoder().decode(sigB64);
-        } catch (Exception e) {
-            return "false";
-        }
-        if (sig.length != 64) return "false";
-
-        byte[] hash = messageHash(message);
-        for (int i = 0; i < 4; i++) {
-            byte[] recoveredPubKey = Secp256k1.recover(hash, sig, i);
-            if (recoveredPubKey == null) continue;
-            byte[] recoveredHash = Blake2b.hash(recoveredPubKey, 20);
-            if (Arrays.equals(recoveredHash, addrHash)) return "true";
-        }
-        return "false";
+        return verifySigAgainstAddrHash(message, sigB64, addrHash) ? "true" : "false";
     }
 
     /**
@@ -612,22 +617,36 @@ public class RpcServer {
             throw new RpcException(-20, "Cannot find the owner's address.");
         if (owner.addrHash().length != 20) return "false";
 
+        return verifySigAgainstAddrHash(message, sigB64, owner.addrHash()) ? "true" : "false";
+    }
+
+    /**
+     * RE-ARCHITECTURE: verifyMessage() and verifyMessageWithName() used to
+     * each carry their own, line-for-line identical copy of this
+     * signature-recovery loop (base64-decode the signature, hash the
+     * message, try all 4 recovery IDs, compare the recovered pubkey's
+     * address hash against the target) -- differing only in where the
+     * target address hash came from (a directly-supplied address vs. a
+     * name's current owner UTXO). Pulled out here so there's exactly one
+     * place this verification logic can drift between the two RPCs.
+     */
+    private boolean verifySigAgainstAddrHash(String message, String sigB64, byte[] targetAddrHash) {
         byte[] sig;
         try {
             sig = Base64.getDecoder().decode(sigB64);
         } catch (Exception e) {
-            return "false";
+            return false;
         }
-        if (sig.length != 64) return "false";
+        if (sig.length != 64) return false;
 
         byte[] hash = messageHash(message);
         for (int i = 0; i < 4; i++) {
             byte[] recoveredPubKey = Secp256k1.recover(hash, sig, i);
             if (recoveredPubKey == null) continue;
             byte[] recoveredHash = Blake2b.hash(recoveredPubKey, 20);
-            if (Arrays.equals(recoveredHash, owner.addrHash())) return "true";
+            if (Arrays.equals(recoveredHash, targetAddrHash)) return true;
         }
-        return "false";
+        return false;
     }
 
     /**
@@ -1968,43 +1987,31 @@ public class RpcServer {
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    private static long readLE32(byte[] b, int off) {
-        return (b[off] & 0xFFL) | ((b[off+1] & 0xFFL) << 8)
-                | ((b[off+2] & 0xFFL) << 16) | ((b[off+3] & 0xFFL) << 24);
-    }
+    // FIX: a dead, zero-call-site readLE32(byte[], int) used to live here --
+    // confirmed via grep across the whole file before removal. Deleted as
+    // part of the project's dead-code cleanup pass.
 
     private static String hex(byte[] b) {
         if (b == null) return "";
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     private static String jsonEscape(String s) {
-        StringBuilder sb = new StringBuilder();
-        for (char c : s.toCharArray()) {
-            switch (c) {
-                case '"'  -> sb.append("\\\"");
-                case '\\' -> sb.append("\\\\");
-                case '\n' -> sb.append("\\n");
-                case '\r' -> sb.append("\\r");
-                default   -> sb.append(c);
-            }
-        }
-        return sb.toString();
+        return JsonUtil.escape(s);
     }
 
     private static byte[] fromHex(String s) {
         s = s.replace("\"", "");
-        byte[] b = new byte[s.length() / 2];
-        for (int i = 0; i < b.length; i++)
-            b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-        return b;
+        return HexUtil.decode(s);
     }
 
     private static String escape(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        // FIX: used to escape only '\\' and '"', leaving '\n'/'\r'
+        // unescaped in RPC error messages -- the same latent bug
+        // WebAdminServer's own jsonEscape() had, just rarely exercised
+        // here since error messages rarely contain raw newlines. Now
+        // delegates to the single shared, complete implementation.
+        return JsonUtil.escape(s);
     }
 
     // ── RPC exception ─────────────────────────────────────────────────────────

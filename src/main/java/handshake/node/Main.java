@@ -121,10 +121,8 @@ public class Main {
                             "Startup consistency check found a mismatch at height %d after an unclean "
                                     + "shutdown -- header claims %s, we computed %s",
                             currentTip, hex(claimedRoot), hex(computedRoot)));
-                    UrkelTreeMismatchException cause = new UrkelTreeMismatchException(
-                            currentTip, claimedRoot, computedRoot, db.getNameTree().firstDeepCatchUpDeletionHeight());
-                    UrkelTreeRecovery.RecoveryResult result =
-                            UrkelTreeRecovery.attemptRecovery(db, dataDir, cause, true);
+                    UrkelTreeRecovery.RecoveryResult result = UrkelTreeRecovery.attemptRecovery(
+                            db, dataDir, db.getNameTree().firstDeepCatchUpDeletionHeight(), true);
                     if (!result.success) {
                         // Deliberately fatal: starting sync on top of
                         // known-inconsistent state would risk compounding
@@ -400,8 +398,6 @@ public class Main {
     }
 
     private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 }

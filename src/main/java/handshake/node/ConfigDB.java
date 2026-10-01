@@ -5,10 +5,10 @@ import java.util.Map;
 
 /**
  * ConfigDB — owns the shared storage engine handle that holds validator
- * configuration, seed addresses, peer scores, and discovered peers
- * (settings / seeds / peerScores / discoveredPeers maps).
+ * configuration, seed addresses, and peer scores (settings / seeds /
+ * peerScores maps).
  * <p>
- * This exists because all four of those maps live in ONE physical
+ * This exists because all three of those maps live in ONE physical
  * database, and a single storage engine handle only allows one open
  * instance at a time -- NodeConfig, SeedDatabase, and PeerScorecard
  * can't each open their own handle on the same underlying data
@@ -43,7 +43,6 @@ public final class ConfigDB {
     private final KVMap<String, String> settings;
     private final KVMap<String, String> seeds;
     private final KVMap<String, String> peerScores;
-    private final KVMap<String, String> discoveredPeers;
 
     private ConfigDB(String dataDir) {
         String path = dataDir + "/config";
@@ -54,7 +53,17 @@ public final class ConfigDB {
         this.settings = store.openStringStringMap("settings");
         this.seeds = store.openStringStringMap("seeds");
         this.peerScores = store.openStringStringMap("peerScores");
-        this.discoveredPeers = store.openStringStringMap("discoveredPeers");
+        // FIX: a "discoveredPeers" map used to be opened here too, but it
+        // was dead -- confirmed via grep across the whole codebase to
+        // have no accessor and no reader/writer anywhere, apparently a
+        // planned-but-never-implemented feature distinct from the real,
+        // actively-used seeds map. Removed as part of the project's
+        // dead-code cleanup pass. Safe even if a "discoveredPeers" column
+        // family already exists on disk from a previous run: RocksDBKVStore
+        // discovers and opens every existing column family at startup
+        // regardless of which ones application code asks for by name
+        // (see its own class comment) -- it just sits there unused, as it
+        // already effectively was.
     }
 
     public KVMap<String, String> settingsMap() { return settings; }

@@ -37,6 +37,68 @@ public class UrkelTree {
      *  this store rather than assumed to already be in memory. */
     private UrkelNodeStore nodeStore;
 
+    /** FIX: reconcileAndRemove() used to open a brand-new
+     *  DiskBackedHashKeySet, walk the ENTIRE live tree into it from
+     *  scratch via collectReachable(), use it once, then throw it away
+     *  -- every single reconciliation cycle, forever, once the node
+     *  left deep catch-up. Confirmed as a real, serious production
+     *  problem: at real mainnet-scale name counts, a single one of
+     *  these walks took over an hour and was STILL running when
+     *  observed, with no sign of finishing -- and because this runs
+     *  synchronously on the main block-processing thread, that's an
+     *  hour where no new blocks can be processed at all, repeating
+     *  every PRUNE_EVERY_N_COMMITS cycle for the rest of the node's
+     *  life, with the walk only getting slower as the tree grows. A
+     *  blockchain node has no business re-verifying the reachability of
+     *  its entire historical state on every commit -- only what
+     *  actually changed since the last time this ran.
+     *
+     *  Fix: keep ONE reachable set alive for as long as this UrkelTree
+     *  instance runs (across many reconciliation cycles), instead of a
+     *  fresh one per cycle. collectReachable() already skips anything
+     *  already present in the set it's given (see its own "already
+     *  visited this subtree" early-return) -- that's exactly the
+     *  mechanism needed to make repeat walks incremental; it was simply
+     *  never given the chance to skip anything, since it always started
+     *  from empty before. With a set that persists, the FIRST walk
+     *  after this field is created is still a real, full walk (exactly
+     *  as expensive as today -- there's no way around verifying
+     *  reachability at least once), but every walk after that only
+     *  needs to visit nodes it hasn't already confirmed reachable:
+     *  roughly proportional to how much the tree changed since the
+     *  last cycle, not to the tree's total size.
+     *
+     *  This does NOT weaken the correctness guarantee reconcileAndRemove()
+     *  exists for (see its own doc comment on the resurrection edge
+     *  case this class's walk protects against) -- it's still the exact
+     *  same reachability check, just memoized instead of recomputed.
+     *  The one thing a persistent set needs that a throwaway one didn't:
+     *  eviction. A hash that was reachable last cycle can legitimately
+     *  stop being reachable this cycle (its name got updated, its old
+     *  leaf superseded) -- reconcileAndRemove() evicts every one of this
+     *  cycle's candidates from this set BEFORE walking (see its own
+     *  comment for why that specific order matters), so the walk
+     *  naturally re-discovers and re-adds anything that's actually
+     *  still reachable (a resurrection), while anything genuinely dead
+     *  simply stays evicted. Without this eviction step, pruning would
+     *  silently stop collecting real garbage after the first walk --
+     *  every hash ever marked reachable would stay marked reachable in
+     *  this set forever, regardless of what actually happened to it
+     *  later.
+     *
+     *  Deliberately NOT used at all during deep catch-up (removeDirectly()
+     *  is a completely separate path that never touches this field) --
+     *  and if the node were ever to genuinely re-enter deep catch-up
+     *  after this field has already been seeded (an unusual case: the
+     *  node falling far enough behind the peer network again after
+     *  already having caught up once), drainOneBatch() discards this
+     *  field entirely on that transition rather than trying to keep it
+     *  consistent with a different code path's direct deletions. Paying
+     *  for one more full walk on the rare trip back into validated mode
+     *  is a trivial cost next to the risk of this set silently going
+     *  stale relative to what removeDirectly() actually did to disk. */
+    private DiskBackedHashKeySet persistentReachable;
+
     public void setNodeStore(UrkelNodeStore nodeStore) {
         this.nodeStore = nodeStore;
     }
@@ -592,30 +654,72 @@ public class UrkelTree {
     public PruneResult reconcileAndRemove(UrkelNode root, java.util.Set<UrkelNodeStore.HashKey> candidates) {
         if (nodeStore == null) return new PruneResult(0, 0, 0);
         return nodeStore.runExclusiveOfCompaction(() -> {
-            long walkStart = System.currentTimeMillis();
-            // RE-ARCHITECTURE: disk-backed, not an in-memory HashSet --
-            // see DiskBackedHashKeySet's own class comment for the full
-            // reasoning. Closed in the finally below regardless of how
-            // this exits, so its scratch directory never lingers past
-            // one reconciliation cycle.
-            DiskBackedHashKeySet reachable = new DiskBackedHashKeySet();
-            try {
-                collectReachable(root, reachable);
-                long walkMillis = System.currentTimeMillis() - walkStart;
-
-                long removeStart = System.currentTimeMillis();
-                java.util.List<UrkelNodeStore.HashKey> confirmedGarbage = new java.util.ArrayList<>();
-                for (UrkelNodeStore.HashKey candidate : candidates) {
-                    if (!reachable.contains(candidate)) confirmedGarbage.add(candidate);
-                }
-                int removed = nodeStore.removeKeys(confirmedGarbage);
-                long removeMillis = System.currentTimeMillis() - removeStart;
-
-                return new PruneResult(removed, walkMillis, removeMillis);
-            } finally {
-                reachable.close();
+            // RE-ARCHITECTURE: reused across every call, not recreated
+            // per call -- see persistentReachable's own field comment
+            // for the full reasoning (this is the actual fix for the
+            // full-tree-walk-every-cycle problem). Only ever null on
+            // the very first call, or right after a rare, deliberate
+            // discard (see drainOneBatch()'s deep-catch-up branch).
+            if (persistentReachable == null) {
+                persistentReachable = new DiskBackedHashKeySet();
             }
+
+            // FIX: evict THIS cycle's candidates before walking, not
+            // after -- order matters. A candidate evicted first and
+            // found genuinely still reachable gets correctly re-added
+            // by the walk below (a real resurrection, handled exactly
+            // like the old one-shot-per-cycle design handled every
+            // node, reachable or not). Evicting AFTER the walk instead
+            // would wrongly strip back out anything the walk had just
+            // finished confirming was still live. A candidate that's
+            // genuinely dead simply never gets re-added, and the
+            // eviction here is what lets it ever leave this set at all
+            // -- without it, this cache would only ever grow, and
+            // pruning would silently stop collecting real garbage after
+            // the first walk.
+            for (UrkelNodeStore.HashKey candidate : candidates) {
+                persistentReachable.remove(candidate);
+            }
+
+            long walkStart = System.currentTimeMillis();
+            collectReachable(root, persistentReachable);
+            long walkMillis = System.currentTimeMillis() - walkStart;
+
+            long removeStart = System.currentTimeMillis();
+            java.util.List<UrkelNodeStore.HashKey> confirmedGarbage = new java.util.ArrayList<>();
+            for (UrkelNodeStore.HashKey candidate : candidates) {
+                if (!persistentReachable.contains(candidate)) confirmedGarbage.add(candidate);
+            }
+            int removed = nodeStore.removeKeys(confirmedGarbage);
+            long removeMillis = System.currentTimeMillis() - removeStart;
+
+            return new PruneResult(removed, walkMillis, removeMillis);
         });
+    }
+
+    /** Called ONLY when the node discards its validated-mode reachable
+     *  cache -- see persistentReachable's own field comment for the one
+     *  case this matters (a rare trip back into deep catch-up after
+     *  already having left it once). A no-op if nothing has been built
+     *  yet. The very next reconcileAndRemove() call after this simply
+     *  rebuilds it via a fresh full walk, exactly like the first call
+     *  ever made on this tree. */
+    public void discardPersistentReachableCache() {
+        if (persistentReachable != null) {
+            persistentReachable.close();
+            persistentReachable = null;
+        }
+    }
+
+    /** Called ONLY from UrkelNameTree.shutdownPruning(), once, on the
+     *  way down -- releases persistentReachable's own scratch RocksDB
+     *  instance and temp directory (see DiskBackedHashKeySet's own
+     *  close()) so a long-running node doesn't leak one of these every
+     *  restart. Safe to call even if nothing was ever built (deep
+     *  catch-up the whole time this process ran, or a genesis restart
+     *  that hasn't reached the tip yet). */
+    public void closePersistentReachableCache() {
+        discardPersistentReachableCache();
     }
 
     /** RE-ARCHITECTURE: no validation walk at all -- trusts the

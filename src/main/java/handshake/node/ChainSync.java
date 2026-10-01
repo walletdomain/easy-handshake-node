@@ -345,10 +345,7 @@ public class ChainSync {
 
     private static byte[] fromHexStatic(String s) {
         try {
-            byte[] b = new byte[s.length() / 2];
-            for (int i = 0; i < b.length; i++)
-                b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-            return b;
+            return HexUtil.decode(s);
         } catch (Exception e) {
             return null;
         }
@@ -654,7 +651,8 @@ public class ChainSync {
                             + "mismatch. Attempting automatic recovery before deciding whether sync can "
                             + "resume.");
                     UrkelTreeRecovery.RecoveryResult result =
-                            UrkelTreeRecovery.attemptRecovery(db, config.getDataDir(), e, false);
+                            UrkelTreeRecovery.attemptRecovery(db, config.getDataDir(),
+                                    e.firstDeepCatchUpDeletionHeight, false);
                     if (result.success) {
                         System.out.println("[ChainSync] Recovery succeeded: " + result.message
                                 + " Clearing the halt and resuming normal sync.");
@@ -857,6 +855,108 @@ public class ChainSync {
         }
     }
 
+    /**
+     * Called when a header fails our chain-link check: asks 1-2 OTHER
+     * currently-pooled peers -- deliberately excluding whichever one
+     * just sent the disputed header -- what THEY have immediately
+     * following our own stored tip, using the exact same
+     * GETHEADERS/locator mechanism as a normal sync request. This is
+     * the actual "find a different source and see if they agree" step
+     * that was previously missing entirely: recordInvalidData()
+     * penalized the offending peer and moved on, but nothing ever
+     * actively investigated whether that peer was really the outlier,
+     * or whether our OWN stored tip might be the one that's wrong.
+     * <p>
+     * Reuses each confirming peer's EXISTING pooled connection rather
+     * than opening a new one -- exactly what the outbound pool (see
+     * maintainOutboundPool()) exists for, just aimed at a specific
+     * question instead of a general tip comparison. Safe to borrow
+     * briefly: nothing else ever reads or writes a pooled connection's
+     * socket except syncCycle()'s own single thread, and
+     * maintainOutboundPool() (a separate thread) only ever opens NEW
+     * connections, never touches an existing one's I/O.
+     * <p>
+     * Deliberately conservative about what it does with the answer: it
+     * can't roll anything back on its own (that's real, safety-critical
+     * work, scoped separately). It only decides whether to treat the
+     * rejection with the normal, single-peer-outlier assumption, or to
+     * raise a much louder, distinct alarm when other independent peers
+     * instead corroborate the REJECTED header -- meaning our own stored
+     * data might be the actual outlier, not the peer we just penalized.
+     */
+    private void confirmDisagreement(int tip, byte[] rejectedHeader, PeerConnection excludePeer) {
+        List<PeerInfo> candidates = new ArrayList<>();
+        for (PeerInfo p : connectedPeers) {
+            if (p.inbound()) continue;
+            if (p.ip().equals(excludePeer.ip)) continue;
+            candidates.add(p);
+        }
+        if (candidates.isEmpty()) {
+            System.out.println("[ChainSync] No other pooled peers available to confirm this "
+                    + "disagreement right now.");
+            return;
+        }
+
+        List<byte[]> locator = buildLocator(tip);
+        byte[] rejectedHash = HeaderUtil.hash(rejectedHeader);
+        int agreeWithUs = 0;
+        int agreeWithRejected = 0;
+        int asked = 0;
+
+        for (PeerInfo p : candidates) {
+            if (asked >= 2) break; // deliberately just 1-2 confirmations, not a full poll
+            PeerConnection confirmer = p.conn();
+            try {
+                confirmer.sendGetHeaders(locator);
+                byte[] msg = null;
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (System.currentTimeMillis() < deadline) {
+                    byte[] candidate = confirmer.readMessage(10_000);
+                    if (candidate == null) break;
+                    if (getMessageType(candidate) == MSG_HEADERS) { msg = candidate; break; }
+                    handleNonBlockMessage(candidate, confirmer);
+                }
+                asked++;
+                if (msg == null) continue;
+                List<byte[]> theirHeaders = parseHeaders(msg);
+                if (theirHeaders.isEmpty()) continue;
+                byte[] theirFirstHash = HeaderUtil.hash(theirHeaders.get(0));
+                if (Arrays.equals(theirFirstHash, rejectedHash)) {
+                    agreeWithRejected++;
+                    System.out.printf("[ChainSync] Confirmation: %s independently offers the SAME "
+                                    + "header we just rejected (hash=%s).%n",
+                            confirmer.ip, toHex(theirFirstHash));
+                } else {
+                    agreeWithUs++;
+                    System.out.printf("[ChainSync] Confirmation: %s offers a DIFFERENT header at "
+                                    + "this height (hash=%s) than the one we rejected -- "
+                                    + "corroborates our stored data, not the rejected peer's.%n",
+                            confirmer.ip, toHex(theirFirstHash));
+                }
+            } catch (Exception e) {
+                System.out.printf("[ChainSync] Confirmation attempt against %s failed: %s%n",
+                        p.ip(), e.getMessage());
+            }
+        }
+
+        if (agreeWithRejected > 0 && agreeWithRejected >= agreeWithUs) {
+            System.out.printf("[ChainSync] *** POSSIBLE LOCAL DATA ISSUE ***  %d of %d confirming "
+                            + "peers independently offered the SAME header this project just "
+                            + "rejected at height %d -- this now looks more like OUR stored chain "
+                            + "being the outlier than the rejecting peer being wrong. This needs "
+                            + "direct investigation, not just another retry.%n",
+                    agreeWithRejected, agreeWithRejected + agreeWithUs, tip + 1);
+        } else if (agreeWithUs > 0) {
+            System.out.printf("[ChainSync] Confirmed: %d of %d other peers disagree with the "
+                            + "rejected header too -- treating this as that peer being the "
+                            + "outlier, as usual.%n",
+                    agreeWithUs, agreeWithUs + agreeWithRejected);
+        } else {
+            System.out.println("[ChainSync] Could not get a usable confirmation from any other "
+                    + "pooled peer right now -- proceeding with the normal single-peer penalty.");
+        }
+    }
+
     private PeerConnection connectToBestPeer(
             List<PeerDiscovery.ConnectTarget> candidates, int ourTip) {
 
@@ -871,6 +971,32 @@ public class ChainSync {
             try {
                 PeerConnection conn = connectPeer(target);
                 if (conn == null) continue;
+
+                // FIX: connectedPeers previously accumulated a separate
+                // entry per connection attempt to the SAME ip, never
+                // cleaned up -- confirmed directly from the admin
+                // page's own Connected Peers table showing the same
+                // handful of IPs repeated many times over, each with a
+                // different (older) height snapshot. Root cause: this
+                // method is the fallback path used whenever
+                // pickPoolPeer() rejects every existing pool entry --
+                // which happens routinely, since pickPoolPeer() skips
+                // any pooled peer whose stale peerHeight snapshot has
+                // fallen behind our own (ever-growing) tip -- and
+                // unlike maintainOutboundPool(), which already checks
+                // for this, this method never checked whether the
+                // candidate it was about to connect to already had an
+                // entry sitting here. Closing that stale entry first
+                // (removing it via close()'s own connectedPeers.removeIf())
+                // turns every such reconnect into a genuine refresh --
+                // same IP, one live entry, an up-to-date height --
+                // instead of a second, permanently-stale duplicate.
+                for (PeerInfo existing : connectedPeers) {
+                    if (!existing.inbound() && existing.ip().equals(target.ip()) && existing.conn() != conn) {
+                        existing.conn().close();
+                        break; // ip is the (currency, ip) analogue of a unique key here -- there's only ever one stale entry to find
+                    }
+                }
 
                 maxPeerHeight = Math.max(maxPeerHeight, conn.peerHeight);
                 connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
@@ -1039,9 +1165,7 @@ public class ChainSync {
     }
 
     private static String toHex(byte[] b) {
-        StringBuilder sb = new StringBuilder();
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     // ── Header sync ───────────────────────────────────────────────────────────
@@ -1109,6 +1233,31 @@ public class ChainSync {
             List<byte[]> validHeaders = new ArrayList<>();
             for (byte[] h : headers) {
                 if (previousHeader != null && !HeaderUtil.chainsFrom(h, previousHeader)) {
+                    // DIAGNOSTIC (temporary, pending root-cause): every
+                    // real occurrence of this so far has been at a
+                    // height hundreds of thousands of blocks behind
+                    // every connected peer's own reported tip -- far
+                    // too deep into already-finalized history for a
+                    // genuine PoW-chain reorg (those are shallow, a
+                    // block or two, essentially never hundreds of
+                    // thousands deep), which points at a bug in this
+                    // project's own storage or locator logic rather
+                    // than an actual network-level disagreement. This
+                    // dumps exactly what our own chain-link check is
+                    // comparing, in full, so the next real occurrence
+                    // gives direct evidence instead of another
+                    // externally-unverifiable log line.
+                    System.out.printf("[ChainSync] CHAIN-LINK MISMATCH at height %d from %s:%n",
+                            tip + validHeaders.size() + 1, peer.ip);
+                    System.out.printf("[ChainSync]   our stored header at height %d: hash=%s%n",
+                            tip + validHeaders.size(), toHex(HeaderUtil.hash(previousHeader)));
+                    System.out.printf("[ChainSync]   our stored header raw bytes: %s%n",
+                            toHex(previousHeader));
+                    System.out.printf("[ChainSync]   incoming header's prevBlock field: %s%n",
+                            toHex(HeaderUtil.prevBlock(h)));
+                    System.out.printf("[ChainSync]   incoming header raw bytes: %s%n",
+                            toHex(h));
+                    confirmDisagreement(tip + validHeaders.size(), h, peer);
                     PeerScorecard.get().recordInvalidData(peer.ip,
                             "header at height " + (tip + validHeaders.size() + 1)
                                     + " doesn't chain from previous header");
@@ -2467,9 +2616,4 @@ public class ChainSync {
         return pos + 3;
     }
 
-    private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
-    }
 }

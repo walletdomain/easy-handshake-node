@@ -72,6 +72,23 @@ public class ChainDB {
     // ChainDB itself writes and what a recovery tool writes.
     static final String META_URKEL_LIVE_ROOT      = "urkel_live_root";
     static final String META_URKEL_COMMITTED_ROOT = "urkel_committed_root";
+    // FIX: UrkelNameTree.firstDeepCatchUpDeletionHeight was a plain,
+    // in-memory-only field, reset to -1 on every restart -- but the
+    // CONSEQUENCES of a deep-catch-up deletion (the actual tree state
+    // on disk) persist across restarts regardless. Confirmed directly
+    // from a real incident: the original session correctly identified
+    // a deletion at a specific height; a later restart (needed to pick
+    // up an unrelated fix) lost that in-memory context entirely, and
+    // UrkelTreeRecovery -- reading only the freshly-thrown exception's
+    // own captured value, which was -1 in the new session -- correctly
+    // but unhelpfully concluded there was no known, bounded explanation
+    // to recover from, even though the real, underlying cause was
+    // exactly the same as before. This key is what makes that
+    // knowledge survive a restart: see persistNameTreeStateTimed()
+    // (writes it, once, the first time it's ever set) and this
+    // constructor below (reads it back into the freshly-constructed
+    // UrkelNameTree before anything else can run).
+    static final String META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT = "first_deep_catchup_deletion_height";
     // NEW: resilience support -- see markCleanShutdown() and
     // checkAndClearCleanShutdownMarker()'s own comments for the full
     // design. Set only when the JVM shutdown hook actually runs to
@@ -154,6 +171,21 @@ public class ChainDB {
         long t0 = System.nanoTime();
         nameTree.persistBlock();
         meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
+
+        // See META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT's own comment --
+        // the moment this becomes known (persistBlock() just above is
+        // where UrkelNameTree's own reconciliation, and therefore any
+        // deep-catch-up deletion, actually happens), persist it
+        // immediately, once. meta.get() first rather than relying on
+        // put() being naturally idempotent: this only needs to WRITE
+        // once, ever, per database -- checking first avoids a
+        // pointless write on every single one of the many, many blocks
+        // processed after the one that actually set it.
+        if (nameTree.firstDeepCatchUpDeletionHeight() != -1
+                && meta.get(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT) == null) {
+            meta.put(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT,
+                    String.valueOf(nameTree.firstDeepCatchUpDeletionHeight()));
+        }
         long t1 = System.nanoTime();
 
         if (nameTree.maybeCommit(height, bestKnownPeerHeight)) {
@@ -227,6 +259,17 @@ public class ChainDB {
         byte[] persistedLiveRoot = fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT));
         byte[] persistedCommittedRoot = fromHexOrZero(meta.get(META_URKEL_COMMITTED_ROOT));
         this.nameTree = new UrkelNameTree(nodeStore, persistedLiveRoot, persistedCommittedRoot);
+
+        // See META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT's own comment --
+        // restores knowledge of a PAST session's deep-catch-up deletion
+        // (if any) into this freshly-constructed tree, before anything
+        // else has a chance to run, so a mismatch discovered in THIS
+        // session can still correctly attribute itself to a cause that
+        // actually happened in an earlier one.
+        String persistedDeletionHeight = meta.get(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT);
+        if (persistedDeletionHeight != null) {
+            nameTree.setFirstDeepCatchUpDeletionHeight(Integer.parseInt(persistedDeletionHeight));
+        }
     }
 
     public void close() {
@@ -324,6 +367,23 @@ public class ChainDB {
     /**
      * Stores a batch of raw headers starting at startHeight.
      * Caps storage at existingTip + 2016 to prevent fake header inflation.
+     * <p>
+     * FIX: this used to update hashIndex and advance newTip
+     * unconditionally, even for a height where headers.containsKey(h)
+     * was already true and the new header was therefore silently
+     * DISCARDED (headers.put() never ran). That meant the hash index
+     * and the reported tip could describe a header that was never
+     * actually the one stored at that height -- e.g. hashIndex would
+     * map the discarded header's hash to height h, while headers.get(h)
+     * still returned the original, different one. Now: an identical
+     * duplicate is a true no-op (skip everything, it's already correct);
+     * a DIFFERENT header already present at this height is logged
+     * loudly rather than silently discarded -- this should never happen
+     * under normal operation (insertHeaders is only ever called with
+     * startHeight one past our own confirmed tip, using data that was
+     * already chain-link-validated against what we currently have), so
+     * if it ever does, that's exactly the kind of signal worth seeing
+     * directly rather than papering over.
      */
     public void insertHeaders(List<byte[]> rawHeaders, int startHeight) {
         int existingTip = getHeaderTip();
@@ -338,9 +398,21 @@ public class ChainDB {
             long h = startHeight + i;
             if (h > maxHeight) break;
             byte[] header = rawHeaders.get(i);
-            if (!headers.containsKey(h)) {
+            byte[] existing = headers.get(h);
+            if (existing == null) {
                 headers.put(h, header);
+            } else if (!java.util.Arrays.equals(existing, header)) {
+                System.out.printf("[ChainDB] WARNING: height %d already has a DIFFERENT stored "
+                                + "header (existing hash=%s, incoming hash=%s) -- keeping the "
+                                + "existing one, not overwriting. This should not happen under "
+                                + "normal operation; worth investigating if it recurs.%n",
+                        h, hex(HeaderUtil.hash(existing)), hex(HeaderUtil.hash(header)));
+                continue; // keep the existing one -- don't touch hashIndex/newTip for this height
             }
+            // else: existing != null and byte-identical to the incoming
+            // header -- a genuine no-op duplicate, safe to fall through
+            // and re-affirm hashIndex/newTip exactly as if it were a
+            // fresh write, since it IS the same data either way.
             hashIndex.put(hex(HeaderUtil.hash(header)), h);
             newTip = (int) h;
         }
@@ -810,17 +882,12 @@ public class ChainDB {
 
     private static String hex(byte[] b) {
         if (b == null || b.length == 0) return "";
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     private static byte[] fromHex(String s) {
         if (s == null || s.isEmpty()) return new byte[0];
-        byte[] b = new byte[s.length() / 2];
-        for (int i = 0; i < b.length; i++)
-            b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-        return b;
+        return HexUtil.decode(s);
     }
 
     /** Like fromHex, but returns 32 zero bytes for null/empty rather

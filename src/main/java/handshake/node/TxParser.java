@@ -311,9 +311,7 @@ public class TxParser {
     // ── Utilities ─────────────────────────────────────────────────────────────
 
     private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     /** Reverses byte order and returns hex — converts wire format to display format. */

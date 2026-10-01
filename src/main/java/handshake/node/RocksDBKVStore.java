@@ -124,11 +124,38 @@ public class RocksDBKVStore implements KVStore {
      *  from the live process aren't visible without reopening, which is
      *  the correct, expected behavior for a diagnostic read, not a bug. */
     public RocksDBKVStore(String path, boolean readOnly) {
+        this(path, readOnly, -1L);
+    }
+
+    /** blockCacheBytesOverride: -1 means "auto-detect from total system
+     *  RAM" (detectSharedBlockCacheBytes() below) -- the right default
+     *  for this project's one long-lived chain database, where a large
+     *  cache pays for itself over the database's entire lifetime. Any
+     *  non-negative value bypasses detection entirely and uses exactly
+     *  that many bytes instead.
+     *
+     *  FIX: added specifically for DiskBackedHashKeySet, which opens a
+     *  brand-new RocksDBKVStore for every single reconciliation walk
+     *  (roughly every 360 blocks near the tip) purely as a throwaway,
+     *  single-cycle dedup set -- confirmed, directly from this
+     *  constructor's own pre-fix behavior, that each of those short-
+     *  lived instances was sizing its block cache the same way the
+     *  main chain database does: 10% of TOTAL SYSTEM RAM, up to a 4GB
+     *  ceiling, entirely native (off-heap) memory invisible to the
+     *  JVM's own -Xmx and to any heap-based monitoring. On a real run
+     *  that repeated this several hundred times over a long sync, this
+     *  was real, reported system memory pressure (a machine going
+     *  unusable) that never showed up in the JVM heap numbers being
+     *  watched, because it genuinely wasn't JVM heap. A small dedup set
+     *  gets no real benefit from a multi-gigabyte block cache sized for
+     *  a permanent database -- it just needs to survive one walk. */
+    public RocksDBKVStore(String path, boolean readOnly, long blockCacheBytesOverride) {
         RocksDB.loadLibrary();
         this.path = path;
         this.readOnly = readOnly;
         if (!readOnly) new File(path).mkdirs();
-        this.sharedBlockCache = new LRUCache(detectSharedBlockCacheBytes());
+        this.sharedBlockCache = new LRUCache(
+                blockCacheBytesOverride >= 0 ? blockCacheBytesOverride : detectSharedBlockCacheBytes());
 
         this.dbOptions = new DBOptions()
                 .setCreateIfMissing(!readOnly)

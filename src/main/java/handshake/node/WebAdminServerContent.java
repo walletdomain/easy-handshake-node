@@ -339,7 +339,7 @@ public final class WebAdminServerContent {
      * deliberate deviations like estimatefee taking no parameters at
      * all despite real hsd's version accepting one.
      */
-    private static final String RPC_METHODS_JS = """
+    static final String RPC_METHODS_JS = """
             const RPC_METHODS = {
               "addnode": { params: [
                 {name:"node", type:"string", required:true},

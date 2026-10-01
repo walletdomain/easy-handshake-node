@@ -1,6 +1,12 @@
 package handshake.node;
 
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -121,7 +127,7 @@ public class SeedDatabase {
         }
         this.seedsMap = db.seedsMap();
         loadFromDb();
-        bootstrapIfEmpty();
+        mergeFromResourceFile();
     }
 
     private void loadFromDb() {
@@ -147,36 +153,92 @@ public class SeedDatabase {
 
     // ── Bootstrap seeds ───────────────────────────────────────────────────────
     //
-    // Used ONLY to populate the "seeds" map on a genuinely fresh install
-    // (empty map, no existing config database carried over). Without this, a first-run
-    // validator would load zero seeds from an empty DB and have no way to ever
-    // discover its first peer -- ChainSync only dials from
-    // getBrontideSeeds(), and PeerDiscovery starts empty too. These are the
-    // same 10 real, verified entries recovered from a working config database
-    // (the 3 that database had explicitly marked "deleted:<ip>" -- found
-    // to be bad in production -- are deliberately excluded here too).
-    private static final List<Seed> BOOTSTRAP_SEEDS = List.of(
-            new Seed("ai7dgiwueiiwber6uhoeqfjdujxph6ueqpnaml36sicakngmnm3am", "103.152.197.114", 44806, "Nathan.Woodburn/3", true),
-            new Seed("aokj73pefmtrc7ikoxqiz4nrhgrxeqnnjpv4wxekteup33duneih2", "103.152.197.115", 44806, "Nathan.Woodburn/2", true),
-            new Seed("ajd6wzdp34c32rymlljybvbosnx75aty4rwmtpkxshvfrqufq6vuk", "103.152.197.116", 44806, "Nathan.Woodburn/1", true),
-            new Seed("aksygghkgmciomeldjf5sc6rs2sgn2m34zfdz4xr7z5vguqvjis4e", "129.153.177.220", 44806, "seed-4", true),
-            new Seed("am2lsmbzzxncaptqjo22jay3mztfwl33bxhkp7icfx7kmi5rvjaic", "139.162.183.168", 44806, "seed-5", true),
-            new Seed("apt4rf2dfyelbivg63u47wykvdjtsl4kxzfdylkaae5s5ydldlnwu", "159.69.46.23", 44806, "seed-3", true),
-            new Seed("aoihqqagbhzz6wxg43itefqvmgda4uwtky362p22kbimcyg5fdp54", "172.104.214.189", 44806, "seed-2", true),
-            new Seed("aiwykdz37okry3pb2lzdsgbxeg72uky2zckxmiapzstpqqmb2hnge", "35.154.209.88", 44806, "handshake-micro-grants", true),
-            new Seed("ap5vuwabzwyz6akhesanada4skhetd2jsvpkwuqxzuaoovn5ez4xg", "45.79.134.225", 44806, "seed-1", true),
-            new Seed("anbwqus4a45bwiztei62lf2jiurzbsakzm7z2oz4oqug3ea5i3sac", "74.208.31.75", 44806, "relay-validator", true)
-    );
+    // FIX: moved out of hardcoded Java (previously a BOOTSTRAP_SEEDS
+    // List.of(...) literal right here, requiring a recompile to add,
+    // remove, or fix a single seed -- e.g. dropping a seed that turns
+    // out to reliably fail its handshake, or shipping a newly found
+    // reliable one) and into seeds.txt on the classpath, following the
+    // exact same convention ReservedNames.java already uses for
+    // reserved_lockup.tsv: a plain, human-editable resource file loaded
+    // via getResourceAsStream(), failing loudly (not silently) if it's
+    // missing from the classpath.
+    //
+    // FIX: no longer only consulted on a genuinely fresh install (empty
+    // seeds map). Now merged in on EVERY startup, so that shipping an
+    // updated seeds.txt (fixing a bad entry, adding a new reliable one)
+    // actually reaches installs that have already run before, not just
+    // brand new ones. This merge is deliberately additive-only and
+    // respects everything this class already knows: an IP already
+    // present in the persistent seeds map is left completely untouched
+    // (whatever PeerScorecard/runtime discovery has learned about it
+    // stays exactly as it was), and an IP with a "deleted:<ip>"
+    // tombstone is never resurrected just because it's still listed in
+    // seeds.txt -- removing a seed is done by tombstoning it (or simply
+    // letting scoring back it off), never by editing this file, since a
+    // node that already knows better about a given IP shouldn't be
+    // overridden by the shipped defaults on its next restart.
+    private static List<Seed> loadSeedsFromResource() {
+        List<Seed> loaded = new ArrayList<>();
+        try (InputStream in = SeedDatabase.class.getResourceAsStream("/seeds.txt")) {
+            if (in == null) {
+                throw new IllegalStateException(
+                        "seeds.txt is missing from the classpath -- this project has no other "
+                                + "way to find its first peer on a fresh install. See SeedDatabase's "
+                                + "own class comment for where this file comes from and its format.");
+            }
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                String line;
+                int lineNum = 0;
+                while ((line = reader.readLine()) != null) {
+                    lineNum++;
+                    String trimmed = line.trim();
+                    if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                    String[] p = trimmed.split("\\|", -1);
+                    if (p.length < 4) {
+                        System.err.printf("[SeedDB] seeds.txt line %d malformed (expected "
+                                + "brontideKey|ip|port|label) -- skipping: %s%n", lineNum, line);
+                        continue;
+                    }
+                    String brontideKey = p[0].trim();
+                    String ip = p[1].trim();
+                    int port = Seed.parseIntSafe(p[2].trim(), 44806);
+                    String label = p[3].trim();
+                    if (brontideKey.isEmpty() || ip.isEmpty()) {
+                        System.err.printf("[SeedDB] seeds.txt line %d missing brontideKey or ip -- "
+                                + "skipping: %s%n", lineNum, line);
+                        continue;
+                    }
+                    loaded.add(new Seed(brontideKey, ip, port, label, true));
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load seeds.txt", e);
+        }
+        return loaded;
+    }
 
-    private void bootstrapIfEmpty() {
-        if (!seeds.isEmpty()) return;
-        System.out.println("[SeedDB] seeds map is empty (fresh install) -- populating "
-                + BOOTSTRAP_SEEDS.size() + " built-in bootstrap seeds.");
-        for (Seed seed : BOOTSTRAP_SEEDS) {
+    private void mergeFromResourceFile() {
+        List<Seed> fromFile = loadSeedsFromResource();
+        int added = 0, alreadyKnown = 0, tombstoned = 0;
+        for (Seed seed : fromFile) {
+            if (isDeleted(seed.ip())) {
+                tombstoned++;
+                continue;
+            }
+            if (isSeed(seed.ip())) {
+                alreadyKnown++;
+                continue;
+            }
             seeds.add(seed);
             seedsMap.put(seed.ip(), seed.toStorage());
+            added++;
         }
-        ConfigDB.get().commit();
+        if (added > 0) {
+            ConfigDB.get().commit();
+        }
+        System.out.printf("[SeedDB] seeds.txt: %d merged in, %d already known, %d tombstoned/skipped "
+                + "(%d total seeds now).%n", added, alreadyKnown, tombstoned, seeds.size());
     }
 
     // ── Public API ────────────────────────────────────────────────────────────

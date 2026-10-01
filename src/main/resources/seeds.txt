@@ -1,0 +1,39 @@
+# Handshake bootstrap seed nodes for this project.
+#
+# Loaded from the classpath by SeedDatabase (see its own class comment)
+# on every startup -- not just a first-ever run. Any line below whose IP
+# isn't already known to a node's persistent seed database, and hasn't
+# been explicitly tombstoned ("deleted:<ip>") by that node, gets merged
+# in as a builtin seed. Already-known IPs are left untouched (whatever
+# PeerScorecard/SeedDatabase has learned about them stays), and nothing
+# is ever removed from an existing install just because a line is
+# removed here -- removal happens only through the normal scoring/
+# tombstone mechanism, never by editing this file.
+#
+# Format (pipe-delimited, one seed per line):
+#   brontideKey|ip|port|label
+#
+# - brontideKey: base32-encoded compressed secp256k1 public key (33 bytes).
+#   Required -- this project is Brontide-only (see SeedDatabase's class
+#   comment for why).
+# - ip: IPv4 or IPv6 address.
+# - port: almost always 44806 (the standard Brontide P2P port).
+# - label: free-form human-readable name, used only for logging.
+#
+# Lines starting with # and blank lines are ignored.
+#
+# These are the same 10 real, verified entries this project has used
+# since it started recovering seed data from an earlier working config
+# database (3 known-bad entries that database had explicitly marked
+# "deleted:<ip>" are deliberately excluded here too).
+
+ai7dgiwueiiwber6uhoeqfjdujxph6ueqpnaml36sicakngmnm3am|103.152.197.114|44806|Nathan.Woodburn/3
+aokj73pefmtrc7ikoxqiz4nrhgrxeqnnjpv4wxekteup33duneih2|103.152.197.115|44806|Nathan.Woodburn/2
+ajd6wzdp34c32rymlljybvbosnx75aty4rwmtpkxshvfrqufq6vuk|103.152.197.116|44806|Nathan.Woodburn/1
+aksygghkgmciomeldjf5sc6rs2sgn2m34zfdz4xr7z5vguqvjis4e|129.153.177.220|44806|seed-4
+am2lsmbzzxncaptqjo22jay3mztfwl33bxhkp7icfx7kmi5rvjaic|139.162.183.168|44806|seed-5
+apt4rf2dfyelbivg63u47wykvdjtsl4kxzfdylkaae5s5ydldlnwu|159.69.46.23|44806|seed-3
+aoihqqagbhzz6wxg43itefqvmgda4uwtky362p22kbimcyg5fdp54|172.104.214.189|44806|seed-2
+aiwykdz37okry3pb2lzdsgbxeg72uky2zckxmiapzstpqqmb2hnge|35.154.209.88|44806|handshake-micro-grants
+ap5vuwabzwyz6akhesanada4skhetd2jsvpkwuqxzuaoovn5ez4xg|45.79.134.225|44806|seed-1
+anbwqus4a45bwiztei62lf2jiurzbsakzm7z2oz4oqug3ea5i3sac|74.208.31.75|44806|relay-validator

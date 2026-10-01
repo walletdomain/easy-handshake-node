@@ -60,16 +60,42 @@ public class UrkelTreeRecovery {
 
     private static final int SWAP_CHUNK_SIZE = 20_000;
 
+    // Resumability -- confirmed as a real, substantial cost without
+    // this: one real run lost 16 hours of progress (reaching block
+    // 160,000 of ~348,000) to exactly this, since the replay
+    // previously always deleted any existing scratch data and started
+    // over from genesis, every single invocation. These two keys,
+    // stored in the SCRATCH database's own meta map (never the real
+    // one), are what make resuming safe rather than just fast:
+    // SCRATCH_PROGRESS_HEIGHT_KEY records the last height whose tree
+    // data is durably committed, and SCRATCH_SAFE_HEIGHT_KEY records
+    // which safeHeight that progress was made under -- if a later
+    // invocation passes a DIFFERENT safeHeight (a changed
+    // knownDeletionHeight, or updated covenant-processing logic that
+    // would behave differently), the mismatch is caught and this
+    // falls back to starting fresh rather than resuming under a stale,
+    // no-longer-valid assumption.
+    private static final String SCRATCH_PROGRESS_HEIGHT_KEY = "scratch_replay_progress_height";
+    private static final String SCRATCH_SAFE_HEIGHT_KEY = "scratch_replay_safe_height";
+    // See BlockProcessor.computeCovenantLogicFingerprint()'s own
+    // comment for the full reasoning -- a real, previously-missing
+    // safeguard here specifically: this is production code the real
+    // node relies on for automatic recovery, so a resumed replay
+    // silently mixing progress computed under old covenant-processing
+    // logic with new logic applied from that point forward would have
+    // produced a result with no reliable meaning at all.
+    private static final String SCRATCH_LOGIC_FINGERPRINT_KEY = "scratch_replay_logic_fingerprint";
+
     public static RecoveryResult attemptRecovery(ChainDB realDb, String dataDir,
-                                                 UrkelTreeMismatchException cause,
+                                                 int firstDeepCatchUpDeletionHeight,
                                                  boolean uncleanShutdownDetected) {
         int safeHeight;
-        if (cause.firstDeepCatchUpDeletionHeight != -1) {
+        if (firstDeepCatchUpDeletionHeight != -1) {
             // Known, specific risky height -- roll back to just before
             // it, same strategy as the original design.
-            safeHeight = Math.max(0, cause.firstDeepCatchUpDeletionHeight - UrkelNameTree.TREE_INTERVAL);
+            safeHeight = Math.max(0, firstDeepCatchUpDeletionHeight - UrkelNameTree.TREE_INTERVAL);
             System.out.println("[UrkelTreeRecovery] Attempting automatic recovery. First deep-catch-up "
-                    + "deletion was at height " + cause.firstDeepCatchUpDeletionHeight + " -- rolling back "
+                    + "deletion was at height " + firstDeepCatchUpDeletionHeight + " -- rolling back "
                     + "to height " + safeHeight + " and replaying forward with the fully-validated walk "
                     + "forced on for the rest of the replay.");
         } else if (uncleanShutdownDetected) {
@@ -106,22 +132,94 @@ public class UrkelTreeRecovery {
 
         String scratchDir = dataDir + "-recovery-scratch";
         String scratchPath = scratchDir + File.separator + "chain.mv.db";
-        deleteDir(scratchDir);
+        // Fingerprints EVERY compiled class in the handshake.node
+        // package -- see computeCovenantLogicFingerprint()'s own
+        // comment for why this needs to cover the whole package, not
+        // a hand-picked list of "the classes that matter."
+        String currentFingerprint = BlockProcessor.computeCovenantLogicFingerprint();
+
+        // Look for a resumable prior attempt before deleting anything
+        // -- see this class's own SCRATCH_PROGRESS_HEIGHT_KEY comment
+        // for why this exists at all. Opens the existing scratch data
+        // (if any) just to read its marker keys, then closes it
+        // again -- the real replay below opens it fresh either way,
+        // so this is a small, one-time, negligible cost against a
+        // replay that runs for hours.
+        int resumeFromHeight = 0;
+        boolean resuming = false;
+        if (new File(scratchDir).exists()) {
+            ChainDB existingScratch = null;
+            try {
+                existingScratch = ChainDB.openScratch(scratchPath);
+                KVMap<String, String> existingMeta = existingScratch.metaMapForRecovery();
+                String storedSafeHeight = existingMeta.get(SCRATCH_SAFE_HEIGHT_KEY);
+                String storedProgress = existingMeta.get(SCRATCH_PROGRESS_HEIGHT_KEY);
+                String storedFingerprint = existingMeta.get(SCRATCH_LOGIC_FINGERPRINT_KEY);
+                if (storedProgress != null && storedFingerprint == null) {
+                    System.out.println("[UrkelTreeRecovery] Found prior progress, but it predates this "
+                            + "tool's own logic-fingerprint safeguard, so which covenant-processing logic "
+                            + "produced it can't be confirmed -- starting over from genesis rather than "
+                            + "risk silently mixing rule sets.");
+                } else if (storedProgress != null && !currentFingerprint.equals(storedFingerprint)) {
+                    System.out.println("[UrkelTreeRecovery] Found prior progress, but it was computed under "
+                            + "DIFFERENT covenant-processing logic (fingerprint " + storedFingerprint
+                            + " vs. current " + currentFingerprint + ") -- starting over from genesis "
+                            + "rather than silently mixing old and new rules across a resumed run.");
+                } else if (storedSafeHeight != null && storedProgress != null
+                        && Integer.parseInt(storedSafeHeight) == safeHeight) {
+                    int progress = Integer.parseInt(storedProgress);
+                    if (progress >= 0 && progress <= realTipHeight) {
+                        resumeFromHeight = progress + 1;
+                        resuming = true;
+                        System.out.println("[UrkelTreeRecovery] Found a resumable scratch replay from a "
+                                + "previous attempt, already durably progressed through height " + progress
+                                + " under the SAME covenant-processing logic -- resuming from "
+                                + resumeFromHeight + " instead of starting over from genesis.");
+                    }
+                }
+            } catch (Exception e) {
+                // Anything at all wrong with the existing scratch data
+                // -- unreadable, corrupted, missing markers from an
+                // older version of this tool -- falls safely back to
+                // starting fresh below. Never trust partial data this
+                // can't fully verify; a wasted few hours redoing work
+                // is a far better outcome than silently resuming from
+                // something subtly broken.
+                System.out.println("[UrkelTreeRecovery] An existing scratch replay exists but could not be "
+                        + "safely resumed (" + e.getMessage() + ") -- starting over from genesis instead.");
+            } finally {
+                if (existingScratch != null) existingScratch.close();
+            }
+        }
+
+        if (!resuming) {
+            deleteDir(scratchDir);
+        }
 
         ChainDB scratchDb = ChainDB.openScratch(scratchPath);
-        boolean phase2 = false;
+        // Recomputed correctly on resume, not just left false until the
+        // loop naturally reaches safeHeight again -- resuming partway
+        // through phase 2 must keep the fully-validated walk forced on
+        // from the very first height processed this run, exactly as it
+        // would have been if this were one continuous, uninterrupted
+        // replay.
+        boolean phase2 = resumeFromHeight > safeHeight;
 
         try {
             Method processNameCovenant = BlockProcessor.class.getDeclaredMethod(
                     "processNameCovenant", TxParser.Output.class, String.class, int.class, int.class,
-                    ChainDB.class);
+                    ChainDB.class, TxParser.Input.class);
             processNameCovenant.setAccessible(true);
+
+            Method serializeCovenant = BlockProcessor.class.getDeclaredMethod(
+                    "serializeCovenant", TxParser.Covenant.class);
+            serializeCovenant.setAccessible(true);
 
             Field commitIntervalField = ChainSync.class.getDeclaredField("BLOCK_COMMIT_INTERVAL");
             commitIntervalField.setAccessible(true);
             int commitInterval = commitIntervalField.getInt(null);
 
-            for (int height = 0; height <= realTipHeight; height++) {
+            for (int height = resumeFromHeight; height <= realTipHeight; height++) {
                 byte[] rawBlock = realDb.getBlock(height);
                 if (rawBlock == null) break;
 
@@ -144,10 +242,43 @@ public class UrkelTreeRecovery {
                 List<TxParser.ParsedTx> txs = BlockProcessor.parseBlockTxs(rawBlock);
                 for (TxParser.ParsedTx tx : txs) {
                     String txid = TxParser.computeTxid(tx.raw);
+                    if (txid == null) continue;
+                    TxParser.Input spentInput = tx.inputs.isEmpty() ? null : tx.inputs.get(0);
+
+                    // PERFORMANCE FIX: see UrkelDivergenceFinder's own
+                    // identical comment for the full reasoning -- this
+                    // previously saved a UTXO entry for EVERY output of
+                    // EVERY transaction in the entire chain (and
+                    // attempted a removal for every input), when
+                    // db.getUtxo() is only ever called from CLAIM's own
+                    // re-claim-value check, which can only ever resolve
+                    // to a PRIOR CLAIM's own output. Confirmed as the
+                    // dominant cost behind a real, measured slowdown.
+                    // The removal loop is dropped entirely, not just
+                    // narrowed: a UTXO's value never changes once
+                    // written, so a stale-but-present entry for an
+                    // already-spent claim output cannot produce a wrong
+                    // answer, and a later re-claim looks up the NEW
+                    // owner's own outpoint, never the old one.
                     for (int i = 0; i < tx.outputs.size(); i++) {
                         TxParser.Output out = tx.outputs.get(i);
+
+                        if (out.covenant != null && out.covenant.type == TxParser.COV_CLAIM) {
+                            byte[] covData = (byte[]) serializeCovenant.invoke(null, out.covenant);
+                            ChainDB.UtxoEntry utxo = new ChainDB.UtxoEntry(
+                                    out.value,
+                                    out.addrVersion,
+                                    out.addrHash,
+                                    out.covenant.type,
+                                    covData,
+                                    spentInput == null || spentInput.isCoinbase(),
+                                    height
+                            );
+                            scratchDb.saveUtxo(txid, i, utxo);
+                        }
+
                         if (out.covenant != null && out.covenant.type != 0) {
-                            processNameCovenant.invoke(null, out, txid, i, height, scratchDb);
+                            processNameCovenant.invoke(null, out, txid, i, height, scratchDb, spentInput);
                         }
                     }
                 }
@@ -160,8 +291,52 @@ public class UrkelTreeRecovery {
                 scratchDb.persistNameTreeStateTimed(height, bestKnownPeerHeight);
 
                 if (height % commitInterval == 0 && height > 0) {
+                    // Progress marker written BEFORE commit(), not
+                    // after -- so the SAME commit() call that durably
+                    // persists this height's tree data also durably
+                    // persists the marker describing it, atomically.
+                    // Writing it after would leave a real window where
+                    // a kill could lose the marker even though the
+                    // data it should have pointed to was already safe
+                    // on disk, silently discarding otherwise-resumable
+                    // progress right back to the exact problem this
+                    // whole mechanism exists to fix.
+                    KVMap<String, String> scratchMeta = scratchDb.metaMapForRecovery();
+                    scratchMeta.put(SCRATCH_PROGRESS_HEIGHT_KEY, String.valueOf(height));
+                    scratchMeta.put(SCRATCH_SAFE_HEIGHT_KEY, String.valueOf(safeHeight));
+                    scratchMeta.put(SCRATCH_LOGIC_FINGERPRINT_KEY, currentFingerprint);
                     scratchDb.commit();
                     scratchDb.compact(1000);
+
+                    // SAFETY NET: see UrkelDivergenceFinder's own
+                    // identical comment for the full reasoning. Checked
+                    // right after this commit, not before, so whatever
+                    // exit this triggers always leaves a genuinely
+                    // resumable checkpoint behind.
+                    long usableBytes = new File(scratchDir).getUsableSpace();
+                    long minSafeBytes = 10L * 1024 * 1024 * 1024;
+                    if (usableBytes < minSafeBytes) {
+                        // return, not System.exit() -- this method's
+                        // real caller (attemptRecovery(), returning
+                        // RecoveryResult) is the one Main's own startup
+                        // path checks .success on before deciding
+                        // whether to allow sync to proceed at all; a
+                        // bare System.exit() here would skip that
+                        // decision entirely when this runs as part of
+                        // production startup recovery, not just as a
+                        // standalone tool.
+                        String message = String.format(
+                                "Stopped due to low disk space: only %.1f GB free on the volume holding "
+                                        + "the scratch database (below the %.0f GB safety margin) -- stopped "
+                                        + "right after a durable commit at height %d, rather than risk an "
+                                        + "uncontrolled write failure. This height's progress is safely "
+                                        + "saved; free up disk space and rerun to resume from here.",
+                                usableBytes / (1024.0 * 1024 * 1024), minSafeBytes / (1024.0 * 1024 * 1024),
+                                height);
+                        System.out.println();
+                        System.out.println("[UrkelTreeRecovery] " + message);
+                        return new RecoveryResult(false, message);
+                    }
                 }
 
                 if (height % 5000 == 0) {
@@ -268,9 +443,7 @@ public class UrkelTreeRecovery {
     }
 
     static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder();
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
+        return HexUtil.encode(b);
     }
 
     static void deleteDir(String path) {

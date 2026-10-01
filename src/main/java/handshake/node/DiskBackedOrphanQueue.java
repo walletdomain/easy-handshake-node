@@ -24,27 +24,27 @@ package handshake.node;
  *  constrained 247MB heap (this project's real target machines run
  *  4048MB+), completed cleanly using 11MB.
  *
- *  Implements Set<HashKey> -- extends AbstractSet, same base class
- *  DiskBackedHashKeySet already uses -- specifically so this is a
- *  drop-in replacement for accumulatedOrphanCandidates wherever it's
- *  referenced, including UrkelTree's own, already-verified unorphan-
- *  resurrection safeguard (registerExternalPendingRemovalSet(), which
- *  requires a real Set<HashKey> and genuinely calls remove(key) on it
- *  -- not just contains() -- when a pending-removal candidate gets
- *  reused before its actual deletion). That's why entries are keyed by
- *  their own hex-encoded hash bytes here, not by an insertion-order
- *  sequence number the way an obvious first attempt at this might do
- *  it: remove(Object) needs to be a direct, O(1)-ish RocksDB key
- *  lookup, not a scan through however many hundreds of thousands of
- *  entries are currently queued to find a match. The cost is giving up
- *  FIFO ordering -- takeUpTo() below returns whatever RocksDB's own
- *  natural (hash-lexicographic) key order happens to produce, not
- *  strictly the oldest entries first. That's a deliberate, low-cost
- *  trade: no correctness requirement anywhere in this system depends
- *  on removal order -- every tracked candidate here already passed
- *  orphan()'s own persisted-and-superseded check and the two-
- *  generation delay in advanceOrphanGeneration(), so any of them is
- *  equally safe to take whenever a drain cycle reaches it.
+ *  Implements Set<HashKey> -- extends the same DiskBackedHashKeyStoreBase
+ *  that DiskBackedHashKeySet does -- specifically so this is a drop-in
+ *  replacement for accumulatedOrphanCandidates wherever it's referenced,
+ *  including UrkelTree's own, already-verified unorphan-resurrection
+ *  safeguard (registerExternalPendingRemovalSet(), which requires a real
+ *  Set<HashKey> and genuinely calls remove(key) on it -- not just
+ *  contains() -- when a pending-removal candidate gets reused before its
+ *  actual deletion). That's why entries are keyed by their own
+ *  hex-encoded hash bytes here, not by an insertion-order sequence
+ *  number the way an obvious first attempt at this might do it:
+ *  remove(Object) needs to be a direct, O(1)-ish RocksDB key lookup, not
+ *  a scan through however many hundreds of thousands of entries are
+ *  currently queued to find a match. The cost is giving up FIFO
+ *  ordering -- takeUpTo() below returns whatever RocksDB's own natural
+ *  (hash-lexicographic) key order happens to produce, not strictly the
+ *  oldest entries first. That's a deliberate, low-cost trade: no
+ *  correctness requirement anywhere in this system depends on removal
+ *  order -- every tracked candidate here already passed orphan()'s own
+ *  persisted-and-superseded check and the two-generation delay in
+ *  advanceOrphanGeneration(), so any of them is equally safe to take
+ *  whenever a drain cycle reaches it.
  *
  *  Every candidate here being disposable is also what makes this queue
  *  itself safe to be fully ephemeral: losing its contents entirely (a
@@ -54,7 +54,12 @@ package handshake.node;
  *  rediscovers them as orphans again through the ordinary
  *  insert()/remove() path. Created fresh, in the OS's own temp
  *  directory, each time the process starts -- never restored from a
- *  previous run, wiped on close().
+ *  previous run, wiped on close(). Unlike DiskBackedHashKeySet, this
+ *  queue keeps RocksDBKVStore's normal auto-detected block-cache sizing
+ *  (no override) -- it's a single, whole-process-lifetime instance, not
+ *  something freshly opened every reconciliation cycle, so the repeated-
+ *  allocation native-memory concern that motivates DiskBackedHashKeySet's
+ *  own override doesn't apply here the same way.
  *
  *  Single-threaded access only, by design, not merely by convention.
  *  Confirmed directly: accumulatedOrphanCandidates (what this
@@ -68,31 +73,10 @@ package handshake.node;
  *
  *  Deliberately does NOT support iteration -- see iterator()'s own
  *  comment. */
-final class DiskBackedOrphanQueue extends java.util.AbstractSet<UrkelNodeStore.HashKey> implements AutoCloseable {
-    private static final byte[] MARKER = new byte[0];
-
-    private final java.nio.file.Path scratchDir;
-    private final RocksDBKVStore store;
-    private final KVMap<String, byte[]> map;
-    private int size = 0;
+final class DiskBackedOrphanQueue extends DiskBackedHashKeyStoreBase {
 
     DiskBackedOrphanQueue() {
-        try {
-            this.scratchDir = java.nio.file.Files.createTempDirectory("urkel-orphan-queue-");
-        } catch (java.io.IOException e) {
-            throw new RuntimeException("Could not create a scratch directory for the orphan backlog queue", e);
-        }
-        this.store = new RocksDBKVStore(scratchDir.toString());
-        this.map = store.openStringBytesMap("queue");
-    }
-
-    @Override
-    public boolean add(UrkelNodeStore.HashKey key) {
-        String hexKey = hex(key.bytes);
-        if (map.containsKey(hexKey)) return false;
-        map.put(hexKey, MARKER);
-        size++;
-        return true;
+        super("urkel-orphan-queue-", "queue", null);
     }
 
     /** The specific operation UrkelTree's unorphan-resurrection
@@ -102,7 +86,7 @@ final class DiskBackedOrphanQueue extends java.util.AbstractSet<UrkelNodeStore.H
     @Override
     public boolean remove(Object o) {
         if (!(o instanceof UrkelNodeStore.HashKey key)) return false;
-        String hexKey = hex(key.bytes);
+        String hexKey = HexUtil.encode(key.bytes);
         // FIX: RocksDBKVMap.remove() always returns null unconditionally
         // (confirmed directly, in its own comment -- a deliberate choice
         // elsewhere in this codebase, not a bug there, but it means this
@@ -113,17 +97,6 @@ final class DiskBackedOrphanQueue extends java.util.AbstractSet<UrkelNodeStore.H
         map.remove(hexKey);
         size--;
         return true;
-    }
-
-    @Override
-    public boolean contains(Object o) {
-        if (!(o instanceof UrkelNodeStore.HashKey key)) return false;
-        return map.containsKey(hex(key.bytes));
-    }
-
-    @Override
-    public int size() {
-        return size;
     }
 
     /** Removes and returns up to n entries -- NOT strictly the oldest
@@ -157,7 +130,7 @@ final class DiskBackedOrphanQueue extends java.util.AbstractSet<UrkelNodeStore.H
 
         java.util.Set<UrkelNodeStore.HashKey> result = new java.util.HashSet<>(keysToTake.size() * 2);
         for (String hexKey : keysToTake) {
-            result.add(new UrkelNodeStore.HashKey(fromHex(hexKey)));
+            result.add(new UrkelNodeStore.HashKey(HexUtil.decode(hexKey)));
         }
         map.removeAll(keysToTake);
         size -= keysToTake.size();
@@ -206,37 +179,6 @@ final class DiskBackedOrphanQueue extends java.util.AbstractSet<UrkelNodeStore.H
     @Override
     public int hashCode() {
         return System.identityHashCode(this);
-    }
-
-    @Override
-    public void close() {
-        store.close();
-        deleteRecursive(scratchDir.toFile());
-    }
-
-    private static void deleteRecursive(java.io.File dir) {
-        java.io.File[] files = dir.listFiles();
-        if (files != null) {
-            for (java.io.File f : files) {
-                if (f.isDirectory()) deleteRecursive(f);
-                else f.delete();
-            }
-        }
-        dir.delete();
-    }
-
-    private static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) sb.append(String.format("%02x", x));
-        return sb.toString();
-    }
-
-    private static byte[] fromHex(String s) {
-        byte[] b = new byte[s.length() / 2];
-        for (int i = 0; i < b.length; i++) {
-            b[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-        }
-        return b;
     }
 
     /** Thrown purely as a fast, deliberate exit from forEachKey()'s
