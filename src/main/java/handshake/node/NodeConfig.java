@@ -1,5 +1,8 @@
 package handshake.node;
 
+import handshake.node.storage.ConfigDB;
+import handshake.node.storage.KVMap;
+
 /**
  * NodeConfig — configuration management for the Handshake validator validator.
  * <p>

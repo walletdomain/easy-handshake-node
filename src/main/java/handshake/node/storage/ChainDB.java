@@ -1,0 +1,1072 @@
+package handshake.node.storage;
+
+import java.io.File;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+
+// RE-ARCHITECTURE: added when ChainDB moved into its own storage
+// subpackage -- these four were previously same-package, zero-import
+// references (see handshake.node.storage's own package comment for the
+// full reasoning behind this split).
+import handshake.node.util.HexUtil;
+import handshake.node.chain.HeaderUtil;
+import handshake.node.urkeltree.UrkelNodeStore;
+import handshake.node.urkeltree.UrkelNameTree;
+
+/**
+ * ChainDB — persistent storage for the Handshake validator validator.
+ * <p>
+ * Stores:
+ *   headers    height(long)             → raw 236-byte header
+ *   blocks     height(long)             → raw block bytes
+ *   chainwork  height(long)             → cumulative chainwork (32 bytes)
+ *   utxos      txid+index(36 raw bytes) → serialized UtxoEntry
+ *   names      nameHash(32 raw bytes)   → serialized NameEntry
+ *   hashIndex  blockHash(32 raw bytes)  → height(long)
+ *   urkelNodes nodeHash(32 raw bytes)   → encoded Urkel tree node
+ *   meta       key(String)              → value(String)
+ *   peers      ip(String)               → serialized PeerEntry
+ * <p>
+ * FIX: this comment used to say "All maps use MVStore" -- stale on two
+ * counts, independently: storage moved from MVStore to RocksDB (see this
+ * class's own constructor comment), and utxos/names/hashIndex/urkelNodes
+ * moved from hex-string keys to raw bytes (see
+ * META_STORAGE_FORMAT_VERSION's own comment). All maps use RocksDB, via
+ * the KVStore/KVMap interfaces, for crash-safe, compressed persistence.
+ * No wallet data is stored here — the wallet app has its own DB.
+ */
+public class ChainDB {
+
+    // ── Singleton ─────────────────────────────────────────────────────────────
+
+    private static volatile ChainDB instance;
+
+    public static ChainDB open(String path) {
+        if (instance == null) {
+            synchronized (ChainDB.class) {
+                if (instance == null) instance = new ChainDB(path);
+            }
+        }
+        return instance;
+    }
+
+    /** NEW: self-healing support. A second, deliberately separate way
+     *  to construct a ChainDB, for UrkelTreeRecovery's scratch replay
+     *  specifically -- never touches the static `instance` field at
+     *  all, unlike open(). That distinction matters here in a way it
+     *  didn't for this project's earlier standalone diagnostic tools:
+     *  those always ran as a completely separate process, so briefly
+     *  nulling `instance` to open a second ChainDB was harmless. This
+     *  runs inside the SAME live JVM process as the real, already-open
+     *  node -- nulling `instance` here, even briefly, would be a real,
+     *  latent risk for anything that might ever call ChainDB.get()
+     *  while a recovery replay is in progress (confirmed nothing does
+     *  today, but that's not something safe to keep relying on for
+     *  something this consequential). This sidesteps the question
+     *  entirely: the real db's `instance` reference is never touched,
+     *  so it stays exactly as valid throughout a recovery attempt as
+     *  it would be if no recovery were happening at all. */
+    public static ChainDB openScratch(String path) {
+        return new ChainDB(path);
+    }
+
+    public static ChainDB get() {
+        if (instance == null) throw new IllegalStateException("ChainDB not opened");
+        return instance;
+    }
+
+    // ── Meta keys ─────────────────────────────────────────────────────────────
+
+    private static final String META_HEADER_TIP    = "header_tip";
+    private static final String META_BLOCK_TIP     = "block_tip";
+    private static final String META_GENESIS_HASH  = "genesis_hash";
+    // FIX: originally package-visible, not private -- UrkelTreeRecovery
+    // (same package at the time) needs to write these same two keys
+    // directly as part of its atomic swap, and referencing the exact
+    // same constants here rules out any chance of a typo-based mismatch
+    // between what ChainDB itself writes and what a recovery tool
+    // writes.
+    //
+    // RE-ARCHITECTURE: widened further, to public, as part of the
+    // handshake.node.storage split (package-reorg-plan.md, Phase 1) --
+    // UrkelTreeRecovery stays outside this package, so package-private
+    // visibility alone no longer reaches it.
+    public static final String META_URKEL_LIVE_ROOT      = "urkel_live_root";
+    public static final String META_URKEL_COMMITTED_ROOT = "urkel_committed_root";
+    // FIX: UrkelNameTree.firstDeepCatchUpDeletionHeight was a plain,
+    // in-memory-only field, reset to -1 on every restart -- but the
+    // CONSEQUENCES of a deep-catch-up deletion (the actual tree state
+    // on disk) persist across restarts regardless. Confirmed directly
+    // from a real incident: the original session correctly identified
+    // a deletion at a specific height; a later restart (needed to pick
+    // up an unrelated fix) lost that in-memory context entirely, and
+    // UrkelTreeRecovery -- reading only the freshly-thrown exception's
+    // own captured value, which was -1 in the new session -- correctly
+    // but unhelpfully concluded there was no known, bounded explanation
+    // to recover from, even though the real, underlying cause was
+    // exactly the same as before. This key is what makes that
+    // knowledge survive a restart: see persistNameTreeStateTimed()
+    // (writes it, once, the first time it's ever set) and this
+    // constructor below (reads it back into the freshly-constructed
+    // UrkelNameTree before anything else can run).
+    static final String META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT = "first_deep_catchup_deletion_height";
+    // NEW: resilience support -- see markCleanShutdown() and
+    // checkAndClearCleanShutdownMarker()'s own comments for the full
+    // design. Set only when the JVM shutdown hook actually runs to
+    // completion (confirmed: this never happens on a power loss,
+    // kill -9, or crash -- only on normal exit or SIGTERM/Ctrl+C),
+    // meaning its absence at the next startup is a genuine, reliable
+    // signal that the previous run did not exit cleanly.
+    static final String META_CLEAN_SHUTDOWN = "clean_shutdown";
+
+    // RE-ARCHITECTURE: byte-keyed storage change -- urkelNodes/hashIndex/
+    // names now store raw hash bytes as keys instead of 64-character hex
+    // strings (see KVStore.openBytesBytesMap()'s own comment for why).
+    // There is no live-migration path for existing data -- the person is
+    // expected to delete the data directory and resync from genesis
+    // instead (acceptable for this project pre-production; see this
+    // constructor's own storage-format check below for the real risk
+    // this specific approach introduces and how it's guarded against).
+    //
+    // "1" (implicit -- no database ever actually wrote this value, since
+    // the marker didn't exist yet) means the old hex-string-keyed format.
+    // "2" is the current, byte-keyed format. Bump this again, in the
+    // same spirit, for any FUTURE on-disk key/value format change this
+    // project makes a similar "just delete and resync" decision about,
+    // rather than inventing a parallel mechanism each time.
+    static final String META_STORAGE_FORMAT_VERSION = "storage_format_version";
+    static final String CURRENT_STORAGE_FORMAT_VERSION = "2";
+
+    // ── Storage ───────────────────────────────────────────────────────────────
+
+    private final KVStore                  store;
+    private final String                   dataDir;
+    private final KVMap<Long,   byte[]>    headers;
+    private final KVMap<Long,   byte[]>    blocks;
+    private final KVMap<Long,   byte[]>    chainwork;
+    // RE-ARCHITECTURE: utxos/names/hashIndex/urkelNodes all moved from
+    // hex-string keys to raw bytes -- see KVStore.openBytesBytesMap()'s
+    // own comment and META_STORAGE_FORMAT_VERSION's own comment for why.
+    // utxos is keyed by a 36-byte fixed-width encoding (32-byte txid +
+    // 4-byte big-endian index), not a pure hash -- see utxoKey()'s own
+    // comment.
+    private final KVMap<byte[], String>    utxos;
+    private final KVMap<byte[], String>    names;
+    private final KVMap<String, String>    meta;
+    private final KVMap<String, String>    peers;
+    /** Real header hash -> height. Needed to resolve a peer's GETHEADERS
+     *  locator to a height without a linear scan over the whole chain
+     *  (which would be up to 32 locator hashes x hundreds of thousands
+     *  of headers per request). */
+    private final KVMap<byte[], Long>      hashIndex;
+    /** Content-addressed Urkel tree node storage -- see UrkelNodeStore. */
+    private final KVMap<byte[], byte[]>    urkelNodes;
+
+    /** The Urkel name tree, tracking every name's tree-committed state
+     *  across blocks -- now persisted to disk (via urkelNodes) after
+     *  every block, not just at commit boundaries; see UrkelNameTree's
+     *  own class comment for why every-block persistence specifically
+     *  is what's needed for correctness across a restart. */
+    private final UrkelNameTree nameTree;
+
+    public UrkelNameTree getNameTree() { return nameTree; }
+
+    /** NEW: self-healing support. Direct, surgical access to the Urkel
+     *  tree's own node storage and the two meta keys that designate
+     *  which root is "official" -- used ONLY by UrkelTreeRecovery, to
+     *  perform the safe, atomic swap after an independently-verified
+     *  recovery replay (see that class's own comment for the full
+     *  design). A named, explicit method rather than reflection-based
+     *  private-field access, deliberately, given the consequence of
+     *  getting this wrong -- this should be easy to find and audit,
+     *  not something that has to be discovered by reading bytecode. */
+    public KVMap<byte[], byte[]> urkelNodesMapForRecovery() { return urkelNodes; }
+    public KVMap<String, String> metaMapForRecovery() { return meta; }
+
+    /** Result of persistNameTreeState()'s two conceptually distinct
+     *  phases, split out specifically to answer a real question: when
+     *  "persist" dominates per-block timing, is it the per-block
+     *  write-new-nodes walk (persistBlockNanos), or the commit/prune-
+     *  submission step (maybeCommitNanos) -- which should be near-
+     *  instant now that the prune itself runs on its own background
+     *  thread, not inline here. */
+    public record PersistTiming(long persistBlockNanos, long maybeCommitNanos) {}
+
+    /** Convenience overload -- bestKnownPeerHeight=0 (unknown), which
+     *  UrkelNameTree.maybeCommit() treats the same safe way
+     *  BlockProcessor's own signature-verification skip does: unknown
+     *  means "assume we're at/near the tip," normal frequent pruning,
+     *  never the reduced-during-catchup schedule. Real production code
+     *  always goes through the overload below instead, which passes
+     *  the real value through from ChainSync; this one exists mainly
+     *  so tests and tools that don't have (or need) a real peer-height
+     *  value don't have to fabricate one. */
+    public void persistNameTreeState(int height) {
+        persistNameTreeState(height, 0);
+    }
+
+    public void persistNameTreeState(int height, int bestKnownPeerHeight) {
+        persistNameTreeStateTimed(height, bestKnownPeerHeight);
+    }
+
+    /** Same as persistNameTreeState(), but returns a breakdown of
+     *  where the time actually went -- see PersistTiming's own comment
+     *  for why this distinction matters. */
+    public PersistTiming persistNameTreeStateTimed(int height, int bestKnownPeerHeight) {
+        long t0 = System.nanoTime();
+        nameTree.persistBlock();
+        meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
+
+        // See META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT's own comment --
+        // the moment this becomes known (persistBlock() just above is
+        // where UrkelNameTree's own reconciliation, and therefore any
+        // deep-catch-up deletion, actually happens), persist it
+        // immediately, once. meta.get() first rather than relying on
+        // put() being naturally idempotent: this only needs to WRITE
+        // once, ever, per database -- checking first avoids a
+        // pointless write on every single one of the many, many blocks
+        // processed after the one that actually set it.
+        if (nameTree.firstDeepCatchUpDeletionHeight() != -1
+                && meta.get(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT) == null) {
+            meta.put(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT,
+                    String.valueOf(nameTree.firstDeepCatchUpDeletionHeight()));
+        }
+        long t1 = System.nanoTime();
+
+        if (nameTree.maybeCommit(height, bestKnownPeerHeight)) {
+            meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
+        }
+        long t2 = System.nanoTime();
+
+        return new PersistTiming(t1 - t0, t2 - t1);
+    }
+
+    private ChainDB(String path) {
+        this(path, false);
+    }
+
+    /** readOnly=true is for standalone diagnostic tools specifically --
+     *  confirmed safe, via a real compile-and-run test against the
+     *  actual RocksDB API, to open even while the real, live node is
+     *  running and actively writing to the SAME database: RocksDB's
+     *  single-writer lock only applies to read-write handles, and its
+     *  dedicated read-only mode exists precisely so a separate tool can
+     *  inspect a live database's current state without needing the
+     *  running node to be stopped first. Deliberately does NOT touch
+     *  the instance singleton field at all -- this returns a fresh,
+     *  independent object, so a diagnostic tool using this can never
+     *  collide with, or accidentally substitute for, the real node's
+     *  own ChainDB.open()/get() singleton if it happens to run in the
+     *  same process for any reason. */
+    public static ChainDB openReadOnly(String path) {
+        return new ChainDB(path, true);
+    }
+
+    private ChainDB(String path, boolean readOnly) {
+        // Switched from MVStoreKVStore to RocksDBKVStore -- see
+        // RocksDBKVStore's own class comment, and RocksDBKVMap's
+        // runExclusiveOfCompaction() comment specifically, for the
+        // full reasoning: MVStore's B-tree/chunk-based design meant a
+        // long-running reachability walk could have the exact chunk
+        // it was reading physically reorganized out from under it by
+        // concurrent compaction, a real, repeatedly observed failure
+        // ("Chunk ... not found") that survived three different,
+        // progressively more targeted attempts to fix within MVStore's
+        // own concurrency model. RocksDB's LSM-tree design and native
+        // snapshot isolation eliminate that entire class of problem
+        // structurally, confirmed directly via a real compile-and-run
+        // test against the actual RocksDB API, not just by reasoning
+        // about it. This one line is deliberately the only place that
+        // concrete choice is made -- everything else in this class,
+        // and every one of its own callers, goes through the
+        // KVStore/KVMap interfaces and needed zero other changes.
+        this.store = new RocksDBKVStore(path, readOnly);
+        this.dataDir = path;
+
+        /** NEW: exposes the directory this database lives in, so code
+         *  that only has a ChainDB reference (not the original config
+         *  or path string) -- e.g. BlockProcessor's mismatch handling --
+         *  can still write to a plain log file alongside it, without
+         *  needing that path threaded through every intervening method
+         *  signature. */
+
+        this.headers   = store.openLongBytesMap("headers");
+        this.blocks    = store.openLongBytesMap("blocks");
+        this.chainwork = store.openLongBytesMap("chainwork");
+        this.meta      = store.openStringStringMap("meta");
+        this.peers     = store.openStringStringMap("peers");
+
+        // FIX: storage-format safety guard, specific to the byte-keyed
+        // storage change's "delete and resync from genesis" approach
+        // (see META_STORAGE_FORMAT_VERSION's own comment). Without a
+        // live migration, the real risk this approach introduces is the
+        // new, byte[]-key-expecting code accidentally being pointed at
+        // an OLD, hex-string-keyed database -- a leftover data
+        // directory, an old backup, the wrong jar run by mistake. That
+        // would never crash loudly on its own: a hex string's UTF-8
+        // bytes would just be silently treated as if they were already
+        // the raw 32-byte hash, meaning every lookup against urkelNodes/
+        // hashIndex/names would simply miss (wrong key bytes) rather
+        // than throw -- indistinguishable, from the outside, from a
+        // corrupted database. Checked and stamped here, before
+        // urkelNodes/hashIndex/names are even opened below, so this
+        // can never run against a mismatched format.
+        String storedFormatVersion = meta.get(META_STORAGE_FORMAT_VERSION);
+        if (storedFormatVersion == null) {
+            if (meta.size() == 0) {
+                // Genuinely fresh database (meta always gains other
+                // entries, e.g. META_GENESIS_HASH, very early in any
+                // real sync -- an empty meta map is a reliable signal
+                // this is brand new, not just missing this one key).
+                if (!readOnly) {
+                    meta.put(META_STORAGE_FORMAT_VERSION, CURRENT_STORAGE_FORMAT_VERSION);
+                }
+                // A read-only open (a diagnostic tool) against a
+                // genuinely empty database has nothing to misinterpret
+                // and nothing worth stamping -- just proceed.
+            } else {
+                throw new IllegalStateException(
+                        "This database was created by a version of this software that "
+                                + "predates the byte-keyed storage change -- it still uses the "
+                                + "old 64-character-hex-string key format, and this build expects "
+                                + "storage format " + CURRENT_STORAGE_FORMAT_VERSION + " (raw-byte "
+                                + "keys). There is no automatic migration: delete this data "
+                                + "directory and let the node resync from genesis to use this "
+                                + "build, or run the matching older build against this existing "
+                                + "database instead.");
+            }
+        } else if (!storedFormatVersion.equals(CURRENT_STORAGE_FORMAT_VERSION)) {
+            throw new IllegalStateException(
+                    "Storage format mismatch: this database is format " + storedFormatVersion
+                            + ", but this build expects format " + CURRENT_STORAGE_FORMAT_VERSION
+                            + ". Delete this data directory and let the node resync from genesis "
+                            + "to use this build, or run the matching older build against this "
+                            + "existing database instead.");
+        }
+
+        this.utxos     = store.openBytesStringMap("utxos");
+        this.names     = store.openBytesStringMap("names");
+        this.hashIndex = store.openBytesLongMap("hashIndex");
+        this.urkelNodes = store.openBytesBytesMap("urkelNodes");
+
+        UrkelNodeStore nodeStore = new UrkelNodeStore(urkelNodes);
+        byte[] persistedLiveRoot = fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT));
+        byte[] persistedCommittedRoot = fromHexOrZero(meta.get(META_URKEL_COMMITTED_ROOT));
+        this.nameTree = new UrkelNameTree(nodeStore, persistedLiveRoot, persistedCommittedRoot);
+
+        // See META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT's own comment --
+        // restores knowledge of a PAST session's deep-catch-up deletion
+        // (if any) into this freshly-constructed tree, before anything
+        // else has a chance to run, so a mismatch discovered in THIS
+        // session can still correctly attribute itself to a cause that
+        // actually happened in an earlier one.
+        String persistedDeletionHeight = meta.get(META_FIRST_DEEP_CATCHUP_DELETION_HEIGHT);
+        if (persistedDeletionHeight != null) {
+            nameTree.setFirstDeepCatchUpDeletionHeight(Integer.parseInt(persistedDeletionHeight));
+        }
+    }
+
+    public void close() {
+        // FIX: must wait for any in-progress background prune to
+        // actually finish BEFORE closing the underlying store --
+        // confirmed via a real, caught MVStoreException that a prune
+        // still running past this point hits when the file it's
+        // reading from gets closed out from under it. See
+        // UrkelNameTree.shutdownPruning()'s own comment for the full
+        // reasoning.
+        if (nameTree != null) {
+            nameTree.shutdownPruning();
+        }
+        store.close();
+    }
+
+    // ── Commit ────────────────────────────────────────────────────────────────
+
+    public String getDataDir() {
+        return dataDir;
+    }
+
+    public void commit() {
+        // FIX: wait for any in-flight background reconciliation to
+        // finish before flushing -- otherwise a commit can declare a
+        // height "safely durable" while a background removal is still
+        // mid-flight, writing to the SAME underlying database on a
+        // different thread. Those writes wouldn't be covered by this
+        // flush if they happen after it -- meaning an interruption
+        // (crash, power loss) right afterward could leave the database
+        // internally inconsistent despite this commit's own claim. A
+        // real, plausible explanation for a real, observed failure (a
+        // resumed run reporting a mismatch immediately after a genuine,
+        // uncontrolled power loss) -- see UrkelNameTree's own comment on
+        // waitForReconciliationToSettle() for the full reasoning.
+        nameTree.waitForReconciliationToSettle();
+        store.commit();
+    }
+
+    /** NEW: resilience support. Called ONLY from the shutdown hook, once
+     *  every other shutdown step has already run -- marks this exit as
+     *  genuinely clean and durably commits that fact. Deliberately
+     *  self-contained (does its own commit() rather than relying on the
+     *  caller to do one afterward) so this can never accidentally end
+     *  up written but not yet flushed. */
+    public void markCleanShutdown() {
+        meta.put(META_CLEAN_SHUTDOWN, "true");
+        commit();
+    }
+
+    /** NEW: resilience support. Called once, early at startup (before
+     *  normal sync begins), to find out whether the PREVIOUS run exited
+     *  cleanly, then immediately clears the marker and commits that
+     *  change -- so if THIS run also fails to exit cleanly, the NEXT
+     *  startup correctly detects that too, rather than the marker
+     *  staying "true" from some much earlier clean exit and never being
+     *  updated again. Returns the marker's value as found, i.e.
+     *  whether the LAST shutdown (before this startup) was clean --
+     *  false (including on a genuinely fresh database, where the key
+     *  has simply never been set) means the previous run's on-disk
+     *  state was never confirmed consistent, and Main's own startup
+     *  sequence should verify it before proceeding normally. */
+    public boolean checkAndClearCleanShutdownMarker() {
+        boolean wasClean = "true".equals(meta.get(META_CLEAN_SHUTDOWN));
+        meta.put(META_CLEAN_SHUTDOWN, "false");
+        commit();
+        return wasClean;
+    }
+
+    /**
+     * Reclaims disk space from old, no-longer-reachable chunks --
+     * MVStore's own commit() only makes the current version durable, it
+     * doesn't reclaim space from versions that are no longer needed
+     * (that's compaction's job specifically). Time-bounded rather than a
+     * single unbounded pass, so a periodic call from ChainSync can't
+     * stall block/header processing for an unpredictable length of time.
+     * The synchronization this used to need against the background
+     * prune's own store manipulation now lives inside MVStoreKVStore
+     * itself, since both are engine-specific concerns.
+     */
+    public void compact(int maxMillis) {
+        store.compact(maxMillis);
+    }
+
+    public String getPath() {
+        return store.getFileName();
+    }
+
+    public long getDiskSizeBytes() {
+        return store.getDiskSizeBytes();
+    }
+
+    // ── Header operations ─────────────────────────────────────────────────────
+
+    /**
+     * Stores a batch of raw headers starting at startHeight.
+     * Caps storage at existingTip + 2016 to prevent fake header inflation.
+     * <p>
+     * FIX: this used to update hashIndex and advance newTip
+     * unconditionally, even for a height where headers.containsKey(h)
+     * was already true and the new header was therefore silently
+     * DISCARDED (headers.put() never ran). That meant the hash index
+     * and the reported tip could describe a header that was never
+     * actually the one stored at that height -- e.g. hashIndex would
+     * map the discarded header's hash to height h, while headers.get(h)
+     * still returned the original, different one. Now: an identical
+     * duplicate is a true no-op (skip everything, it's already correct);
+     * a DIFFERENT header already present at this height is logged
+     * loudly rather than silently discarded -- this should never happen
+     * under normal operation (insertHeaders is only ever called with
+     * startHeight one past our own confirmed tip, using data that was
+     * already chain-link-validated against what we currently have), so
+     * if it ever does, that's exactly the kind of signal worth seeing
+     * directly rather than papering over.
+     */
+    public void insertHeaders(List<byte[]> rawHeaders, int startHeight) {
+        int existingTip = getHeaderTip();
+        if (startHeight > existingTip + 2016) {
+            System.out.printf("[ChainDB] Rejecting headers at %d — too far ahead of tip %d%n",
+                    startHeight, existingTip);
+            return;
+        }
+        int maxHeight = existingTip + 2016;
+        int newTip = startHeight - 1;
+        for (int i = 0; i < rawHeaders.size(); i++) {
+            long h = startHeight + i;
+            if (h > maxHeight) break;
+            byte[] header = rawHeaders.get(i);
+            byte[] existing = headers.get(h);
+            if (existing == null) {
+                headers.put(h, header);
+            } else if (!java.util.Arrays.equals(existing, header)) {
+                System.out.printf("[ChainDB] WARNING: height %d already has a DIFFERENT stored "
+                                + "header (existing hash=%s, incoming hash=%s) -- keeping the "
+                                + "existing one, not overwriting. This should not happen under "
+                                + "normal operation; worth investigating if it recurs.%n",
+                        h, hex(HeaderUtil.hash(existing)), hex(HeaderUtil.hash(header)));
+                continue; // keep the existing one -- don't touch hashIndex/newTip for this height
+            }
+            // else: existing != null and byte-identical to the incoming
+            // header -- a genuine no-op duplicate, safe to fall through
+            // and re-affirm hashIndex/newTip exactly as if it were a
+            // fresh write, since it IS the same data either way.
+            hashIndex.put(HeaderUtil.hash(header), h);
+            newTip = (int) h;
+        }
+        if (newTip > existingTip) {
+            meta.put(META_HEADER_TIP, String.valueOf(newTip));
+        }
+        store.commit();
+    }
+
+    public byte[] getHeader(int height) {
+        return headers.get((long) height);
+    }
+
+    public int getHeaderTip() {
+        String v = meta.get(META_HEADER_TIP);
+        return v != null ? Integer.parseInt(v) : -1;
+    }
+
+    /** Resolves a real header hash to its height, or -1 if unknown. Used
+     *  to serve GETHEADERS requests without a linear scan.
+     *
+     *  RE-ARCHITECTURE: hashIndex itself moved to raw-byte keys (see
+     *  META_STORAGE_FORMAT_VERSION's own comment); this hex-string
+     *  overload stays for callers that already have a hex string on
+     *  hand (parsed RPC/wire-protocol input), decoding once here rather
+     *  than pushing that onto every caller. A caller that already has
+     *  raw hash bytes should call the byte[] overload directly instead
+     *  of hex-encoding just to immediately decode again. */
+    public int getHeightByHash(String hexHash) {
+        return getHeightByHash(HexUtil.decode(hexHash));
+    }
+
+    public int getHeightByHash(byte[] hash) {
+        Long h = hashIndex.get(hash);
+        return h != null ? h.intValue() : -1;
+    }
+
+    /**
+     * One-time backfill for the hash index against any headers already
+     * stored before this index existed (a real, current situation for
+     * this project -- earlier sessions synced hundreds of thousands of
+     * headers with no hash index at all). Cheap to check (a single size
+     * comparison) and safe to call on every startup; only does real work
+     * the one time it's actually needed.
+     */
+    public void backfillHashIndexIfNeeded() {
+        int tip = getHeaderTip();
+        if (tip < 0) return;
+        if (hashIndex.size() >= tip + 1) return; // already complete
+        System.out.println("[ChainDB] Backfilling header hash index (first run after this feature was added)...");
+        int done = 0;
+        for (int h = 0; h <= tip; h++) {
+            byte[] header = headers.get((long) h);
+            if (header == null) continue;
+            byte[] hashBytes = HeaderUtil.hash(header);
+            if (!hashIndex.containsKey(hashBytes)) {
+                hashIndex.put(hashBytes, (long) h);
+                done++;
+            }
+        }
+        store.commit();
+        System.out.println("[ChainDB] Backfill complete: " + done + " entries added.");
+    }
+
+    /**
+     * Resets header chain to targetHeight, deleting all headers above it.
+     * Used to recover from fake header inflation.
+     */
+    public void resetHeaderTip(int targetHeight) {
+        int current = getHeaderTip();
+        System.out.printf("[ChainDB] Resetting header tip %d → %d%n", current, targetHeight);
+        for (int h = current; h > targetHeight; h--) {
+            headers.remove((long) h);
+            chainwork.remove((long) h);
+        }
+        meta.put(META_HEADER_TIP, String.valueOf(targetHeight));
+        store.commit();
+    }
+
+    /**
+     * A genuinely complete wipe of everything derived from chain data --
+     * headers, chainwork, blocks, UTXOs, names, and the hash index --
+     * plus both the header and block tip metadata. Used when the stored
+     * chain data can't be trusted at all (e.g. a genesis-hash mismatch,
+     * which can indicate the underlying database file was left in an
+     * inconsistent state by an unclean process kill, not just "stale
+     * data from before a fix").
+     * <p>
+     * resetHeaderTip() alone is NOT sufficient for this case: it only
+     * clears headers/chainwork, leaving block_tip pointing at whatever
+     * height blocks were previously downloaded to. Since blockDownload
+     * logic starts from blockTip+1, that stale block_tip would silently
+     * skip re-downloading and re-validating every block up to the old
+     * tip once headers catch back up to that height -- exactly the
+     * heights whose data was potentially corrupted in the first place,
+     * now silently trusted forever with no re-validation.
+     */
+    public void fullReset() {
+        System.out.println("[ChainDB] Performing a full reset -- headers, blocks, "
+                + "UTXOs, names, and the hash index are all being cleared, not just "
+                + "headers, since the stored data as a whole can't be trusted.");
+        // FIX: a real, confirmed production incident -- this used to
+        // mark the tip metadata as reset (-1) only AFTER every clear()
+        // call below succeeded. When clear() then crashed partway
+        // through (a real OutOfMemoryError, on a column family with
+        // tens of millions of entries -- see RocksDBKVMap.clear()'s
+        // own fix), that left the worst possible combination: headers
+        // and blocks already wiped, but header_tip/block_tip still
+        // pointing at their old, now-invalid height. The startup
+        // consistency check in Main.java then reads that stale
+        // non-negative tip, finds no header there (since it's already
+        // gone), and -- unable to tell "genuinely fresh, tip is -1"
+        // apart from "tip claims data that no longer exists" -- treats
+        // it as an ordinary fresh install with nothing to verify, and
+        // would have gone on to sync on top of a database with zero
+        // headers but potentially millions of orphaned UTXO/name
+        // entries underneath. Marking the tips reset FIRST means any
+        // failure during the clear() calls below -- this one or a
+        // different one entirely -- leaves metadata that honestly
+        // reflects "nothing here can be trusted," which the startup
+        // check already treats correctly as a genuine fresh start.
+        meta.put(META_HEADER_TIP, "-1");
+        meta.put(META_BLOCK_TIP, "-1");
+        store.commit();
+        headers.clear();
+        chainwork.clear();
+        blocks.clear();
+        utxos.clear();
+        names.clear();
+        hashIndex.clear();
+        store.commit();
+        // Given this just cleared potentially the entire database's worth
+        // of data at once, give compaction a real, larger time budget
+        // right away rather than waiting for the next periodic call --
+        // this is exactly the moment the most disk space is reclaimable.
+        store.compact(30_000);
+        System.out.println("[ChainDB] Full reset complete.");
+    }
+
+    // ── Block operations ──────────────────────────────────────────────────────
+
+    public void saveBlock(byte[] rawBlock, int height) {
+        blocks.put((long) height, rawBlock);
+    }
+
+    public byte[] getBlock(int height) {
+        return blocks.get((long) height);
+    }
+
+    /**
+     * Returns the highest contiguous block height stored.
+     * Recomputes from stored tip downward to find the true boundary.
+     */
+    public int getBlockTip() {
+        String v = meta.get(META_BLOCK_TIP);
+        int stored = v != null ? Integer.parseInt(v) : -1;
+        // Verify contiguity — walk down from stored tip
+        while (stored > 0 && !blocks.containsKey((long) stored)) {
+            stored--;
+        }
+        return stored;
+    }
+
+    public void setBlockTip(int height) {
+        meta.put(META_BLOCK_TIP, String.valueOf(height));
+    }
+
+    // ── Chainwork ─────────────────────────────────────────────────────────────
+
+    public BigInteger getChainwork(int height) {
+        byte[] b = chainwork.get((long) height);
+        return b != null ? new BigInteger(1, b) : BigInteger.ZERO;
+    }
+
+    // ── UTXO operations ───────────────────────────────────────────────────────
+
+    /**
+     * A UTXO entry: value, address version, address hash, covenant type,
+     * covenant items (serialized), coinbase flag.
+     */
+    public record UtxoEntry(
+            long value,
+            int addrVersion,
+            byte[] addrHash,
+            int covenantType,
+            byte[] covenantData,
+            boolean coinbase,
+            int height
+    ) {
+        public String toStorage() {
+            return value + "|" + addrVersion + "|"
+                    + hex(addrHash) + "|"
+                    + covenantType + "|"
+                    + hex(covenantData) + "|"
+                    + coinbase + "|"
+                    + height;
+        }
+
+        public static UtxoEntry fromStorage(String s) {
+            String[] p = s.split("\\|", 7);
+            return new UtxoEntry(
+                    Long.parseLong(p[0]),
+                    Integer.parseInt(p[1]),
+                    fromHex(p[2]),
+                    Integer.parseInt(p[3]),
+                    fromHex(p[4]),
+                    Boolean.parseBoolean(p[5]),
+                    p.length > 6 ? Integer.parseInt(p[6]) : 0
+            );
+        }
+    }
+
+    /** RE-ARCHITECTURE: utxos moved from a composite hex-string key
+     *  ("<64-char-hex-txid>:<index>", ~75 bytes as UTF-8) to a fixed-
+     *  width, 36-byte raw encoding (32-byte txid + 4-byte big-endian
+     *  index) -- see META_STORAGE_FORMAT_VERSION's own comment. Unlike
+     *  urkelNodes/hashIndex/names, this isn't a pure hash, so it gets
+     *  its own small codec here rather than a direct hex-to-bytes swap;
+     *  kept entirely private to this class -- every public UTXO method
+     *  (saveUtxo/getUtxo/removeUtxo/getUtxoKeysForAddress) keeps its
+     *  existing (String txid, int index) signature exactly as before,
+     *  so this is purely an internal storage-layer change with zero
+     *  blast radius on any caller. */
+    private static byte[] utxoKey(String txid, int index) {
+        byte[] txidBytes = HexUtil.decode(txid);
+        byte[] key = new byte[36];
+        System.arraycopy(txidBytes, 0, key, 0, 32);
+        key[32] = (byte) (index >>> 24);
+        key[33] = (byte) (index >>> 16);
+        key[34] = (byte) (index >>> 8);
+        key[35] = (byte) index;
+        return key;
+    }
+
+    /** Reverses utxoKey() -- used only by getUtxoKeysForAddress() below,
+     *  to keep returning its existing "<hex-txid>:<index>" String shape
+     *  to callers even though the underlying storage key is now raw
+     *  bytes. */
+    private static String utxoKeyToString(byte[] key) {
+        byte[] txidBytes = java.util.Arrays.copyOfRange(key, 0, 32);
+        int index = ((key[32] & 0xFF) << 24) | ((key[33] & 0xFF) << 16)
+                | ((key[34] & 0xFF) << 8) | (key[35] & 0xFF);
+        return HexUtil.encode(txidBytes) + ":" + index;
+    }
+
+    public void saveUtxo(String txid, int index, UtxoEntry entry) {
+        utxos.put(utxoKey(txid, index), entry.toStorage());
+    }
+
+    public UtxoEntry getUtxo(String txid, int index) {
+        String s = utxos.get(utxoKey(txid, index));
+        return s != null ? UtxoEntry.fromStorage(s) : null;
+    }
+
+    public void removeUtxo(String txid, int index) {
+        utxos.remove(utxoKey(txid, index));
+    }
+
+    /** Returns all UTXOs at a given address hash (requires address index). */
+    public List<String> getUtxoKeysForAddress(byte[] addrHash) {
+        String hashHex = hex(addrHash);
+        List<String> result = new ArrayList<>();
+        for (var e : utxos.entrySet()) {
+            UtxoEntry u = UtxoEntry.fromStorage(e.getValue());
+            if (hex(u.addrHash()).equals(hashHex)) {
+                result.add(utxoKeyToString(e.getKey()));
+            }
+        }
+        return result;
+    }
+
+    // ── Name state operations ─────────────────────────────────────────────────
+
+    /**
+     * Name state entry tracking covenant state for each registered name.
+     * <p>
+     * Maps nameHash → NameEntry with fields matching hsd's namestate:
+     *   name, nameHash, state, height (auction open height),
+     *   renewal, owner (txid:index), value, highest, claimed,
+     *   renewals, weak, transfer, revoked
+     */
+    public static class NameEntry {
+        public String name;
+        public String nameHash;
+        public String state;          // OPENING, BIDDING, REVEAL, CLOSED, REVOKED
+        public int    height;         // block where auction opened
+        public int    renewal;        // last renewal/finalize block
+        public String ownerTxid;      // outpoint of current name UTXO
+        public int    ownerIndex;
+        public long   value;          // locked bid value
+        public long   highest;        // highest bid seen
+        public int    claimed;        // DNSSEC claim height (0 for auctioned)
+        public int    renewals;       // number of renewals
+        public boolean weak;
+        public int    transfer;       // transfer lockup block (0 if not transferring)
+        public int    revoked;
+        public boolean registered;    // set explicitly by REGISTER, NOT derived from state -- confirmed via real hsd's getnameproof for "crypto51": a freshly-claimed name has state=CLOSED but registered=false, since CLAIM never sets it (previously this was wrongly derived as state=="CLOSED", which incorrectly marked every claim as registered too)
+        public boolean expired = false; // set by maybeExpire() when an auction closes with no revealed bids (or a registration goes unrenewed past renewalWindow) -- confirmed against real hsd's getnameproof, field bit 8
+        public byte[] resourceData = new byte[0]; // raw DNS-record blob from the most recent UPDATE/REGISTER covenant, for getnameresource
+
+        public String toStorage() {
+            // ownerTxid can genuinely be null now (OPEN no longer sets
+            // it, confirmed correct against real hsd's own reset()
+            // logic) -- string concatenation would otherwise silently
+            // turn a null into the literal text "null", which survives
+            // a round trip through storage and later breaks every
+            // downstream null-check (including fromHex, which then
+            // crashes trying to parse "null" as hex). Write an explicit
+            // empty string instead, matching what every null-check here
+            // already treats as "no owner".
+            String ownerTxidField = (ownerTxid == null) ? "" : ownerTxid;
+            return name + "|" + nameHash + "|" + state + "|" + height + "|"
+                    + renewal + "|" + ownerTxidField + "|" + ownerIndex + "|"
+                    + value + "|" + highest + "|" + claimed + "|"
+                    + renewals + "|" + weak + "|" + transfer + "|" + revoked
+                    + "|" + hex(resourceData) + "|" + registered + "|" + expired;
+        }
+
+        public static NameEntry fromStorage(String s) {
+            // Defensive: previously an exception here (e.g. a name record
+            // written by an earlier version of this code with a
+            // different field layout, now sitting in a database that's
+            // survived many code changes across a long testing session)
+            // would propagate all the way up and abort processing of the
+            // ENTIRE block -- discarding every other transaction's UTXO
+            // and name-state updates in that block too, not just this
+            // one name's. Treating an unparseable record as "no existing
+            // entry" is a far safer fallback than losing everything else
+            // in the block over one corrupted/stale record.
+            try {
+                String[] p = s.split("\\|", 17);
+                NameEntry e = new NameEntry();
+                e.name       = p[0];
+                e.nameHash   = p[1];
+                e.state      = p[2];
+                e.height     = Integer.parseInt(p[3]);
+                e.renewal    = Integer.parseInt(p[4]);
+                e.ownerTxid  = p[5];
+                e.ownerIndex = Integer.parseInt(p[6]);
+                e.value      = Long.parseLong(p[7]);
+                e.highest    = Long.parseLong(p[8]);
+                e.claimed    = Integer.parseInt(p[9]);
+                e.renewals   = Integer.parseInt(p[10]);
+                e.weak       = Boolean.parseBoolean(p[11]);
+                e.transfer   = Integer.parseInt(p[12]);
+                e.revoked    = p.length > 13 ? Integer.parseInt(p[13]) : 0;
+                e.resourceData = p.length > 14 && !p[14].isEmpty() ? fromHex(p[14]) : new byte[0];
+                // Defaults to false for records written before this field
+                // existed -- matches a fresh NameEntry's own default,
+                // safer than guessing true for old records.
+                e.registered = p.length > 15 && Boolean.parseBoolean(p[15]);
+                e.expired    = p.length > 16 && Boolean.parseBoolean(p[16]);
+                return e;
+            } catch (Exception ex) {
+                System.err.println("[ChainDB] WARNING: unparseable NameEntry record, "
+                        + "treating as no existing entry: " + ex.getMessage());
+                return null;
+            }
+        }
+    }
+
+    // FIX: saveName() previously wrote each covenant's name update
+    // directly, individually -- one RocksDB put() per covenant.
+    // Confirmed as a real, measurable contributor to slow covenant
+    // processing at real production scale (several hundred covenants
+    // per block during high-activity ranges of the chain): the exact
+    // same class of overhead (per-operation JNI/native round-trip
+    // cost) that WriteBatch already fixed for the Urkel tree's own
+    // node writes. Buffers this block's writes here instead, and
+    // flushPendingNames() -- called once per block, from
+    // BlockProcessor, at the same point persistNameTreeState() already
+    // runs -- writes them all as a single batched operation.
+    //
+    // getNameByHash() checks this buffer FIRST, before falling back to
+    // the real, on-disk map -- required for correctness, not just a
+    // nice-to-have: getNameByHash() is called from more than just the
+    // covenant-processing path that calls saveName() (RPC handlers, in
+    // particular, run on a separate thread and could ask for a name's
+    // state at any point, including mid-block, before this block's
+    // writes have been flushed). Without this, an RPC caller -- or a
+    // second covenant touching the same name later in the SAME block,
+    // both real, possible scenarios -- could see stale data.
+    private final java.util.Map<String, String> pendingNameWrites = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public void saveName(NameEntry entry) {
+        pendingNameWrites.put(entry.nameHash, entry.toStorage());
+    }
+
+    /** Writes this block's buffered name updates as a single batched
+     *  operation, then clears the buffer. Must be called once per
+     *  block, BEFORE setBlockTip() advances for that block (see
+     *  BlockProcessor's own call site) -- setBlockTip() is
+     *  deliberately the last thing written per block specifically so a
+     *  crash before it means the whole block gets safely reprocessed
+     *  on restart; calling this after setBlockTip() would break that
+     *  guarantee, since a crash between them would permanently lose
+     *  buffered name writes for a block already marked complete. */
+    public void flushPendingNames() {
+        if (pendingNameWrites.isEmpty()) return;
+        // RE-ARCHITECTURE: pendingNameWrites itself deliberately stays
+        // hex-String-keyed -- it's a transient, in-memory
+        // ConcurrentHashMap, not persistent storage, so the usual
+        // key-size argument for raw bytes doesn't apply, and String's
+        // real content equality is exactly what its own get()/put()
+        // lookups by hex nameHash need. The hex-decode step happens
+        // right here instead, at the one point these buffered writes
+        // actually cross into the byte-keyed `names` map.
+        java.util.Map<byte[], String> toWrite = new java.util.LinkedHashMap<>();
+        for (var e : pendingNameWrites.entrySet()) {
+            toWrite.put(HexUtil.decode(e.getKey()), e.getValue());
+        }
+        names.putAll(toWrite);
+        pendingNameWrites.clear();
+    }
+
+    /** Hex-string overload for callers that already have one (RPC/wire-
+     *  protocol input) -- decodes once, then delegates. A caller that
+     *  already has raw name-hash bytes on hand (BlockProcessor's hot
+     *  covenant-processing path, in particular -- every single covenant
+     *  transaction calls this) should use the byte[] overload directly
+     *  instead of hex-encoding just to immediately decode again. */
+    public NameEntry getNameByHash(String nameHash) {
+        return getNameByHash(HexUtil.decode(nameHash));
+    }
+
+    public NameEntry getNameByHash(byte[] nameHash) {
+        String pending = pendingNameWrites.get(HexUtil.encode(nameHash));
+        if (pending != null) return NameEntry.fromStorage(pending);
+        String s = names.get(nameHash);
+        return s != null ? NameEntry.fromStorage(s) : null;
+    }
+
+    public NameEntry getNameByString(String name) {
+        // Checks the pending (not-yet-flushed) buffer first, for the
+        // same reason getNameByHash() does -- see saveName()'s own
+        // comment. Small (at most one block's worth of writes), so
+        // scanning it first is cheap.
+        for (String storage : pendingNameWrites.values()) {
+            NameEntry ne = NameEntry.fromStorage(storage);
+            if (name.equalsIgnoreCase(ne.name)) return ne;
+        }
+        // Linear scan — acceptable since name index is maintained separately
+        // FIX: names's keys are now raw bytes (see
+        // META_STORAGE_FORMAT_VERSION's own comment) while
+        // pendingNameWrites stays hex-String-keyed (see
+        // flushPendingNames()'s own comment on why) -- containsKey()
+        // against the WRONG type silently always returns false rather
+        // than failing to compile (java.util.Map.containsKey() takes a
+        // plain Object), so the hex-encode here is required for
+        // correctness, not optional.
+        for (var e : names.entrySet()) {
+            if (pendingNameWrites.containsKey(HexUtil.encode(e.getKey()))) continue; // already checked above, pending takes precedence
+            NameEntry ne = NameEntry.fromStorage(e.getValue());
+            if (name.equalsIgnoreCase(ne.name)) return ne;
+        }
+        return null;
+    }
+
+    public int getNameCount() {
+        // Pending entries not yet in `names` still need to count --
+        // but a pending entry for an EXISTING name (an update, not a
+        // brand-new registration) must not be double-counted.
+        int pendingNew = 0;
+        for (String key : pendingNameWrites.keySet()) {
+            if (!names.containsKey(HexUtil.decode(key))) pendingNew++;
+        }
+        return names.size() + pendingNew;
+    }
+
+    /** Fast, approximate name count -- see KVMap.sizeEstimate()'s own
+     *  comment. Doesn't bother accounting for pendingNameWrites the way
+     *  getNameCount() does -- that buffer is only ever a single block's
+     *  worth of entries at most, trivial next to real production scale,
+     *  and this method exists purely for a startup banner where an
+     *  approximate figure was already the whole point. */
+    public int getNameCountEstimate() {
+        return names.sizeEstimate();
+    }
+
+    /** All names currently tracked, for the "getnames" RPC method.
+     *  Skips any record that fails to parse (see NameEntry.fromStorage()'s
+     *  defensive handling) rather than letting one bad record break the
+     *  whole listing. Includes pending (not-yet-flushed) writes, taking
+     *  precedence over the committed version of the same name, for the
+     *  same reason getNameByHash() does. */
+    public List<NameEntry> getAllNames() {
+        List<NameEntry> result = new ArrayList<>();
+        for (String raw : pendingNameWrites.values()) {
+            NameEntry e = NameEntry.fromStorage(raw);
+            if (e != null) result.add(e);
+        }
+        for (var entry : names.entrySet()) {
+            // Same hex-encode-before-containsKey() requirement as
+            // getNameByString() above -- see its own comment.
+            if (pendingNameWrites.containsKey(HexUtil.encode(entry.getKey()))) continue; // already included above, pending takes precedence
+            NameEntry e = NameEntry.fromStorage(entry.getValue());
+            if (e != null) result.add(e);
+        }
+        return result;
+    }
+
+    // ── Peer operations ───────────────────────────────────────────────────────
+
+    public void savePeer(String ip, String data) {
+        peers.put(ip, data);
+    }
+
+    public java.util.Map<String, String> getAllPeers() {
+        return peers.asUnmodifiableMap();
+    }
+
+    // ── Meta operations ───────────────────────────────────────────────────────
+
+    // ── Statistics ────────────────────────────────────────────────────────────
+
+    public int getHeaderCount()  { return headers.size(); }
+    public int getBlockCount()   { return blocks.size(); }
+    public int getUtxoCount()    { return utxos.size(); }
+
+    /** Fast, approximate counterparts -- see KVMap.sizeEstimate()'s own
+     *  comment. getUtxoCount()/getBlockCount()/getHeaderCount() stay
+     *  exact for their existing callers (gettxoutsetinfo genuinely
+     *  wants precision for an explicit audit-style RPC; these estimate
+     *  versions exist purely for Main's own startup banner, confirmed
+     *  directly to have been causing a real, multi-minute silent stall
+     *  at real production scale). */
+    public int getHeaderCountEstimate() { return headers.sizeEstimate(); }
+    public int getBlockCountEstimate()  { return blocks.sizeEstimate(); }
+    public int getUtxoCountEstimate()   { return utxos.sizeEstimate(); }
+
+    /** Sums every UTXO's value -- a real linear scan, acceptable here
+     *  since gettxoutsetinfo is an infrequent, user-initiated diagnostic
+     *  call, not something on any hot path. */
+    public long getTotalUtxoValue() {
+        long total = 0;
+        for (String raw : utxos.values()) {
+            UtxoEntry e = UtxoEntry.fromStorage(raw);
+            if (e != null) total += e.value();
+        }
+        return total;
+    }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+
+    private static String hex(byte[] b) {
+        if (b == null || b.length == 0) return "";
+        return HexUtil.encode(b);
+    }
+
+    private static byte[] fromHex(String s) {
+        if (s == null || s.isEmpty()) return new byte[0];
+        return HexUtil.decode(s);
+    }
+
+    /** Like fromHex, but returns 32 zero bytes for null/empty rather
+     *  than a zero-length array -- what a freshly-initialized Urkel
+     *  root pointer needs on a genuinely fresh database. */
+    private static byte[] fromHexOrZero(String s) {
+        if (s == null || s.isEmpty()) return new byte[32];
+        return fromHex(s);
+    }
+}
