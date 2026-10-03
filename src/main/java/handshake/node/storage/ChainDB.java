@@ -234,7 +234,7 @@ public class ChainDB {
         }
         long t1 = System.nanoTime();
 
-        if (nameTree.maybeCommit(height, bestKnownPeerHeight)) {
+        if (nameTree.maybeCommit(height, bestKnownPeerHeight, getDataDir())) {
             meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
         }
         long t2 = System.nanoTime();

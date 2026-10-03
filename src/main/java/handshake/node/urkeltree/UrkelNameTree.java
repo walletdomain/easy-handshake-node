@@ -3,6 +3,7 @@ package handshake.node.urkeltree;
 import handshake.node.storage.KVStore;
 import handshake.node.storage.DiskBackedHashKeySet;
 import handshake.node.storage.DiskBackedOrphanQueue;
+import handshake.node.storage.PersistentLog;
 
 import handshake.node.chain.BlockProcessor;
 
@@ -51,6 +52,37 @@ public class UrkelNameTree {
      *  happen, avoiding the periodic full-tree walk entirely, which is
      *  a separate, more involved change to insert()/remove() themselves. */
     private static final int PRUNE_EVERY_N_COMMITS = 10;
+
+    /** Gates the detailed per-cycle reconciliation reporting -- every
+     *  "Reconciliation STARTING" line here, every prune removal phase/
+     *  chunk line in UrkelNodeStore, and every prune walk-in-progress
+     *  line in UrkelTree. Useful when actively diagnosing a slow or
+     *  unusually large reconciliation, but at the normal cadence (a
+     *  cycle roughly every PRUNE_EVERY_N_COMMITS commits) this flooded
+     *  the console across ordinary catch-up sync. Default off; the
+     *  periodic rollup (RECONCILE_LOG_EVERY_N_CYCLES below) is the
+     *  always-on summary regardless of this flag, and BACKPRESSURE lines
+     *  (see blockUntilBacklogDrains()) are never gated by it either --
+     *  those are rare and significant enough to always print. Referenced
+     *  from UrkelNodeStore and UrkelTree too (package-private, same
+     *  package) so all three classes' detailed output turns on/off
+     *  together rather than needing three separate flags kept in sync. */
+    static final boolean VERBOSE_PRUNE_LOGGING = false;
+
+    /** How many reconciliation cycles to accumulate before printing one
+     *  rollup summary line, instead of a STARTING/removed pair on every
+     *  single cycle. A cycle fires roughly every PRUNE_EVERY_N_COMMITS
+     *  commits, so this isn't pegged to an exact block count (one would
+     *  drift if the commit interval ever changed) -- it lands in
+     *  roughly the same multi-thousand-block ballpark that was actually
+     *  wanted, by counting the thing that directly drives the noise
+     *  instead. */
+    private static final int RECONCILE_LOG_EVERY_N_CYCLES = 100;
+
+    private int  reconcileCyclesSinceLog   = 0;
+    private long reconcileRemovedSinceLog  = 0;
+    private long reconcileMillisSinceLog   = 0;
+    private int  reconcileFirstHeightSinceLog = -1;
 
     /** FIX (superseded): this project used to also reduce reconciliation
      *  frequency during deep catch-up via a second, larger commit-count
@@ -513,7 +545,7 @@ public class UrkelNameTree {
         this.pruningDisabled = disabled;
     }
 
-    public boolean maybeCommit(int height, int bestKnownPeerHeight) {
+    public boolean maybeCommit(int height, int bestKnownPeerHeight, String dataDir) {
         if (height % TREE_INTERVAL != 0) return false;
         lastCommittedRoot = tree.rootHash().clone();
 
@@ -567,7 +599,7 @@ public class UrkelNameTree {
         // catches back up, rather than letting the backlog keep growing
         // regardless of how much RAM happens to be available.
         if (accumulatedOrphanCandidates.size() >= HARD_BACKPRESSURE_CAP) {
-            blockUntilBacklogDrains(deepCatchUp, rootToPrune, height);
+            blockUntilBacklogDrains(deepCatchUp, rootToPrune, height, dataDir);
         }
 
         // RE-ARCHITECTURE (second pass): this is the actual fix for the
@@ -642,11 +674,18 @@ public class UrkelNameTree {
             candidatesSnapshot.addAll(accumulatedOrphanCandidates.takeUpTo(accumulatedOrphanCandidates.size()));
         }
 
-        System.out.println("[UrkelNameTree] Reconciliation STARTING at height " + height
-                + " (heap: " + heapSnapshot() + ", draining " + candidatesSnapshot.size()
-                + " of " + (candidatesSnapshot.size() + accumulatedOrphanCandidates.size()) + " waiting, "
-                + (deepCatchUp ? "trusting candidates directly, no validation walk -- deep catch-up"
-                : "full disk-backed validation walk -- near the tip"));
+        // FIX: was printed unconditionally on every cycle -- gated behind
+        // VERBOSE_PRUNE_LOGGING now (see its own comment); the periodic
+        // rollup in drainOneBatch() is the always-on summary. Also fixes
+        // a cosmetic bug noticed along the way: this line opened a
+        // "(heap: ..." parenthetical but never closed it.
+        if (VERBOSE_PRUNE_LOGGING) {
+            System.out.println("[UrkelNameTree] Reconciliation STARTING at height " + height
+                    + " (heap: " + heapSnapshot() + ", draining " + candidatesSnapshot.size()
+                    + " of " + (candidatesSnapshot.size() + accumulatedOrphanCandidates.size()) + " waiting, "
+                    + (deepCatchUp ? "trusting candidates directly, no validation walk -- deep catch-up)"
+                    : "full disk-backed validation walk -- near the tip)"));
+        }
 
         // RE-ARCHITECTURE (fourth pass): synchronous, inline, on this
         // (block-processing) thread -- was pruneExecutor.submit(...)
@@ -683,12 +722,23 @@ public class UrkelNameTree {
      *  reconciliation is synchronous everywhere now, so this loop is
      *  simply the calling thread draining chunk after chunk itself,
      *  nothing else could ever be running concurrently to wait for. */
-    private void blockUntilBacklogDrains(boolean deepCatchUp, UrkelNode rootToPrune, int height) {
+    private void blockUntilBacklogDrains(boolean deepCatchUp, UrkelNode rootToPrune, int height,
+                                         String dataDir) {
         long resumeThreshold = HARD_BACKPRESSURE_CAP / 2;
         long startSize = accumulatedOrphanCandidates.size();
-        System.out.println("[UrkelNameTree] BACKPRESSURE: orphan backlog (" + startSize
+        // FIX: a backpressure episode is exactly the kind of rare,
+        // significant event PersistentLog exists for (see its own class
+        // comment) -- these have run for 10+ minutes in real runs, and
+        // previously existed ONLY in live console output. If the
+        // terminal's scroll-back had already moved past it, or the
+        // process wasn't being watched live when it happened, there was
+        // no way to find out after the fact that this ever occurred,
+        // let alone how long it took or how large the backlog got.
+        String startMsg = "BACKPRESSURE: orphan backlog (" + startSize
                 + ") reached the hard cap (" + HARD_BACKPRESSURE_CAP + ") at height " + height
-                + " -- pausing block processing until it drains back below " + resumeThreshold + ".");
+                + " -- pausing block processing until it drains back below " + resumeThreshold + ".";
+        System.out.println("[UrkelNameTree] " + startMsg);
+        PersistentLog.logWarn(dataDir, startMsg);
         long start = System.currentTimeMillis();
         while (accumulatedOrphanCandidates.size() > resumeThreshold) {
             java.util.Set<UrkelNodeStore.HashKey> chunk = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -751,8 +801,10 @@ public class UrkelNameTree {
                 return;
             }
         }
-        System.out.println("[UrkelNameTree] BACKPRESSURE: backlog drained to " + accumulatedOrphanCandidates.size()
-                + " after " + (System.currentTimeMillis() - start) + "ms -- resuming normal block processing.");
+        String resumeMsg = "BACKPRESSURE: backlog drained to " + accumulatedOrphanCandidates.size()
+                + " after " + (System.currentTimeMillis() - start) + "ms -- resuming normal block processing.";
+        System.out.println("[UrkelNameTree] " + resumeMsg);
+        PersistentLog.logWarn(dataDir, resumeMsg);
     }
 
     /** Does the actual removal work for one batch of candidates --
@@ -839,16 +891,22 @@ public class UrkelNameTree {
                     firstDeepCatchUpDeletionHeight = height;
                 }
                 long millis = System.currentTimeMillis() - start;
-                System.out.printf("[UrkelNameTree] Reconciliation (started at height %d): "
-                                + "removed %d of %d candidates in %dms (no validation walk -- catch-up)%n",
-                        height, removed, candidatesSnapshot.size(), millis);
+                if (VERBOSE_PRUNE_LOGGING) {
+                    System.out.printf("[UrkelNameTree] Reconciliation (started at height %d): "
+                                    + "removed %d of %d candidates in %dms (no validation walk -- catch-up)%n",
+                            height, removed, candidatesSnapshot.size(), millis);
+                }
+                recordReconcileCycleAndMaybeLog(height, removed, millis);
             } else {
                 UrkelTree.PruneResult result = tree.reconcileAndRemove(rootToPrune, candidatesSnapshot);
                 long millis = System.currentTimeMillis() - start;
-                System.out.printf("[UrkelNameTree] Reconciliation (started at height %d): "
-                                + "removed %d of %d candidates in %dms total (walk=%dms remove=%dms)%n",
-                        height, result.removed(), candidatesSnapshot.size(), millis,
-                        result.walkMillis(), result.removeMillis());
+                if (VERBOSE_PRUNE_LOGGING) {
+                    System.out.printf("[UrkelNameTree] Reconciliation (started at height %d): "
+                                    + "removed %d of %d candidates in %dms total (walk=%dms remove=%dms)%n",
+                            height, result.removed(), candidatesSnapshot.size(), millis,
+                            result.walkMillis(), result.removeMillis());
+                }
+                recordReconcileCycleAndMaybeLog(height, result.removed(), millis);
             }
         } catch (UrkelTree.PruneInterruptedException e) {
             // Expected, clean abort during shutdown -- see
@@ -882,6 +940,29 @@ public class UrkelNameTree {
                     + "failed (non-fatal -- candidates re-queued for the next attempt): %s%n", height, e);
         } finally {
             pruneInProgress.set(false);
+        }
+    }
+
+    /** Accumulates one reconciliation cycle's result and, every
+     *  RECONCILE_LOG_EVERY_N_CYCLES cycles, prints ONE rollup line
+     *  summarizing all of them instead of a line per cycle -- see that
+     *  constant's own comment for why. VERBOSE_PRUNE_LOGGING's per-cycle
+     *  detail (at drainOneBatch()'s two call sites above) is independent
+     *  of this and unaffected by it either way. */
+    private void recordReconcileCycleAndMaybeLog(int height, int removed, long millis) {
+        if (reconcileFirstHeightSinceLog == -1) reconcileFirstHeightSinceLog = height;
+        reconcileCyclesSinceLog++;
+        reconcileRemovedSinceLog += removed;
+        reconcileMillisSinceLog += millis;
+        if (reconcileCyclesSinceLog >= RECONCILE_LOG_EVERY_N_CYCLES) {
+            System.out.printf("[UrkelNameTree] Reconciliation rollup: %d cycles (heights %d-%d), "
+                            + "removed %d candidates total, %dms total spent reconciling (heap: %s)%n",
+                    reconcileCyclesSinceLog, reconcileFirstHeightSinceLog, height,
+                    reconcileRemovedSinceLog, reconcileMillisSinceLog, heapSnapshot());
+            reconcileCyclesSinceLog = 0;
+            reconcileRemovedSinceLog = 0;
+            reconcileMillisSinceLog = 0;
+            reconcileFirstHeightSinceLog = -1;
         }
     }
 

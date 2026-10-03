@@ -195,10 +195,15 @@ public class BlockProcessor {
     // real, observed slowdown (down to ~2.7 seconds/block) persisted even
     // after fixing GC pause times with a larger heap, meaning something
     // OTHER than GC pausing itself is consuming the time. These
-    // accumulate across blocks and get logged (then reset) every 100
-    // blocks, matching ChainSync's own existing log cadence, so this
-    // gives a direct breakdown of where time actually goes without
-    // flooding the log with a line per block.
+    // accumulate across blocks and get logged (then reset) every
+    // BLOCKS_PER_TIMING_LOG blocks, matching ChainSync's own
+    // BLOCK_PROGRESS_LOG_EVERY cadence, so this gives a direct breakdown
+    // of where time actually goes without flooding the log with a line
+    // per block. (Raised from 100 to 1000 -- at 100, both this and
+    // ChainSync's per-block progress line were dominating terminal
+    // scroll-back during catch-up sync for little real benefit at that
+    // resolution.)
+    private static final int BLOCKS_PER_TIMING_LOG = 1000;
     private static long sigVerifyNanos = 0;
     private static long utxoBookkeepingNanos = 0;
     private static long covenantProcessingNanos = 0;
@@ -216,7 +221,7 @@ public class BlockProcessor {
 
     private static void logTimingIfDue(int height) {
         blocksSinceTimingLog++;
-        if (blocksSinceTimingLog < 100) return;
+        if (blocksSinceTimingLog < BLOCKS_PER_TIMING_LOG) return;
         System.out.printf("[BlockProcessor] Timing over last %d blocks (ending height %d): "
                         + "sigVerify=%.1fs utxoBookkeeping=%.1fs covenantProcessing=%.1fs "
                         + "persistBlock=%.1fs maybeCommit=%.1fs heap=%s%n",

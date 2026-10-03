@@ -132,11 +132,29 @@ public class PeerDiscovery {
      * connect to securely in the first place.
      */
     public void onAddrMessage(byte[] msg, String fromIp) {
+        // NEW: this method previously processed ADDR replies completely
+        // silently -- whether we ever receive one at all, how many
+        // entries it carries, and how many get filtered out (keyless,
+        // wrong port, already known) versus actually added as new
+        // candidates was all invisible from the console/log. That made
+        // it impossible to tell "our peers never gossip us anything new"
+        // apart from "gossip is broken on our end" just by reading
+        // output -- both looked identical (nothing happens). This logs
+        // one summary line per ADDR message received, regardless of
+        // outcome, so that question has a direct answer going forward
+        // instead of needing a one-off debugging session.
+        if (msg.length == 0) {
+            System.out.printf("[PeerDiscovery] Received empty ADDR from %s (0 bytes).%n", fromIp);
+            return;
+        }
+        int entryCount = msg[0] & 0xFF;
+        int newlyAdded = 0;
+        int skippedKeylessOrWrongPort = 0;
+        int skippedInvalidIp = 0;
+        int skippedAlreadyKnown = 0;
         try {
-            int pos = 0;
-            if (pos >= msg.length) return;
-            int count = msg[pos++] & 0xFF;
-            for (int i = 0; i < count && pos + 88 <= msg.length; i++) {
+            int pos = 1;
+            for (int i = 0; i < entryCount && pos + 88 <= msg.length; i++) {
                 pos += 8 + 4 + 4; // skip time + services + hiServices
                 pos += 1;         // skip addrType
                 // raw[16]: standard IPv4-mapped IPv6 -- IP is the last 4 bytes
@@ -151,14 +169,32 @@ public class PeerDiscovery {
 
                 String ip = (ipBytes[0] & 0xFF) + "." + (ipBytes[1] & 0xFF)
                         + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
-                if (!isValidIp(ip)) continue;
+                if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
 
-                if (port != 44806 || isAllZero(keyBytes)) continue;
+                if (port != 44806 || isAllZero(keyBytes)) { skippedKeylessOrWrongPort++; continue; }
+
+                if (discovered.containsKey(ip) || SeedDatabase.get().isSeed(ip)) {
+                    skippedAlreadyKnown++;
+                    continue;
+                }
 
                 String base32Key = NodeIdentity.base32Encode(keyBytes);
                 addDiscovered(base32Key, ip, port, "addr:" + fromIp);
+                newlyAdded++;
             }
-        } catch (Exception ignored) {}
+            System.out.printf("[PeerDiscovery] ADDR from %s: %d entries (%d new, %d already known, "
+                            + "%d keyless/wrong-port, %d invalid IP).%n",
+                    fromIp, entryCount, newlyAdded, skippedAlreadyKnown,
+                    skippedKeylessOrWrongPort, skippedInvalidIp);
+        } catch (Exception e) {
+            // FIX: previously swallowed completely silently -- a
+            // malformed/truncated ADDR message from a misbehaving or
+            // incompatible peer would vanish with zero trace, looking
+            // identical in the log to a peer that simply never sent one.
+            System.out.printf("[PeerDiscovery] ADDR from %s: failed to parse "
+                            + "(%d declared entries, %d byte payload): %s%n",
+                    fromIp, entryCount, msg.length, e);
+        }
     }
 
     private static boolean isAllZero(byte[] b) {

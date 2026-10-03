@@ -58,6 +58,13 @@ public class ChainSync {
     private static final int CONNECT_TIMEOUT_MS = 5_000;
     private static final int READ_TIMEOUT_MS    = 30_000;
     private static final int MAX_HEADERS_BATCH  = 2000;
+
+    /** How often (in headers) to print header-sync progress. Batches
+     *  still arrive every MAX_HEADERS_BATCH -- this just throttles how
+     *  often that progress is actually printed, independent of the wire
+     *  batch size. See syncHeaders()'s own comment for why this changed
+     *  from printing every batch. */
+    private static final int HEADER_PROGRESS_LOG_EVERY = 20_000;
     private static final int MAX_BLOCK_BATCH    = 16;
 
 
@@ -66,6 +73,14 @@ public class ChainSync {
      *  for why the previous unbatched behavior caused a real, worsening
      *  slowdown as the database grew). */
     private static final int BLOCK_COMMIT_INTERVAL = 100;
+
+    /** How often (in blocks) to print the "Block N processed" progress
+     *  line. Matches BlockProcessor's own timing-dump cadence (see
+     *  BlockProcessor.BLOCKS_PER_TIMING_LOG) so the two lines that
+     *  together describe "what's happened in the last batch of blocks"
+     *  keep appearing together, not at two different, out-of-sync
+     *  resolutions. */
+    private static final int BLOCK_PROGRESS_LOG_EVERY = 1000;
     private static final int HANDSHAKE_TIMEOUT  = 10_000;
 
     // P2P message types -- real values from hsd's lib/net/packets.js exports.types,
@@ -643,11 +658,38 @@ public class ChainSync {
                         localTip = peerHeight;
                     }
 
-                    if (localTip < peerHeight) {
-                        // Sync headers
-                        int newTip = syncHeaders(peer, localTip, peerHeight);
+                    // BUGFIX: this used to be gated behind
+                    // `if (localTip < peerHeight)`. peerHeight is this
+                    // pooled connection's cached, connect-time-only
+                    // value (see PeerConnection's own field comment and
+                    // syncHeaders()'s updated comment) -- it never
+                    // changes again for as long as pickPoolPeer() keeps
+                    // handing back the same long-lived connection. Once
+                    // localTip first caught up to it, this gate went
+                    // false permanently, and the node never sent another
+                    // GETHEADERS to this peer again, no matter how many
+                    // new real blocks the network went on to produce.
+                    // That's the exact bug behind the tip sitting frozen
+                    // at the same height for hours while otherwise
+                    // looking perfectly healthy.
+                    //
+                    // Always probing is cheap: when we're genuinely
+                    // caught up, syncHeaders() now costs exactly one
+                    // GETHEADERS/HEADERS round trip (the peer replies
+                    // empty and the loop returns immediately). When the
+                    // peer actually has more, this is what discovers it.
+                    int newTip = syncHeaders(peer, localTip, peerHeight);
+                    if (newTip != localTip) {
                         System.out.printf("[ChainSync] Headers synced to %d%n", newTip);
-                        madeProgress = newTip > localTip;
+                    }
+                    madeProgress = newTip > localTip;
+                    // Keep the cached height roughly fresh too, so
+                    // crossCheckTip()'s cross-peer comparison and the
+                    // auto-rollback check above aren't permanently
+                    // working off a connect-time snapshot for a
+                    // long-lived pooled connection.
+                    if (newTip > peer.peerHeight) {
+                        peer.peerHeight = newTip;
                     }
 
                     // Download missing blocks. Its own return value feeds
@@ -1193,12 +1235,72 @@ public class ChainSync {
 
     // ── Header sync ───────────────────────────────────────────────────────────
 
+    // How long to wait for a HEADERS reply to a GETHEADERS we sent purely
+    // as a routine "anything new?" probe -- i.e. we already believe,
+    // going in, that we're caught up to this peer. Real hsd peers
+    // observed in practice simply stay silent when they have nothing new
+    // to send, rather than replying with an explicit empty HEADERS
+    // message, so this wait is the expected, common case once steady
+    // state is reached, not an error condition -- it fires on every
+    // single poll cycle for every already-caught-up pooled peer now that
+    // syncCycle() always probes (see its own comment on why). Keeping
+    // this short (rather than reusing the 30s genuine-catch-up timeout)
+    // is what keeps that routine case cheap instead of stalling each
+    // cycle for half a minute per peer for no reason.
+    private static final int PROBE_HEADERS_TIMEOUT_MS = 5_000;
+
+    // Full wait used when we actually expect real data back -- i.e. we
+    // know going in that this peer claims to be ahead of us.
+    private static final int CATCHUP_HEADERS_TIMEOUT_MS = 30_000;
+
     private int syncHeaders(PeerConnection peer, int localTip, int peerHeight)
             throws Exception {
         int tip = localTip;
         int batchesOnThisPeer = 0;
+        // Decided once, from the state at entry: are we asking because we
+        // genuinely expect this peer to have more (localTip < peerHeight),
+        // or just checking in case something changed since we last
+        // talked to it? See PROBE_HEADERS_TIMEOUT_MS's own comment.
+        boolean probing = localTip >= peerHeight;
+        int headersTimeoutMs = probing ? PROBE_HEADERS_TIMEOUT_MS : CATCHUP_HEADERS_TIMEOUT_MS;
+        // FIX: progress used to print on every single 2000-header batch,
+        // which meant ~175 lines just to sync one peer's worth of
+        // mainnet header history -- real console/scroll-back cost for
+        // information nobody needs at that resolution. Printing only
+        // every HEADER_PROGRESS_LOG_EVERY headers (plus always on the
+        // loop's final iteration, below) keeps the same "still making
+        // progress, here's roughly how far along" signal at a size that
+        // doesn't dominate the scroll-back. lastLoggedTip starts at
+        // localTip (not 0 or -1) so a resumed sync doesn't immediately
+        // reprint a line for ground already covered before this run.
+        int lastLoggedTip = localTip;
 
-        while (tip < peerHeight && running) {
+        // BUGFIX: this used to be `while (tip < peerHeight && running)`.
+        // peerHeight here is PeerConnection.peerHeight -- set exactly
+        // once, during that connection's VERSION handshake, and never
+        // updated again for the life of a pooled, reused connection (see
+        // syncCycle()'s own comment on this). Once localTip caught up to
+        // whatever height the peer happened to report AT CONNECT TIME,
+        // this condition went false on iteration zero forever, even
+        // though pickPoolPeer() keeps handing back that same long-lived
+        // connection cycle after cycle while the real network keeps
+        // producing new blocks underneath it. The node would then sit
+        // reporting the same frozen tip indefinitely, with no further
+        // GETHEADERS ever sent to that peer again -- exactly what was
+        // observed: hours of identical "Tip: 349711" / "Connected ...
+        // h=349711" lines with zero progress.
+        //
+        // The real protocol-correct stop condition doesn't need
+        // peerHeight at all: ask with our current tip, and stop when the
+        // peer itself says "nothing more" (an empty HEADERS reply) or
+        // stops responding. That's exactly what the loop body below
+        // already does (`if (headers.isEmpty()) break;`, the no-response
+        // timeout break). So the loop can run unconditionally and let
+        // the peer's own answers decide when to stop -- which also means
+        // a cycle where we're already caught up now costs exactly one
+        // cheap GETHEADERS/HEADERS round trip instead of silently doing
+        // nothing.
+        while (running) {
             // Build locator (sparse list of known block hashes)
             List<byte[]> locator = buildLocator(tip);
 
@@ -1215,10 +1317,17 @@ public class ChainSync {
             // doVersionHandshake. Loop past anything else instead, only
             // breaking on a genuine timeout or an actual empty HEADERS.
             byte[] msg = null;
-            long deadline = System.currentTimeMillis() + 30_000;
-            System.out.printf("[ChainSync] Waiting for HEADERS response from %s (up to 30s)...%n", peer.ip);
+            long deadline = System.currentTimeMillis() + headersTimeoutMs;
+            if (!probing) {
+                // Only worth announcing for a real catch-up wait -- a
+                // routine probe happens every single cycle now, so
+                // printing this every time would just reintroduce the
+                // noise the logging changes were meant to cut down on.
+                System.out.printf("[ChainSync] Waiting for HEADERS response from %s (up to %ds)...%n",
+                        peer.ip, headersTimeoutMs / 1000);
+            }
             while (System.currentTimeMillis() < deadline) {
-                byte[] candidate = peer.readMessage(30_000);
+                byte[] candidate = peer.readMessage(headersTimeoutMs);
                 if (candidate == null) break;
                 int type = getMessageType(candidate);
                 if (type == MSG_HEADERS) {
@@ -1232,7 +1341,17 @@ public class ChainSync {
                 // waiting for HEADERS.
             }
             if (msg == null) {
-                System.out.printf("[ChainSync] No HEADERS response from %s within 30s.%n", peer.ip);
+                // Silence here is the expected, common outcome of a
+                // routine probe (see PROBE_HEADERS_TIMEOUT_MS) -- worth a
+                // quiet, low-key line for anyone watching closely, but
+                // not the same "something might be wrong" framing as a
+                // real catch-up timing out with nothing.
+                if (probing) {
+                    System.out.printf("[ChainSync] %s has nothing new.%n", peer.ip);
+                } else {
+                    System.out.printf("[ChainSync] No HEADERS response from %s within %ds.%n",
+                            peer.ip, headersTimeoutMs / 1000);
+                }
                 break;
             }
             PeerScorecard.get().recordLatency(peer.ip, System.currentTimeMillis() - requestStart);
@@ -1346,7 +1465,16 @@ public class ChainSync {
             db.insertHeaders(validHeaders, insertStartHeight);
             tip = db.getHeaderTip();
 
-            System.out.printf("[ChainSync] Headers: %d/%d%n", tip, peerHeight);
+            // See HEADER_PROGRESS_LOG_EVERY's own comment -- throttled
+            // independently of the per-batch wire size. Always prints on
+            // the final batch (tip reaches peerHeight) even if that
+            // batch didn't cross a round 20,000 boundary, so "caught up"
+            // is never silently skipped.
+            boolean reachedPeerHeight = tip >= peerHeight;
+            if (tip - lastLoggedTip >= HEADER_PROGRESS_LOG_EVERY || reachedPeerHeight) {
+                System.out.printf("[ChainSync] Headers: %d/%d%n", tip, peerHeight);
+                lastLoggedTip = tip;
+            }
 
             // After each batch, check whether a meaningfully better peer
             // has emerged (e.g. thanks to the latency/valid-data scoring
@@ -1742,7 +1870,7 @@ public class ChainSync {
         // Notify listeners (wallet app, DNS app)
         if (rpc != null) rpc.notifyNewBlock(height, hash, rawBlock);
 
-        if (height % 100 == 0) {
+        if (height % BLOCK_PROGRESS_LOG_EVERY == 0) {
             System.out.printf("[ChainSync] Block %d processed (total: %d)%n",
                     height, blocksDownloaded.get());
         }

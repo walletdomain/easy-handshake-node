@@ -460,7 +460,12 @@ public class UrkelTree {
 
         state.totalVisited++;
         long now = System.currentTimeMillis();
-        if (now - state.lastLogMillis >= PROGRESS_LOG_EVERY_MILLIS) {
+        // FIX: gated behind VERBOSE_PRUNE_LOGGING (see its own comment
+        // on UrkelNameTree) -- a walk through a large backlog could
+        // print dozens of these in a row every PROGRESS_LOG_EVERY_MILLIS,
+        // and UrkelNameTree's periodic reconciliation rollup already
+        // covers the steady-state "is this working" signal.
+        if (UrkelNameTree.VERBOSE_PRUNE_LOGGING && now - state.lastLogMillis >= PROGRESS_LOG_EVERY_MILLIS) {
             state.lastLogMillis = now;
             System.out.println("[UrkelTree] Prune walk in progress: " + state.totalVisited
                     + " nodes visited so far (heap: " + UrkelNameTree.heapSnapshot() + ")");

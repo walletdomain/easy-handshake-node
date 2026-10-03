@@ -379,9 +379,17 @@ public class UrkelNodeStore {
             Math.max(10_000, UrkelNameTree.HARD_BACKPRESSURE_CAP / 10);
 
     public int removeKeys(java.util.List<HashKey> toRemove) {
-        System.out.println("[UrkelNodeStore] Prune removal phase STARTING: " + toRemove.size()
-                + " entries to remove in chunks of " + REMOVAL_CHUNK_SIZE
-                + " (heap: " + UrkelNameTree.heapSnapshot() + ")");
+        // FIX: gated behind VERBOSE_PRUNE_LOGGING (see its own comment
+        // on UrkelNameTree) -- previously unconditional, firing on every
+        // single reconciliation cycle's removal phase regardless of
+        // size. UrkelNameTree's periodic rollup is the always-on summary
+        // now; this detail is for actively diagnosing a specific slow
+        // or unusually large removal.
+        if (UrkelNameTree.VERBOSE_PRUNE_LOGGING) {
+            System.out.println("[UrkelNodeStore] Prune removal phase STARTING: " + toRemove.size()
+                    + " entries to remove in chunks of " + REMOVAL_CHUNK_SIZE
+                    + " (heap: " + UrkelNameTree.heapSnapshot() + ")");
+        }
 
         int totalRemoved = 0;
         int chunkNumber = 0;
@@ -404,7 +412,7 @@ public class UrkelNodeStore {
             chunkNumber++;
             totalRemoved += store.removeAll(rawKeys);
 
-            if (totalChunks > 1) {
+            if (totalChunks > 1 && UrkelNameTree.VERBOSE_PRUNE_LOGGING) {
                 System.out.println("[UrkelNodeStore] Prune removal chunk " + chunkNumber + "/" + totalChunks
                         + " complete (" + totalRemoved + "/" + toRemove.size() + " total, heap: "
                         + UrkelNameTree.heapSnapshot() + ")");
