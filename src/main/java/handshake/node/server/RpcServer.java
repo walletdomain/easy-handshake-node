@@ -11,13 +11,11 @@ import handshake.node.crypto.Secp256k1;
 import handshake.node.crypto.MerkleUtil;
 
 import handshake.node.storage.ChainDB;
-import handshake.node.storage.SeedDatabase;
 
 import handshake.node.urkeltree.UrkelNameHash;
 import handshake.node.urkeltree.UrkelProof;
 
-import handshake.node.peer.PeerDiscovery;
-import handshake.node.peer.PeerScorecard;
+import handshake.node.peer.PeerTable;
 import handshake.node.peer.NodeIdentity;
 
 import handshake.node.chain.BlockProcessor;
@@ -877,9 +875,9 @@ public class RpcServer {
                     "setban \"ip\" \"add|remove\" (bantime) (absolute)");
         }
         if ("add".equals(action)) {
-            PeerScorecard.get().banPeer(ip, "banned via RPC");
+            PeerTable.get().banPeer(ip, "banned via RPC");
         } else {
-            PeerScorecard.get().unbanPeer(ip);
+            PeerTable.get().unbanPeer(ip);
         }
         return "null";
     }
@@ -893,11 +891,11 @@ public class RpcServer {
      * remove"/clearbanned call, regardless of what banned_until shows.
      */
     private String listBanned() {
-        List<PeerScorecard.PeerRecord> banned = PeerScorecard.get().listBannedPeers();
+        List<PeerTable.Peer> banned = PeerTable.get().listBannedPeers();
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < banned.size(); i++) {
             if (i > 0) sb.append(",");
-            PeerScorecard.PeerRecord r = banned.get(i);
+            PeerTable.Peer r = banned.get(i);
             long createdSec = r.banTime / 1000;
             sb.append("{")
                     .append("\"address\":\"").append(r.ip).append("\",")
@@ -912,7 +910,7 @@ public class RpcServer {
     }
 
     private String clearBanned() {
-        PeerScorecard.get().clearAllBans();
+        PeerTable.get().clearAllBans();
         return "null";
     }
 
@@ -1192,7 +1190,7 @@ public class RpcServer {
         String ip = parts[0];
         int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 44806;
 
-        PeerDiscovery.get().addDiscovered(key, ip, port, "rpc-addnode");
+        PeerTable.get().addDiscovered(key, ip, port, "rpc-addnode");
         return "null";
     }
 
@@ -1206,8 +1204,11 @@ public class RpcServer {
         String addr = parseStringParam(params, 0);
         if (addr == null) throw new RpcException(-1, "getaddednodeinfo \"validator\"");
         String ip = addr.split(":")[0];
-        boolean known = SeedDatabase.get().getSeedByIp(ip) != null
-                || PeerDiscovery.get().isDiscovered(ip);
+        // isDiscovered() alone now covers both seeds and gossiped/inbound
+        // peers -- the unified table tracks everything it knows under one
+        // membership check (previously this needed a separate SeedDatabase
+        // lookup too).
+        boolean known = PeerTable.get().isDiscovered(ip);
         if (!known) return "[]";
         return "[{"
                 + "\"addednode\":\"" + addr + "\","

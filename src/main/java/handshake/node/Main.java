@@ -4,14 +4,12 @@ import handshake.node.util.HexUtil;
 
 import handshake.node.storage.ChainDB;
 import handshake.node.storage.ConfigDB;
-import handshake.node.storage.SeedDatabase;
 import handshake.node.storage.PersistentLog;
 
 import handshake.node.urkeltree.UrkelTreeRecovery;
 
 import handshake.node.peer.P2PServer;
-import handshake.node.peer.PeerDiscovery;
-import handshake.node.peer.PeerScorecard;
+import handshake.node.peer.PeerTable;
 import handshake.node.peer.NodeIdentity;
 
 import handshake.node.server.RpcServer;
@@ -195,14 +193,13 @@ public class Main {
         // ── 4. Node identity (Brontide keypair) ───────────────────────────────
         NodeIdentity identity = NodeIdentity.load(dataDir);
 
-        // ── 5. Peer scorecard ─────────────────────────────────────────────────
-        PeerScorecard.get().init(ConfigDB.get());
-        PeerDiscovery.get().init(db);
-
-        // ── 6. Seed database ──────────────────────────────────────────────────
-        SeedDatabase seeds = SeedDatabase.get();
+        // ── 5/6. Unified peer table (seeds + scoring + discovery) ──────────────
+        // Replaces the old separate PeerScorecard/PeerDiscovery/SeedDatabase
+        // init calls -- one table now owns all peer state, migrating any
+        // existing data from the three old storage locations on first run.
+        PeerTable.get().init(ConfigDB.get(), db);
         System.out.printf("[Main] Seeds loaded: %d Brontide (brontide-only)%n",
-                seeds.getBrontideSeeds().size());
+                PeerTable.get().getBrontideSeeds().size());
 
         // ── 7. RPC server ─────────────────────────────────────────────────────
         RpcServer rpc = new RpcServer(config, db);

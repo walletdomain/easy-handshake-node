@@ -149,9 +149,26 @@ public class PeerDiscovery {
         }
         int entryCount = msg[0] & 0xFF;
         int newlyAdded = 0;
-        int skippedKeylessOrWrongPort = 0;
+        // DIAGNOSTIC: previously one combined "keyless/wrong-port" bucket,
+        // which made it impossible to tell from the log which condition
+        // was actually firing -- and in real runs, EVERY SINGLE entry
+        // from EVERY peer has landed in that bucket (0 ever new), which
+        // is itself suspicious enough to want the breakdown. Split into
+        // three independent, non-exclusive counts (an entry can be both
+        // wrong-port and keyless at once) so a real run's output can
+        // finally answer "is it the port check, the key check, or both
+        // that's rejecting everything" instead of just one opaque number.
+        // samplePort/sampleKeyHex capture the first rejected entry's raw
+        // values verbatim, since a seen-but-wrong port number (e.g.
+        // consistently 12038, the legacy pre-Brontide port) versus a
+        // consistently empty key tells two very different stories about
+        // what this network is actually gossiping right now.
+        int skippedWrongPort = 0;
+        int skippedKeyless = 0;
         int skippedInvalidIp = 0;
         int skippedAlreadyKnown = 0;
+        Integer samplePort = null;
+        String sampleKeyHex = null;
         try {
             int pos = 1;
             for (int i = 0; i < entryCount && pos + 88 <= msg.length; i++) {
@@ -171,7 +188,17 @@ public class PeerDiscovery {
                         + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
                 if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
 
-                if (port != 44806 || isAllZero(keyBytes)) { skippedKeylessOrWrongPort++; continue; }
+                boolean wrongPort = port != 44806;
+                boolean keyless = isAllZero(keyBytes);
+                if (wrongPort || keyless) {
+                    if (wrongPort) skippedWrongPort++;
+                    if (keyless) skippedKeyless++;
+                    if (samplePort == null) {
+                        samplePort = port;
+                        sampleKeyHex = toHex(keyBytes);
+                    }
+                    continue;
+                }
 
                 if (discovered.containsKey(ip) || SeedDatabase.get().isSeed(ip)) {
                     skippedAlreadyKnown++;
@@ -183,9 +210,13 @@ public class PeerDiscovery {
                 newlyAdded++;
             }
             System.out.printf("[PeerDiscovery] ADDR from %s: %d entries (%d new, %d already known, "
-                            + "%d keyless/wrong-port, %d invalid IP).%n",
+                            + "%d wrong-port, %d keyless, %d invalid IP)%s.%n",
                     fromIp, entryCount, newlyAdded, skippedAlreadyKnown,
-                    skippedKeylessOrWrongPort, skippedInvalidIp);
+                    skippedWrongPort, skippedKeyless, skippedInvalidIp,
+                    samplePort != null
+                            ? String.format(" -- first rejected entry: port=%d key=%s",
+                            samplePort, sampleKeyHex)
+                            : "");
         } catch (Exception e) {
             // FIX: previously swallowed completely silently -- a
             // malformed/truncated ADDR message from a misbehaving or
@@ -200,6 +231,12 @@ public class PeerDiscovery {
     private static boolean isAllZero(byte[] b) {
         for (byte x : b) if (x != 0) return false;
         return true;
+    }
+
+    private static String toHex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) sb.append(String.format("%02x", x));
+        return sb.toString();
     }
 
     // ── Peer selection ────────────────────────────────────────────────────────

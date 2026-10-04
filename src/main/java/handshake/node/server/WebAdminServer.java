@@ -7,7 +7,7 @@ import handshake.node.storage.ChainDB;
 
 import handshake.node.urkeltree.UrkelTreeMismatchException;
 
-import handshake.node.peer.PeerScorecard;
+import handshake.node.peer.PeerTable;
 
 import handshake.node.chain.ChainSync;
 import handshake.node.chain.Mempool;
@@ -293,7 +293,7 @@ public class WebAdminServer {
             }
             StringBuilder sb = new StringBuilder("[");
             boolean first = true;
-            for (PeerScorecard.PeerRecord r : PeerScorecard.get().listBannedPeers()) {
+            for (PeerTable.Peer r : PeerTable.get().listBannedPeers()) {
                 if (!first) sb.append(",");
                 sb.append("{")
                         .append("\"ip\":\"").append(jsonEscape(r.ip)).append("\",")
@@ -326,7 +326,7 @@ public class WebAdminServer {
                 respondJson(ex, 400, "{\"error\":\"Missing ip\"}");
                 return;
             }
-            PeerScorecard.get().unbanPeer(ip);
+            PeerTable.get().unbanPeer(ip);
             respondJson(ex, 200, "{\"ok\":true}");
         } finally {
             ex.close();
@@ -343,7 +343,7 @@ public class WebAdminServer {
                 respondJson(ex, 403, "{\"error\":\"Origin mismatch\"}");
                 return;
             }
-            PeerScorecard.get().clearAllBans();
+            PeerTable.get().clearAllBans();
             respondJson(ex, 200, "{\"ok\":true}");
         } finally {
             ex.close();

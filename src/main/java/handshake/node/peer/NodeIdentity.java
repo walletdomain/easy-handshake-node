@@ -3,6 +3,7 @@ package handshake.node.peer;
 import handshake.node.util.HexUtil;
 
 import handshake.node.crypto.Secp256k1;
+import handshake.node.storage.ConfigDB;
 
 import java.io.*;
 import java.nio.file.*;
@@ -46,6 +47,23 @@ public class NodeIdentity {
     private final byte[] privateKey;   // 32 bytes
     private final byte[] publicKey;    // 33 bytes compressed
 
+    // FIX: our own public IP, once peer-corroborated (see ChainSync's
+    // confirmedSelfIp / recordSelfIpObservation()), was never actually
+    // persisted anywhere -- it lived only in a ChainSync-local in-memory
+    // field, rediscovered from scratch via fresh 2-peer corroboration on
+    // every single run, with this class's own startup banner always
+    // printing the "<yourIP>" placeholder regardless of what a previous
+    // run had already confirmed. Persisted here instead, under the
+    // "settings" map ConfigDB already owns (same one NodeConfig itself
+    // reads/writes), keyed "selfIp" -- so a restart can show the real
+    // last-known address immediately, and so there's finally a durable
+    // record of it at all. Still just a starting point, not blind trust:
+    // ChainSync re-runs its own 2-peer corroboration every session and
+    // calls recordConfirmedPublicIp() again if that finds something
+    // different (e.g. after a real IP change), which both updates this
+    // field and re-persists it.
+    private volatile String publicIp;
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     private NodeIdentity(String dataDir) {
@@ -76,9 +94,27 @@ public class NodeIdentity {
         this.privateKey = privKey;
         this.publicKey  = Secp256k1.compressedPublicKey(privKey);
 
+        // FIX: ConfigDB is already open by this point -- NodeConfig.load()
+        // (step 1 of Main's startup sequence) opens it before NodeIdentity
+        // is ever loaded (step 3) -- so this is safe to read here rather
+        // than needing ConfigDB threaded in as a constructor parameter,
+        // consistent with how other classes in this project (PeerTable's
+        // own persist()) already reach it via ConfigDB.get() directly.
+        String stored = ConfigDB.get().settingsMap().get("selfIp");
+        this.publicIp = (stored != null && !stored.isBlank()) ? stored : null;
+
         System.out.println("[Identity] Node public key: " + hex(publicKey));
-        System.out.println("[Identity] Brontide address: "
-                + base32Encode(publicKey) + "@<yourIP>:44806");
+        if (publicIp != null) {
+            // Last known, not yet reconfirmed THIS session -- ChainSync's
+            // own fresh 2-peer corroboration still runs every startup and
+            // will call recordConfirmedPublicIp() again, updating this (and
+            // re-persisting) if the real IP has actually changed since.
+            System.out.printf("[Identity] Brontide address: %s@%s:44806 (last known -- reconfirming...)%n",
+                    base32Encode(publicKey), publicIp);
+        } else {
+            System.out.println("[Identity] Brontide address: "
+                    + base32Encode(publicKey) + "@<yourIP>:44806 (not yet known -- first run or never confirmed)");
+        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -90,6 +126,25 @@ public class NodeIdentity {
 
     public String getBrontideAddress(String ip, int port) {
         return base32Encode(publicKey) + "@" + ip + ":" + port;
+    }
+
+    /** The last IP this node knows itself as reachable on -- either
+     *  peer-corroborated earlier this session, or (until that happens
+     *  again) the value persisted from a previous one. Null only on a
+     *  genuinely fresh install, or if no run has ever achieved 2-peer
+     *  corroboration. */
+    public String getKnownPublicIp() { return publicIp; }
+
+    /** Called by ChainSync once 2+ independent peers agree on our public
+     *  IP this session. No-op if it's unchanged from what's already known
+     *  (including already persisted from a prior run) -- avoids a
+     *  redundant disk write/commit every single startup when nothing
+     *  actually changed, which is the common case. */
+    public synchronized void recordConfirmedPublicIp(String ip) {
+        if (ip == null || ip.equals(publicIp)) return;
+        publicIp = ip;
+        ConfigDB.get().settingsMap().put("selfIp", ip);
+        ConfigDB.get().commit();
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────

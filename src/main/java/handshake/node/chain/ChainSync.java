@@ -8,15 +8,13 @@ import handshake.node.crypto.MerkleProof;
 
 import handshake.node.storage.ChainDB;
 import handshake.node.storage.ConfigDB;
-import handshake.node.storage.SeedDatabase;
 import handshake.node.storage.PersistentLog;
 
 import handshake.node.urkeltree.UrkelTreeRecovery;
 import handshake.node.urkeltree.UrkelTreeMismatchException;
 
 import handshake.node.peer.BrontideState;
-import handshake.node.peer.PeerDiscovery;
-import handshake.node.peer.PeerScorecard;
+import handshake.node.peer.PeerTable;
 import handshake.node.peer.NodeIdentity;
 
 import handshake.node.server.RpcServer;
@@ -132,8 +130,13 @@ public class ChainSync {
      * needed for normal operation. Error-path logging (decrypt failures,
      * bad magic, partial reads) stays on regardless, since those are rare
      * and genuinely useful when they do happen.
+     * <p>
+     * Not private: P2PServer gates its own inbound-handshake raw-byte
+     * logging off this same flag, so there's one switch for "show me
+     * every raw byte crossing the wire" rather than two independently
+     * toggled ones that could drift out of sync with each other.
      */
-    private static final boolean VERBOSE_WIRE_LOGGING = false;
+    public static final boolean VERBOSE_WIRE_LOGGING = false;
 
     /**
      * Minimum score gap (current peer vs. the top-ranked candidate)
@@ -247,6 +250,106 @@ public class ChainSync {
     private volatile Mempool   mempool;
     private volatile boolean   running;
 
+    // ── Self-address discovery ───────────────────────────────────────────────
+    //
+    // Every VERSION message a peer sends us is supposed to report (per the
+    // hsd "addr_recv" convention -- see parseVersion()'s own comment) what
+    // address THEY saw us connecting from: the same information a STUN
+    // server exists to provide, except free, since we already do this
+    // handshake with every seed on every startup anyway. No traceroute, no
+    // UPnP, no third-party lookup service needed -- it's already arriving
+    // in data we request for an unrelated reason.
+    //
+    // Trusted only once at least 2 DIFFERENT peers independently report the
+    // same IP -- the same "don't trust a single source" caution already
+    // used elsewhere in this file (crossCheckTip(), header-mismatch
+    // confirmation). A single peer could be lying, misconfigured, or
+    // running code that doesn't populate this field honestly at all --
+    // multiple strangers agreeing is a real signal; one peer's say-so isn't.
+    private static final Map<String, Set<String>> selfIpObservedBy = new ConcurrentHashMap<>();
+    private static final int SELF_IP_CONFIRMATIONS_REQUIRED = 2;
+
+    // FIX: seeded from NodeIdentity's own persisted value (see its own
+    // comment) rather than always starting null -- a restart now has a
+    // usable self address from the first connection onward instead of
+    // waiting for fresh corroboration every single run. `confirmedThisSession`
+    // (not "confirmedSelfIp != null") is now the gate on whether to keep
+    // tallying fresh observations: a seeded-but-not-yet-reconfirmed value
+    // still needs real corroboration this session, both to confirm it's
+    // still correct and to catch an actual IP change (VPN, ISP, etc.) --
+    // the old `confirmedSelfIp != null` check would have locked onto
+    // whatever was seeded and never updated it again all session.
+    private static volatile String confirmedSelfIp = null;
+    private static volatile boolean confirmedThisSession = false;
+
+    private void recordSelfIpObservation(String reportedIp, String fromPeerIp) {
+        if (confirmedThisSession) return; // already reconfirmed fresh this session
+        Set<String> reporters = selfIpObservedBy.computeIfAbsent(
+                reportedIp, k -> ConcurrentHashMap.newKeySet());
+        reporters.add(fromPeerIp);
+        if (reporters.size() >= SELF_IP_CONFIRMATIONS_REQUIRED && !confirmedThisSession) {
+            confirmedThisSession = true;
+            confirmedSelfIp = reportedIp;
+            identity.recordConfirmedPublicIp(reportedIp); // persists -- see its own comment
+            System.out.printf("[ChainSync] Our public address confirmed as %s by %d independent peers (%s).%n",
+                    reportedIp, reporters.size(), String.join(", ", reporters));
+            System.out.printf("[Identity] Our Brontide address: %s%n",
+                    identity.getBrontideAddress(reportedIp, config.getP2pPort()));
+            // Peers we connected to BEFORE this confirmation landed never
+            // got a self-announce (sendSelfAnnounce() no-ops while
+            // confirmedSelfIp is still null) -- tell all of them now
+            // instead of only whichever ones we happen to reconnect to
+            // later.
+            broadcastSelfAnnounceToAll();
+        }
+    }
+
+    /**
+     * Sends a self-only ADDR (just our own entry) to one peer -- the
+     * active-propagation counterpart to buildAddrMessage()'s existing
+     * self-entry, which only ever went out reactively, in reply to a
+     * GETADDR this node happened to receive. That dependency turned out
+     * to be the real reason this node had never once actually been seen
+     * inbound: nothing in the observed logs ever showed a peer sending us
+     * GETADDR, so the self-entry -- correct and ready since the earlier
+     * self-IP-discovery fix -- had never actually been transmitted
+     * anywhere. Real P2P networks typically self-announce unsolicited for
+     * exactly this reason rather than depending on being asked. Best-
+     * effort: failure here shouldn't tear down an otherwise-healthy
+     * connection, so it's logged, not propagated.
+     */
+    private void sendSelfAnnounce(PeerConnection conn) {
+        if (confirmedSelfIp == null) return;
+        try {
+            byte[] payload = new byte[1 + NET_ADDRESS_SIZE];
+            payload[0] = 1;
+            writeNetAddressStatic(payload, 1, confirmedSelfIp, config.getP2pPort(), identity.getPublicKey());
+            conn.sendMessage(MSG_ADDR, payload);
+            // DIAGNOSTIC: previously only the failure path logged anything
+            // here, so a successful self-announce and "this method was
+            // never even called" looked identical in the console --
+            // exactly the same blind spot every other diagnostic fix this
+            // session has corrected (inbound accepts, raw handshake bytes,
+            // etc.). This is the one direct way to confirm, from the log
+            // alone, that an unsolicited self-announce actually went out
+            // over the wire to a specific peer, rather than inferring it
+            // from the absence of an error line.
+            System.out.printf("[ChainSync] Self-announced (%s) to %s%n", confirmedSelfIp, conn.ip);
+        } catch (Exception e) {
+            System.out.printf("[ChainSync] Self-announce to %s failed (non-fatal): %s%n", conn.ip, e.getMessage());
+        }
+    }
+
+    /** Self-announces to every currently connected peer -- see its one
+     *  caller, recordSelfIpObservation(), for why this is needed in
+     *  addition to (not instead of) sendSelfAnnounce() on each new
+     *  connection. */
+    private void broadcastSelfAnnounceToAll() {
+        for (PeerInfo p : connectedPeers) {
+            sendSelfAnnounce(p.conn());
+        }
+    }
+
     /** NEW: self-healing support. Set once, the moment a
      *  UrkelTreeMismatchException is ever caught, and never cleared
      *  automatically -- deliberately a SEPARATE flag from `running`,
@@ -338,6 +441,15 @@ public class ChainSync {
         this.db       = db;
         this.identity = identity;
         this.rpc      = rpc;
+        // FIX: start from whatever NodeIdentity already has persisted
+        // (null on a genuinely fresh install, or if no prior run ever
+        // reached 2-peer corroboration) instead of always null -- lets
+        // buildAddrMessage()/sendSelfAnnounce() include a real self-entry
+        // from the very first connection this run, rather than waiting on
+        // fresh corroboration every single startup. confirmedThisSession
+        // stays false either way, so real corroboration still runs this
+        // session and can correct this if the IP has actually changed.
+        confirmedSelfIp = identity.getKnownPublicIp();
     }
 
     public void setMempool(Mempool mempool) {
@@ -427,7 +539,7 @@ public class ChainSync {
         // silently never fire during active syncing either, which is
         // most of the time.
         poolScheduler.scheduleWithFixedDelay(
-                () -> PeerScorecard.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
+                () -> PeerTable.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
     }
 
     /**
@@ -612,8 +724,8 @@ public class ChainSync {
                 System.out.printf("[ChainSync] Tip: %d | Blocks: %d | Outbound pool: %d/%d%n",
                         localTip, db.getBlockTip(), countOutboundPeers(), config.getMaxOutbound());
 
-                List<PeerDiscovery.ConnectTarget> candidates =
-                        PeerDiscovery.get().getCandidates();
+                List<PeerTable.ConnectTarget> candidates =
+                        PeerTable.get().getCandidates();
 
                 if (candidates.isEmpty() && countOutboundPeers() == 0) {
                     System.out.println("[ChainSync] No peer candidates — retrying in "
@@ -742,7 +854,7 @@ public class ChainSync {
                     return;
                 } catch (Exception e) {
                     peerBroken = true;
-                    PeerScorecard.get().recordFailure(peer.ip,
+                    PeerTable.get().recordFailure(peer.ip,
                             e.getClass().getSimpleName() + ": " + e.getMessage());
                     System.out.printf("[ChainSync] Peer %s error: %s%n",
                             peer.ip, e.getMessage());
@@ -797,14 +909,14 @@ public class ChainSync {
             int target = config.getMaxOutbound();
             if (countOutboundPeers() >= target) return;
 
-            List<PeerDiscovery.ConnectTarget> candidates = PeerDiscovery.get().getCandidates();
+            List<PeerTable.ConnectTarget> candidates = PeerTable.get().getCandidates();
             Set<String> alreadyConnected = new HashSet<>();
             for (PeerInfo p : connectedPeers) alreadyConnected.add(p.ip());
 
-            for (PeerDiscovery.ConnectTarget cand : candidates) {
+            for (PeerTable.ConnectTarget cand : candidates) {
                 if (countOutboundPeers() >= target) break;
                 if (alreadyConnected.contains(cand.ip())) continue;
-                if (!PeerScorecard.get().isGood(cand.ip())) continue;
+                if (!PeerTable.get().isGood(cand.ip())) continue;
                 try {
                     PeerConnection conn = connectPeer(cand);
                     if (conn == null) continue;
@@ -812,7 +924,7 @@ public class ChainSync {
                     System.out.printf("[ChainSync] Outbound pool: added %s (h=%d) -- now %d/%d%n",
                             conn.ip, conn.peerHeight, countOutboundPeers(), target);
                 } catch (Exception e) {
-                    PeerScorecard.get().recordFailure(cand.ip(),
+                    PeerTable.get().recordFailure(cand.ip(),
                             e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             }
@@ -836,24 +948,53 @@ public class ChainSync {
      * before maintainOutboundPool()'s first pass has run).
      */
     private PeerConnection pickPoolPeer(int ourTip) {
+        // BUGFIX: this used to also skip any pooled peer whose cached
+        // peer.conn().peerHeight was below our current tip
+        // (`if (p.conn().peerHeight < ourTip) continue;`). That field is
+        // only a connect-time snapshot, refreshed afterward ONLY for
+        // whichever peer syncCycle() actually ends up using that cycle
+        // (see its own comment: "if (newTip > peer.peerHeight)
+        // peer.peerHeight = newTip;") -- every OTHER pooled connection's
+        // cached height is frozen forever. That made this a one-way
+        // trap: the moment our tip first passed a given pooled peer's
+        // original snapshot, this filter excluded it from `usable`
+        // permanently, since nothing ever refreshes a peer that isn't
+        // picked. Whichever peer happened to be selected first stayed
+        // the only "usable" one for the rest of the run, by construction
+        // -- which is exactly what a real run showed: one peer
+        // (74.208.31.75) monopolized every single cycle for hundreds of
+        // polls straight, while the other pooled connections
+        // (159.69.46.23, 129.153.177.220) sat open but were silently
+        // filtered out of consideration forever, and shouldSwitchPeer()
+        // reporting "a better-scored peer is now available -- switching"
+        // never actually resulted in a switch, since pickPoolPeer()
+        // filtered that better peer back out before it was ever tried.
+        //
+        // There's no need for this filter at all now: a routine
+        // GETHEADERS probe against a peer that turns out to have nothing
+        // new costs one cheap, short round trip (see
+        // PROBE_HEADERS_TIMEOUT_MS), which is a far more reliable signal
+        // than a cached number that can go stale the moment it stops
+        // being refreshed. Scoring (PeerScorecard.weightedOrder below)
+        // is what should decide which usable peer to prefer, not a
+        // second, independent, silently-decaying filter on top of it.
         String skip = avoidPeerIp;
         List<PeerInfo> usable = new ArrayList<>();
         for (PeerInfo p : connectedPeers) {
             if (p.inbound()) continue;
             if (skip != null && p.ip().equals(skip)) continue;
-            if (!PeerScorecard.get().isGood(p.ip())) continue;
-            if (p.conn().peerHeight < ourTip) continue;
+            if (!PeerTable.get().isGood(p.ip())) continue;
             usable.add(p);
         }
         if (usable.isEmpty()) return null;
         avoidPeerIp = null; // consumed -- same one-shot semantics connectToBestPeer itself uses
-        List<String> order = PeerScorecard.get().weightedOrder(
+        List<String> order = PeerTable.get().weightedOrder(
                 usable.stream().map(PeerInfo::ip).toList());
         usable.sort(Comparator.comparingInt(p -> order.indexOf(p.ip())));
         return usable.get(0).conn();
     }
 
-    private PeerConnection acquireSyncPeer(List<PeerDiscovery.ConnectTarget> candidates, int ourTip) {
+    private PeerConnection acquireSyncPeer(List<PeerTable.ConnectTarget> candidates, int ourTip) {
         PeerConnection pooled = pickPoolPeer(ourTip);
         if (pooled != null) return pooled;
         return connectToBestPeer(candidates, ourTip);
@@ -901,7 +1042,7 @@ public class ChainSync {
             if (p.ip().equals(selected.ip)) continue;
             others.add(p.conn().peerHeight);
         }
-        for (PeerScorecard.PeerRecord r : PeerScorecard.get()
+        for (PeerTable.Peer r : PeerTable.get()
                 .getRecentHeightObservations(TIP_HISTORY_WINDOW_MS)) {
             if (r.ip.equals(selected.ip)) continue;
             others.add(r.lastHeight);
@@ -916,7 +1057,7 @@ public class ChainSync {
                             + "anywhere close to that -- syncing from it anyway, but this disagreement "
                             + "is worth watching.%n",
                     selected.ip, selected.peerHeight, others.size(), bestOther);
-            PeerScorecard.get().recordImplausibleTip(selected.ip, selected.peerHeight, bestOther);
+            PeerTable.get().recordImplausibleTip(selected.ip, selected.peerHeight, bestOther);
         }
     }
 
@@ -1023,14 +1164,14 @@ public class ChainSync {
     }
 
     private PeerConnection connectToBestPeer(
-            List<PeerDiscovery.ConnectTarget> candidates, int ourTip) {
+            List<PeerTable.ConnectTarget> candidates, int ourTip) {
 
         int maxPeerHeight = 0;
         String skipThisRound = avoidPeerIp;
         avoidPeerIp = null; // one-shot: consume it regardless of whether it was actually usable
 
-        for (PeerDiscovery.ConnectTarget target : candidates) {
-            if (!PeerScorecard.get().isGood(target.ip())) continue;
+        for (PeerTable.ConnectTarget target : candidates) {
+            if (!PeerTable.get().isGood(target.ip())) continue;
             if (target.ip().equals(skipThisRound)) continue;
 
             try {
@@ -1070,14 +1211,14 @@ public class ChainSync {
                     return conn; // good peer found
                 }
 
-                PeerScorecard.get().recordStaleTip(
+                PeerTable.get().recordStaleTip(
                         target.ip(), conn.peerHeight, ourTip);
                 System.out.printf("[ChainSync] Skipping %s (h=%d < our %d)%n",
                         target.ip(), conn.peerHeight, ourTip);
                 conn.close();
 
             } catch (Exception e) {
-                PeerScorecard.get().recordFailure(target.ip(),
+                PeerTable.get().recordFailure(target.ip(),
                         e.getClass().getSimpleName() + ": " + e.getMessage());
                 System.out.printf("[ChainSync] Connect to %s failed: %s: %s%n",
                         target.ip(), e.getClass().getSimpleName(), e.getMessage());
@@ -1105,7 +1246,7 @@ public class ChainSync {
         return null;
     }
 
-    private PeerConnection connectPeer(PeerDiscovery.ConnectTarget target)
+    private PeerConnection connectPeer(PeerTable.ConnectTarget target)
             throws Exception {
         // Brontide-only: every ConnectTarget PeerDiscovery hands back
         // always carries a real key (see PeerDiscovery.getCandidates()),
@@ -1183,7 +1324,14 @@ public class ChainSync {
         // every block/header hash. Restored.)
         conn.sendMessage(MSG_GETADDR, new byte[0]);
 
-        PeerScorecard.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight);
+        // Unsolicited self-announce -- see sendSelfAnnounce()'s own
+        // comment for why this, not just the reactive GETADDR-reply
+        // self-entry, turned out to be necessary. No-ops silently if we
+        // don't have a confirmed address yet (very first few connections
+        // of a genuinely fresh install, before 2-peer corroboration lands).
+        sendSelfAnnounce(conn);
+
+        PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight);
         return conn;
     }
 
@@ -1354,7 +1502,7 @@ public class ChainSync {
                 }
                 break;
             }
-            PeerScorecard.get().recordLatency(peer.ip, System.currentTimeMillis() - requestStart);
+            PeerTable.get().recordLatency(peer.ip, System.currentTimeMillis() - requestStart);
 
             // Parse headers
             List<byte[]> headers = parseHeaders(msg);
@@ -1374,6 +1522,25 @@ public class ChainSync {
             byte[] previousHeader = tip >= 0 ? db.getHeader(tip) : null;
             List<byte[]> validHeaders = new ArrayList<>();
             for (byte[] h : headers) {
+                // FIX: observed once in practice -- a peer's "next" header
+                // came back byte-for-byte IDENTICAL to the header we
+                // already have stored immediately before it (confirmed via
+                // the raw-bytes dump below, two separate variables --
+                // previousHeader from our own DB, h from this peer's wire
+                // reply -- holding the exact same 236 bytes). That's never
+                // legitimately new data: a header can't chain from itself,
+                // and whatever caused the peer to resend it (lag between
+                // its reported connect-time height and its real tip, a
+                // retransmit, etc.) isn't this project's fault and isn't
+                // "invalid data" in the sense the scoring penalty below is
+                // meant to catch. Treat an exact-duplicate resend as a
+                // harmless no-op -- skip it silently and keep processing
+                // the rest of the batch -- instead of tripping the
+                // mismatch diagnostic and penalizing the peer for sending
+                // us something we already have.
+                if (previousHeader != null && Arrays.equals(h, previousHeader)) {
+                    continue;
+                }
                 if (previousHeader != null && !HeaderUtil.chainsFrom(h, previousHeader)) {
                     // DIAGNOSTIC (temporary, pending root-cause): every
                     // real occurrence of this so far has been at a
@@ -1400,7 +1567,7 @@ public class ChainSync {
                     System.out.printf("[ChainSync]   incoming header raw bytes: %s%n",
                             toHex(h));
                     confirmDisagreement(tip + validHeaders.size(), h, peer);
-                    PeerScorecard.get().recordInvalidData(peer.ip,
+                    PeerTable.get().recordInvalidData(peer.ip,
                             "header at height " + (tip + validHeaders.size() + 1)
                                     + " doesn't chain from previous header");
                     break;
@@ -1431,7 +1598,7 @@ public class ChainSync {
                         System.out.printf("[PoW-DEBUG] prevBlock=%s%n", toHex(HeaderUtil.prevBlock(h)));
                         System.out.printf("[PoW-DEBUG] computed hash=%s%n", toHex(HeaderUtil.hash(h)));
                     }
-                    PeerScorecard.get().banPeer(peer.ip,
+                    PeerTable.get().banPeer(peer.ip,
                             "sent header at height " + badHeight
                                     + " with invalid proof-of-work");
                     break;
@@ -1441,7 +1608,7 @@ public class ChainSync {
             }
             if (validHeaders.isEmpty()) break;
             if (validHeaders.size() == headers.size()) {
-                PeerScorecard.get().recordValidData(peer.ip);
+                PeerTable.get().recordValidData(peer.ip);
             }
 
             // Store headers (with fake-header cap). Special case: the
@@ -1464,6 +1631,27 @@ public class ChainSync {
             }
             db.insertHeaders(validHeaders, insertStartHeight);
             tip = db.getHeaderTip();
+
+            // FIX: bestKnownPeerHeight was only ever fed by a peer's
+            // VERSION-time height claim (see parseVersion()'s "if
+            // (peerHeight > bestKnownPeerHeight)" line) -- a one-time
+            // snapshot from connect, never touched again for the life of
+            // the process. That's exactly the same kind of staleness
+            // pickPoolPeer()'s old `peerHeight < ourTip` filter caused
+            // (see its own fix comment), just surfacing somewhere else:
+            // once real sync progress carried our own tip PAST whatever
+            // every currently-connected peer happened to report at
+            // connect time, bestKnownPeerHeight stayed frozen forever,
+            // producing exactly what was seen in the admin panel --
+            // "349810 of 349808" (synced further than the peer's stale
+            // VERSION-time height the denominator was still built from;
+            // the 100% cap only hid part of the symptom, not its cause).
+            // Every header accepted here passed real chain-link and PoW
+            // checks, so it IS proof the network's real height is at
+            // least `tip` -- updating from this, not just from VERSION,
+            // keeps the figure honest as sync actually progresses instead
+            // of only at the moment each connection was first made.
+            if (tip > bestKnownPeerHeight) bestKnownPeerHeight = tip;
 
             // See HEADER_PROGRESS_LOG_EVERY's own comment -- throttled
             // independently of the per-batch wire size. Always prints on
@@ -1518,7 +1706,7 @@ public class ChainSync {
      * a reconnect on every single batch.
      */
     private boolean shouldSwitchPeer(String currentIp) {
-        List<PeerScorecard.PeerRecord> ranked = PeerScorecard.get().getRankedPeers();
+        List<PeerTable.Peer> ranked = PeerTable.get().getRankedPeers();
         if (ranked.isEmpty()) return false;
         int topScore = ranked.get(0).score;
         int currentScore = ranked.stream()
@@ -1827,7 +2015,7 @@ public class ChainSync {
             byte[] storedHash = HeaderUtil.hash(storedHeader);
             if (!Arrays.equals(hash, storedHash)) {
                 System.err.printf("[ChainSync] Block %d hash mismatch!%n", height);
-                PeerScorecard.get().recordInvalidData(fromIp,
+                PeerTable.get().recordInvalidData(fromIp,
                         "block " + height + " hash mismatch");
                 return false;
             }
@@ -1844,7 +2032,7 @@ public class ChainSync {
             // A genuine consensus violation (bad merkle root, failed
             // signature) -- this peer actually sent us something
             // invalid, so banning it is correct.
-            PeerScorecard.get().banPeer(fromIp,
+            PeerTable.get().banPeer(fromIp,
                     "sent block " + height + " that failed validation");
             return false;
         }
@@ -1859,7 +2047,7 @@ public class ChainSync {
             // actually their fault.
             return false;
         }
-        PeerScorecard.get().recordValidData(fromIp);
+        PeerTable.get().recordValidData(fromIp);
 
         // Store block
         db.saveBlock(rawBlock, height);
@@ -1887,7 +2075,7 @@ public class ChainSync {
             byte[] raw = Arrays.copyOfRange(msg, 9, msg.length);
             mempool.submitFromPeer(raw, peer.ip);
         } else if (type == MSG_ADDR) {
-            PeerDiscovery.get().onAddrMessage(
+            PeerTable.get().onAddrMessage(
                     Arrays.copyOfRange(msg, 9, msg.length), peer.ip);
         } else if (type == MSG_GETADDR) {
             peer.sendMessage(MSG_ADDR, buildAddrMessage());
@@ -1983,11 +2171,45 @@ public class ChainSync {
             socket.setSoTimeout(READ_TIMEOUT_MS);
 
             connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), true));
-            PeerScorecard.get().recordSuccess(ip, conn.agent, conn.peerHeight);
+            PeerTable.get().recordSuccess(ip, conn.agent, conn.peerHeight);
+
+            // Same unsolicited self-announce as the outbound side
+            // (connectPeer()) -- an inbound peer is just as real a
+            // propagation path as an outbound one, and there's no reason
+            // to only tell peers we happened to dial ourselves.
+            sendSelfAnnounce(conn);
+
+            // NEW: this is the one case where we learn a peer's real
+            // Brontide static key WITHOUT needing to already know it --
+            // Noise_XK transmits the initiator's static key to the
+            // responder as part of the handshake (see BrontideState's
+            // own comment on remoteStaticPub), so by the time Act 3 has
+            // completed, `brontide.getRemoteStaticPub()` holds it for
+            // free. Previously this was simply discarded: an inbound
+            // peer could connect, sync, and disconnect without ever
+            // being recorded anywhere, meaning this node could never
+            // re-offer it to anyone else via our own ADDR responses, nor
+            // treat it as a future outbound candidate itself.
+            //
+            // We don't actually know this peer's real listening port --
+            // only the ephemeral source port their OS picked for this
+            // outbound-from-their-side connection, which is useless for
+            // dialing them back. config.getP2pPort() (the same port we
+            // ourselves listen on) is the standing convention this whole
+            // project already assumes everywhere else a port isn't
+            // otherwise known (see Seed's own default), so it's used
+            // here too rather than inventing a different fallback.
+            byte[] remoteKey = brontide.getRemoteStaticPub();
+            if (remoteKey != null && remoteKey.length == 33) {
+                String base32Key = NodeIdentity.base32Encode(remoteKey);
+                PeerTable.get().addDiscovered(base32Key, ip, config.getP2pPort(), "inbound:" + ip);
+                System.out.printf("[ChainSync] Learned real Brontide key for %s from its inbound "
+                        + "connection -- now a known, re-shareable peer.%n", ip);
+            }
 
             inboundExecutor.submit(() -> runInboundLoop(conn));
         } catch (Exception e) {
-            PeerScorecard.get().recordFailure(ip, "inbound handshake failed: " + e.getMessage());
+            PeerTable.get().recordFailure(ip, "inbound handshake failed: " + e.getMessage());
             try { socket.close(); } catch (IOException ignored) { }
         }
     }
@@ -2009,7 +2231,7 @@ public class ChainSync {
                 } else if (type == MSG_GETADDR) {
                     conn.sendMessage(MSG_ADDR, buildAddrMessage());
                 } else if (type == MSG_ADDR) {
-                    PeerDiscovery.get().onAddrMessage(Arrays.copyOfRange(msg, 9, msg.length), conn.ip);
+                    PeerTable.get().onAddrMessage(Arrays.copyOfRange(msg, 9, msg.length), conn.ip);
                 } else if (type == MSG_GETHEADERS) {
                     serveGetHeaders(conn, Arrays.copyOfRange(msg, 9, msg.length));
                 } else if (type == MSG_GETDATA) {
@@ -2309,19 +2531,32 @@ public class ChainSync {
      *  meaning every peer we told others about was reported as keyless
      *  regardless of whether we actually knew its brontide key. */
     private byte[] buildAddrMessage() {
+        // NEW: previously this only ever relayed OTHER peers' addresses --
+        // we never once included an entry for ourselves, no matter who
+        // asked. That meant there was no path, even in principle, for
+        // this node's address to ever enter anyone else's address book
+        // via gossip: we could complete a GETADDR/ADDR exchange countless
+        // times and never once tell anyone we exist. Now that a real,
+        // multi-peer-corroborated public IP is available (see
+        // confirmedSelfIp / recordSelfIpObservation()'s own comment),
+        // include a real, dialable self-entry -- but only once it's been
+        // confirmed by independent peers, never a guess.
+        boolean includeSelf = confirmedSelfIp != null;
         List<PeerInfo> known = connectedPeers.subList(0, Math.min(200, connectedPeers.size()));
-        byte[] payload = new byte[1 + known.size() * NET_ADDRESS_SIZE];
+        int total = known.size() + (includeSelf ? 1 : 0);
+        byte[] payload = new byte[1 + total * NET_ADDRESS_SIZE];
         int pos = 0;
-        payload[pos++] = (byte) known.size();
+        payload[pos++] = (byte) total;
+        if (includeSelf) {
+            pos = writeNetAddressStatic(payload, pos, confirmedSelfIp,
+                    config.getP2pPort(), identity.getPublicKey());
+        }
         for (PeerInfo p : known) {
-            SeedDatabase.Seed seed = SeedDatabase.get().getSeedByIp(p.ip());
-            byte[] key = null;
-            if (seed != null && seed.hasBrontideKey()) {
-                key = NodeIdentity.base32Decode(seed.brontideKey());
-            } else {
-                String discoveredKey = PeerDiscovery.get().getBrontideKeyByIp(p.ip());
-                if (discoveredKey != null) key = NodeIdentity.base32Decode(discoveredKey);
-            }
+            // Unified lookup: PeerTable.getBrontideKeyByIp() covers seeds and
+            // discovered/inbound peers alike now (previously this checked
+            // SeedDatabase then fell back to PeerDiscovery separately).
+            String knownKey = PeerTable.get().getBrontideKeyByIp(p.ip());
+            byte[] key = knownKey != null ? NodeIdentity.base32Decode(knownKey) : null;
             pos = writeNetAddressStatic(payload, pos, p.ip(), 44806, key);
         }
         return payload;
@@ -2381,6 +2616,12 @@ public class ChainSync {
         // UrkelNode.Internal's left/right and UrkelTree's
         // awaitingNextCommit earlier this session, not a new pattern.
         volatile BloomFilter bloomFilter = null;
+
+        // DIAGNOSTIC: what this peer's own VERSION message reported
+        // seeing as OUR address (see parseVersion()'s own comment on
+        // this) -- null until a VERSION has actually been received and
+        // parsed. Not yet used for anything beyond observation.
+        volatile String selfReportedIp = null;
 
         PeerConnection(Socket socket, InputStream in, OutputStream out,
                        BrontideState brontide, String ip) {
@@ -2531,6 +2772,46 @@ public class ChainSync {
                     protocolVersion = (int) readLE32(msg, 0);
                     services = (int) readLE32(msg, 4);
                 }
+
+                // DIAGNOSTIC: this NetAddress field is documented (per the
+                // real hsd reference, see writeNetAddress()'s own comment)
+                // as the sender's view of the RECEIVER -- i.e. when a peer
+                // sends US their VERSION, this is supposed to be what
+                // address THEY saw US connecting from. That's exactly the
+                // same information a STUN server exists to provide,
+                // except free: we already open these connections to sync
+                // anyway. Nobody has verified whether real hsd peers
+                // actually populate this honestly, though -- our OWN
+                // outgoing version deliberately writes an all-zero key
+                // into the equivalent field rather than a real one (see
+                // that comment), so the same skepticism applies here
+                // until real captured data says otherwise. This just logs
+                // what every connected peer reports, as its own line, so
+                // that question can be answered by looking at several
+                // real peers' answers side by side rather than guessing
+                // or trusting a single one. NOT used for anything yet --
+                // no self-announcement wired up until this data says it's
+                // trustworthy (e.g. multiple independent peers agreeing).
+                //
+                // Layout within the 88-byte NetAddress (starts at offset
+                // 20 = version+services+hi_services+time):
+                // time(8)+services(4)+hiServices(4)+addrType(1)+raw(16)
+                // +reserved(20)+port(2)+key(33). raw[16]'s last 4 bytes
+                // are the IPv4 address (standard IPv4-mapped-IPv6), so
+                // absolute offset 20+8+4+4+1+12 = 49, 4 bytes.
+                final int netAddrStart = 4 + 4 + 4 + 8; // = 20
+                final int rawIpOffset = netAddrStart + 8 + 4 + 4 + 1 + 12; // = 49
+                if (msg.length >= rawIpOffset + 4) {
+                    String reportedIp = (msg[rawIpOffset] & 0xFF) + "."
+                            + (msg[rawIpOffset + 1] & 0xFF) + "."
+                            + (msg[rawIpOffset + 2] & 0xFF) + "."
+                            + (msg[rawIpOffset + 3] & 0xFF);
+                    selfReportedIp = reportedIp;
+                    System.out.printf("[Handshake] <- %s reports our address as seen by them: %s%n",
+                            ip, reportedIp);
+                    recordSelfIpObservation(reportedIp, ip);
+                }
+
                 int pos = 4 + 4 + 4 + 8 + NET_ADDRESS_SIZE + 8; // = 116, start of agentLen
                 if (msg.length <= pos) return;
                 int agentLen = msg[pos] & 0xFF;

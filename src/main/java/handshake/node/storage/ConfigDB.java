@@ -43,6 +43,7 @@ public final class ConfigDB {
     private final KVMap<String, String> settings;
     private final KVMap<String, String> seeds;
     private final KVMap<String, String> peerScores;
+    private final KVMap<String, String> peers;
 
     private ConfigDB(String dataDir) {
         String path = dataDir + "/config";
@@ -53,6 +54,11 @@ public final class ConfigDB {
         this.settings = store.openStringStringMap("settings");
         this.seeds = store.openStringStringMap("seeds");
         this.peerScores = store.openStringStringMap("peerScores");
+        // NEW: unified peer table storage (handshake.node.peer.PeerTable),
+        // replacing the old seeds/peerScores/ChainDB-peers split. The old
+        // maps above are left opened and untouched on disk so
+        // PeerTable.migrateLegacyData() can read them once at startup.
+        this.peers = store.openStringStringMap("peers");
         // FIX: a "discoveredPeers" map used to be opened here too, but it
         // was dead -- confirmed via grep across the whole codebase to
         // have no accessor and no reader/writer anywhere, apparently a
@@ -69,6 +75,7 @@ public final class ConfigDB {
     public KVMap<String, String> settingsMap() { return settings; }
     public KVMap<String, String> seedsMap() { return seeds; }
     public KVMap<String, String> peerScoresMap() { return peerScores; }
+    public KVMap<String, String> peersMap() { return peers; }
 
     public void commit() {
         store.commit();
