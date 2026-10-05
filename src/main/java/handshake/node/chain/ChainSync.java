@@ -1119,7 +1119,10 @@ public class ChainSync {
                 while (System.currentTimeMillis() < deadline) {
                     byte[] candidate = confirmer.readMessage(10_000);
                     if (candidate == null) break;
-                    if (getMessageType(candidate) == MSG_HEADERS) { msg = candidate; break; }
+                    if (getMessageType(candidate) == MSG_HEADERS) {
+                        if (headersAnswerLocator(candidate, locator)) { msg = candidate; break; }
+                        continue; // unsolicited tip announcement / stale batch, not our reply
+                    }
                     handleNonBlockMessage(candidate, confirmer);
                 }
                 asked++;
@@ -1479,8 +1482,25 @@ public class ChainSync {
                 if (candidate == null) break;
                 int type = getMessageType(candidate);
                 if (type == MSG_HEADERS) {
-                    msg = candidate;
-                    break;
+                    // FIX: a HEADERS message is not necessarily the answer to
+                    // OUR GETHEADERS. We send SENDHEADERS during the
+                    // handshake, so hsd also pushes an unsolicited
+                    // single-header HEADERS announcement for every new
+                    // block, which sits unread on idle pooled connections
+                    // until the next request reads it as if it were the
+                    // reply (confirmed from a real log: the "mismatching"
+                    // headers were stamped minutes before the log time,
+                    // i.e. the live chain tip, or were stale leftovers of
+                    // an earlier batch). A genuine reply's first header
+                    // always chains from one of the hashes in our locator;
+                    // anything else is skipped, not penalised.
+                    if (headersAnswerLocator(candidate, locator)) {
+                        msg = candidate;
+                        break;
+                    }
+                    System.out.printf("[ChainSync] Ignoring unsolicited/stale HEADERS from %s "
+                                    + "(doesn't answer our locator) -- still waiting for the real reply.%n",
+                            peer.ip);
                 } else {
                     handleNonBlockMessage(candidate, peer);
                 }
@@ -1806,6 +1826,21 @@ public class ChainSync {
             (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
             (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00
     };
+
+    /** True if this HEADERS message plausibly answers a GETHEADERS sent
+     *  with {@code locator}: empty ("nothing more"), or its first header's
+     *  prevBlock is one of the locator hashes (the peer replies starting
+     *  right after the first locator hash it knows -- normally our tip,
+     *  or an earlier entry on a reorg). */
+    private boolean headersAnswerLocator(byte[] msg, List<byte[]> locator) {
+        List<byte[]> hs = parseHeaders(msg);
+        if (hs.isEmpty()) return true;
+        byte[] prev = HeaderUtil.prevBlock(hs.get(0));
+        for (byte[] l : locator) {
+            if (Arrays.equals(prev, l)) return true;
+        }
+        return false;
+    }
 
     private List<byte[]> buildLocator(int tip) {
         List<byte[]> locator = new ArrayList<>();
@@ -3006,7 +3041,11 @@ public class ChainSync {
         @Override
         public void close() {
             try { socket.close(); } catch (IOException ignored) {}
-            connectedPeers.removeIf(p -> p.ip().equals(ip));
+            // FIX: was removeIf(p -> p.ip().equals(ip)), which dropped EVERY
+            // entry for this IP -- including a still-open connection in the
+            // opposite direction (e.g. an inbound entry when an outbound one
+            // to the same peer closed). Remove only this connection.
+            connectedPeers.removeIf(p -> p.conn() == this);
         }
     }
 

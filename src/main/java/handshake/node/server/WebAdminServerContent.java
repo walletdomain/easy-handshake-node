@@ -730,10 +730,17 @@ public final class WebAdminServerContent {
                 return (bytes / (1024 * 1024)).toFixed(1) + " MB";
             }
 
+            // Escapes all five HTML-significant characters. The previous
+            // textContent/innerHTML trick only escaped & < > and left quotes
+            // alone, which is unsafe in attribute context such as
+            // data-ip="${escapeHtml(b.ip)}" above.
             function escapeHtml(s) {
-                const div = document.createElement("div");
-                div.textContent = s;
-                return div.innerHTML;
+                return String(s == null ? "" : s)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#39;");
             }
 
             async function loadApiKey() {
