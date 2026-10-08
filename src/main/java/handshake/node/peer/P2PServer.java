@@ -37,12 +37,13 @@ public class P2PServer {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    private final ExecutorService acceptExecutor = Executors.newSingleThreadExecutor(
+    private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(2,
             r -> namedDaemon(r, "p2p-accept"));
     private final ExecutorService handshakeExecutor = Executors.newCachedThreadPool(
             r -> namedDaemon(r, "p2p-handshake"));
 
     private ServerSocket serverSocket;
+    private ServerSocket plainServerSocket;   // cleartext listener (hsd's standard port), may be null
 
     public P2PServer(NodeConfig config, NodeIdentity identity, ChainSync chainSync) {
         this.config = config;
@@ -55,27 +56,70 @@ public class P2PServer {
         serverSocket = new ServerSocket();
         serverSocket.setReuseAddress(true);
         serverSocket.bind(new InetSocketAddress(config.getP2pPort()));
-        acceptExecutor.submit(this::acceptLoop);
+        acceptExecutor.submit(() -> acceptLoop(serverSocket, false));
+
+        // Cleartext listener: plain hsd peers can connect to us the way they
+        // connect to each other. A failure to bind it (port in use, no
+        // permission) must not take down the Brontide listener.
+        if (config.isPlainP2pEnabled()) {
+            try {
+                plainServerSocket = new ServerSocket();
+                plainServerSocket.setReuseAddress(true);
+                plainServerSocket.bind(new InetSocketAddress(config.getPlainP2pPort()));
+                final ServerSocket plainSock = plainServerSocket;
+                acceptExecutor.submit(() -> acceptLoop(plainSock, true));
+                System.out.printf("[P2PServer] Cleartext listener on port %d (peers connecting here are scored as downgraded cleartext peers).%n",
+                        config.getPlainP2pPort());
+            } catch (IOException e) {
+                System.out.printf("[P2PServer] Could not open cleartext listener on port %d: %s -- continuing Brontide-only.%n",
+                        config.getPlainP2pPort(), e.getMessage());
+                closeQuietly(plainServerSocket);
+                plainServerSocket = null;
+            }
+        }
     }
 
     public synchronized void stop() {
         if (!running.compareAndSet(true, false)) return;
         closeQuietly(serverSocket);
+        closeQuietly(plainServerSocket);
         acceptExecutor.shutdownNow();
         handshakeExecutor.shutdownNow();
     }
 
-    private void acceptLoop() {
+    private void acceptLoop(ServerSocket listener, boolean plain) {
         while (running.get()) {
             Socket socket;
             try {
-                socket = serverSocket.accept();
+                socket = listener.accept();
             } catch (IOException e) {
-                if (running.get()) continue;
+                if (running.get() && !listener.isClosed()) continue;
                 break;
             }
-            handshakeExecutor.submit(() -> handleAccepted(socket));
+            handshakeExecutor.submit(() -> {
+                if (plain) handleAcceptedPlain(socket); else handleAccepted(socket);
+            });
         }
+    }
+
+    /** Inbound cleartext connection: no Brontide handshake, straight to the
+     *  P2P version handshake. Same skip/limit rules as the Brontide path. */
+    private void handleAcceptedPlain(Socket socket) {
+        String ip = socket.getInetAddress().getHostAddress();
+        System.out.printf("[P2PServer] Inbound CLEARTEXT connection attempt from %s%n", ip);
+        if (PeerTable.get().shouldSkip(ip)) {
+            System.out.printf("[P2PServer] Rejected inbound cleartext from %s -- currently backed off/banned.%n", ip);
+            closeQuietly(socket);
+            return;
+        }
+        if (chainSync.inboundPeerCount() >= config.getMaxInbound()) {
+            System.out.printf("[P2PServer] Rejected inbound cleartext from %s -- at max inbound (%d).%n",
+                    ip, config.getMaxInbound());
+            closeQuietly(socket);
+            return;
+        }
+        // registerInboundPeer takes ownership of the socket (and closes it on failure).
+        chainSync.registerInboundPeer(socket, null, ip);
     }
 
     private void handleAccepted(Socket socket) {

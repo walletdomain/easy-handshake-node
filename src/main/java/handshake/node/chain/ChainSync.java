@@ -290,6 +290,7 @@ public class ChainSync {
         if (reporters.size() >= SELF_IP_CONFIRMATIONS_REQUIRED && !confirmedThisSession) {
             confirmedThisSession = true;
             confirmedSelfIp = reportedIp;
+            PeerTable.get().setSelfIp(reportedIp);
             identity.recordConfirmedPublicIp(reportedIp); // persists -- see its own comment
             System.out.printf("[ChainSync] Our public address confirmed as %s by %d independent peers (%s).%n",
                     reportedIp, reporters.size(), String.join(", ", reporters));
@@ -321,9 +322,14 @@ public class ChainSync {
     private void sendSelfAnnounce(PeerConnection conn) {
         if (confirmedSelfIp == null) return;
         try {
-            byte[] payload = new byte[1 + NET_ADDRESS_SIZE];
-            payload[0] = 1;
-            writeNetAddressStatic(payload, 1, confirmedSelfIp, config.getP2pPort(), identity.getPublicKey());
+            boolean plainOn = config.isPlainP2pEnabled();
+            int n = plainOn ? 2 : 1;
+            byte[] payload = new byte[1 + n * NET_ADDRESS_SIZE];
+            payload[0] = (byte) n;
+            int apos = writeNetAddressStatic(payload, 1, confirmedSelfIp, config.getP2pPort(), identity.getPublicKey());
+            // Second, keyless entry: our cleartext listener, so plain hsd peers
+            // (which never dial Brontide entries they have no use for) can reach us too.
+            if (plainOn) writeNetAddressStatic(payload, apos, confirmedSelfIp, config.getPlainP2pPort(), null);
             conn.sendMessage(MSG_ADDR, payload);
             // DIAGNOSTIC: previously only the failure path logged anything
             // here, so a successful self-announce and "this method was
@@ -450,6 +456,7 @@ public class ChainSync {
         // stays false either way, so real corroboration still runs this
         // session and can correct this if the IP has actually changed.
         confirmedSelfIp = identity.getKnownPublicIp();
+        PeerTable.get().setSelfIp(confirmedSelfIp);
     }
 
     public void setMempool(Mempool mempool) {
@@ -753,8 +760,8 @@ public class ChainSync {
                     // handshake, so this is always "BRONTIDE" -- no
                     // cleartext transport exists anymore to distinguish
                     // from.
-                    System.out.printf("[ChainSync] Connected to %s via BRONTIDE (h=%d, agent=%s)%n",
-                            peer.ip, peerHeight, peer.agent);
+                    System.out.printf("[ChainSync] Connected to %s via %s (h=%d, agent=%s)%n",
+                            peer.ip, peer.plain ? "CLEARTEXT" : "BRONTIDE", peerHeight, peer.agent);
 
                     // See crossCheckTip()'s own comment -- this is the
                     // actual reason to keep several outbound connections
@@ -762,12 +769,18 @@ public class ChainSync {
                     // sync source's claimed height against.
                     crossCheckTip(peer);
 
-                    // Auto-rollback if we're far above all peers
-                    if (localTip > peerHeight + 2016) {
-                        System.out.printf("[ChainSync] Our tip %d >> peer %d — rolling back%n",
-                                localTip, peerHeight);
-                        db.resetHeaderTip(peerHeight);
-                        localTip = peerHeight;
+                    // Auto-rollback only if we're far above ALL connected peers.
+                    // FIX: this used to compare against the single sync peer
+                    // alone, so one peer that was simply still syncing itself
+                    // (a freshly started node at height 194230, while every
+                    // other peer was at 350149) made a fully synced node throw
+                    // away 156,000 header-tip entries and re-download them.
+                    int rollbackTo = rollbackTargetIfFarAhead(localTip);
+                    if (rollbackTo >= 0) {
+                        System.out.printf("[ChainSync] Our tip %d >> every connected peer (best %d) — rolling back%n",
+                                localTip, rollbackTo);
+                        db.resetHeaderTip(rollbackTo);
+                        localTip = rollbackTo;
                     }
 
                     // BUGFIX: this used to be gated behind
@@ -916,6 +929,7 @@ public class ChainSync {
             for (PeerTable.ConnectTarget cand : candidates) {
                 if (countOutboundPeers() >= target) break;
                 if (alreadyConnected.contains(cand.ip())) continue;
+                if (cand.ip().equals(confirmedSelfIp)) continue;
                 if (!PeerTable.get().isGood(cand.ip())) continue;
                 try {
                     PeerConnection conn = connectPeer(cand);
@@ -1175,6 +1189,7 @@ public class ChainSync {
 
         for (PeerTable.ConnectTarget target : candidates) {
             if (!PeerTable.get().isGood(target.ip())) continue;
+            if (target.ip().equals(confirmedSelfIp)) continue;
             if (target.ip().equals(skipThisRound)) continue;
 
             try {
@@ -1228,11 +1243,13 @@ public class ChainSync {
             }
         }
 
-        // Auto-rollback if all peers are below us by a large margin
-        if (maxPeerHeight > 0 && ourTip > maxPeerHeight + 2016) {
+        // Auto-rollback only if ALL connected peers are far below us (see
+        // rollbackTargetIfFarAhead() for why one lagging peer isn't enough).
+        int rollbackTo = rollbackTargetIfFarAhead(ourTip);
+        if (rollbackTo >= 0) {
             System.out.printf("[ChainSync] All peers at ~%d, our tip %d — rolling back%n",
-                    maxPeerHeight, ourTip);
-            db.resetHeaderTip(maxPeerHeight);
+                    rollbackTo, ourTip);
+            db.resetHeaderTip(rollbackTo);
         }
 
         // If diversification caused us to skip the one peer that would
@@ -1251,10 +1268,11 @@ public class ChainSync {
 
     private PeerConnection connectPeer(PeerTable.ConnectTarget target)
             throws Exception {
-        // Brontide-only: every ConnectTarget PeerDiscovery hands back
-        // always carries a real key (see PeerDiscovery.getCandidates()),
-        // so there's no cleartext fallback branch here at all anymore --
-        // this project no longer tracks or connects to keyless peers.
+        // Keyless targets are cleartext peers (see PeerTable.getCandidates(),
+        // which only ever lists them AFTER every Brontide candidate and only
+        // on the standard cleartext port).
+        if (target.plain()) return connectPlainPeer(target);
+
         Socket socket = new Socket();
         socket.connect(new InetSocketAddress(target.ip(), target.port()),
                 CONNECT_TIMEOUT_MS);
@@ -1334,8 +1352,32 @@ public class ChainSync {
         // of a genuinely fresh install, before 2-peer corroboration lands).
         sendSelfAnnounce(conn);
 
-        PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight);
+        PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, true);
         return conn;
+    }
+
+    /**
+     * Outbound cleartext connection (hsd's standard unencrypted P2P port).
+     * Same message framing and VERSION/VERACK handshake as the Brontide path --
+     * only the transport differs (no Act 1/2/3, frames go over the socket as-is).
+     * The peer is scored as a downgraded cleartext peer (see PeerTable).
+     */
+    private PeerConnection connectPlainPeer(PeerTable.ConnectTarget target) throws Exception {
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(target.ip(), target.port()), CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(READ_TIMEOUT_MS);
+            PeerConnection conn = new PeerConnection(socket, socket.getInputStream(),
+                    socket.getOutputStream(), null, target.ip());
+            conn.doVersionHandshake(db.getBlockTip());
+            conn.sendMessage(MSG_GETADDR, new byte[0]);
+            sendSelfAnnounce(conn);
+            PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, false);
+            return conn;
+        } catch (Exception e) {
+            try { socket.close(); } catch (IOException ignored) { }
+            throw e;
+        }
     }
 
     /**
@@ -1842,6 +1884,24 @@ public class ChainSync {
         return false;
     }
 
+    /**
+     * Header-tip rollback is only justified when we are far ahead of EVERY
+     * connected peer, and only when at least two peers agree. A single peer
+     * behind us proves nothing: it may just be a node that is still syncing
+     * (which the new inbound/outbound mix of peers makes common). Returns the
+     * height to roll back to, or -1 for "don't roll back".
+     */
+    private int rollbackTargetIfFarAhead(int ourTip) {
+        int best = 0;
+        int peers = 0;
+        for (PeerInfo pi : connectedPeers) {
+            peers++;
+            best = Math.max(best, pi.conn().peerHeight);
+        }
+        if (peers < 2 || best <= 0) return -1;
+        return ourTip > best + 2016 ? best : -1;
+    }
+
     private List<byte[]> buildLocator(int tip) {
         List<byte[]> locator = new ArrayList<>();
 
@@ -2124,6 +2184,26 @@ public class ChainSync {
 
     public int getConnectedPeerCount() { return connectedPeers.size(); }
 
+    /** ip -> "outbound" | "inbound" | "both" for every currently connected peer
+     *  (used by the admin panel's unified Peers table). */
+    public Map<String, String> getConnectionTransports() {
+        Map<String, String> m = new HashMap<>();
+        for (PeerInfo pi : connectedPeers) {
+            String t = pi.conn().plain ? "plain" : "brontide";
+            m.merge(pi.ip(), t, (a, b) -> a.equals(b) ? a : "mixed");
+        }
+        return m;
+    }
+
+    public Map<String, String> getConnectionDirections() {
+        Map<String, String> m = new HashMap<>();
+        for (PeerInfo pi : connectedPeers) {
+            String d = pi.inbound() ? "inbound" : "outbound";
+            m.merge(pi.ip(), d, (a, b) -> a.equals(b) ? a : "both");
+        }
+        return m;
+    }
+
     public long inboundPeerCount() {
         return connectedPeers.stream().filter(PeerInfo::inbound).count();
     }
@@ -2168,6 +2248,7 @@ public class ChainSync {
                     .append("\"bytesrecv\":").append(conn.bytesRecv).append(",")
                     .append("\"subver\":\"").append(jsonEscape(conn.agent)).append("\",")
                     .append("\"inbound\":").append(p.inbound()).append(",")
+                    .append("\"transport\":\"").append(conn.plain ? "plain" : "brontide").append("\",")
                     .append("\"startingheight\":").append(conn.peerHeight).append(",")
                     .append("\"bestheight\":").append(conn.peerHeight).append(",")
                     .append("\"conntime\":").append(connSeconds).append(",")
@@ -2206,7 +2287,7 @@ public class ChainSync {
             socket.setSoTimeout(READ_TIMEOUT_MS);
 
             connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), true));
-            PeerTable.get().recordSuccess(ip, conn.agent, conn.peerHeight);
+            PeerTable.get().recordSuccess(ip, conn.agent, conn.peerHeight, brontide != null);
 
             // Same unsolicited self-announce as the outbound side
             // (connectPeer()) -- an inbound peer is just as real a
@@ -2234,7 +2315,7 @@ public class ChainSync {
             // project already assumes everywhere else a port isn't
             // otherwise known (see Seed's own default), so it's used
             // here too rather than inventing a different fallback.
-            byte[] remoteKey = brontide.getRemoteStaticPub();
+            byte[] remoteKey = brontide != null ? brontide.getRemoteStaticPub() : null;
             if (remoteKey != null && remoteKey.length == 33) {
                 String base32Key = NodeIdentity.base32Encode(remoteKey);
                 PeerTable.get().addDiscovered(base32Key, ip, config.getP2pPort(), "inbound:" + ip);
@@ -2577,22 +2658,33 @@ public class ChainSync {
         // include a real, dialable self-entry -- but only once it's been
         // confirmed by independent peers, never a guess.
         boolean includeSelf = confirmedSelfIp != null;
-        List<PeerInfo> known = connectedPeers.subList(0, Math.min(200, connectedPeers.size()));
-        int total = known.size() + (includeSelf ? 1 : 0);
-        byte[] payload = new byte[1 + total * NET_ADDRESS_SIZE];
-        int pos = 0;
-        payload[pos++] = (byte) total;
+        boolean plainOn = config.isPlainP2pEnabled();
+        // Collect (ip, port, key) entries first so the count byte is exact.
+        List<Object[]> entries = new ArrayList<>();
         if (includeSelf) {
-            pos = writeNetAddressStatic(payload, pos, confirmedSelfIp,
-                    config.getP2pPort(), identity.getPublicKey());
+            entries.add(new Object[]{confirmedSelfIp, config.getP2pPort(), identity.getPublicKey()});
+            if (plainOn) {
+                entries.add(new Object[]{confirmedSelfIp, config.getPlainP2pPort(), null});
+            }
         }
-        for (PeerInfo p : known) {
-            // Unified lookup: PeerTable.getBrontideKeyByIp() covers seeds and
-            // discovered/inbound peers alike now (previously this checked
-            // SeedDatabase then fell back to PeerDiscovery separately).
+        for (PeerInfo p : connectedPeers) {
+            if (entries.size() >= 200) break;
             String knownKey = PeerTable.get().getBrontideKeyByIp(p.ip());
-            byte[] key = knownKey != null ? NodeIdentity.base32Decode(knownKey) : null;
-            pos = writeNetAddressStatic(payload, pos, p.ip(), 44806, key);
+            if (knownKey != null) {
+                entries.add(new Object[]{p.ip(), 44806, NodeIdentity.base32Decode(knownKey)});
+            } else if (!p.inbound()) {
+                // Keyless peer we dialed ourselves: its real (cleartext) port is
+                // the one we connected to. An INBOUND keyless peer's listening
+                // port is unknown (only its ephemeral source port is), so it is
+                // not relayed.
+                entries.add(new Object[]{p.ip(), PeerTable.PLAIN_PORT, null});
+            }
+        }
+        byte[] payload = new byte[1 + entries.size() * NET_ADDRESS_SIZE];
+        int pos = 0;
+        payload[pos++] = (byte) entries.size();
+        for (Object[] e : entries) {
+            pos = writeNetAddressStatic(payload, pos, (String) e[0], (Integer) e[1], (byte[]) e[2]);
         }
         return payload;
     }
@@ -2630,7 +2722,8 @@ public class ChainSync {
         final Socket        socket;
         final InputStream   in;
         final OutputStream  out;
-        final BrontideState brontide;
+        final BrontideState brontide;   // null => cleartext transport
+        final boolean       plain;
         final String        ip;
         volatile String     agent  = "";
         volatile int        peerHeight = 0;
@@ -2664,6 +2757,7 @@ public class ChainSync {
             this.in       = in;
             this.out      = out;
             this.brontide = brontide;
+            this.plain    = (brontide == null);
             this.ip       = ip;
         }
 
@@ -2914,7 +3008,7 @@ public class ChainSync {
             writeLE32(frame, 5, payload.length);
             System.arraycopy(payload, 0, frame, 9, payload.length);
 
-            byte[] encrypted = brontide.encryptMessage(frame);
+            byte[] encrypted = plain ? frame : brontide.encryptMessage(frame);
             if (VERBOSE_WIRE_LOGGING) {
                 System.out.printf("[Handshake] -> %s SEND type=%d frame(%d bytes): %s%n",
                         ip, type, frame.length, toHex(frame));
@@ -2952,8 +3046,32 @@ public class ChainSync {
             return result;
         }
 
+        /** Cleartext framing: magic(4) + cmd(1) + length(4 LE) + payload, read as-is. */
+        private byte[] readPlainFrame() {
+            byte[] header = readPartialDebug(in, 9, ip, "header");
+            if (header == null) return null;
+            long magic = readLE32(header, 0) & 0xFFFFFFFFL;
+            if (magic != (MAGIC_MAINNET & 0xFFFFFFFFL)) {
+                System.out.printf("[Handshake] <- %s bad magic: 0x%08X expected 0x%08X%n",
+                        ip, magic, MAGIC_MAINNET & 0xFFFFFFFFL);
+                return null;
+            }
+            long len = readLE32(header, 5) & 0xFFFFFFFFL;
+            if (len > 4_000_000L) {
+                System.out.printf("[Handshake] <- %s payload length %d out of range, treating as invalid%n", ip, len);
+                return null;
+            }
+            byte[] payload = readPartialDebug(in, (int) len, ip, "payload");
+            if (payload == null) return null;
+            byte[] frame = new byte[9 + payload.length];
+            System.arraycopy(header, 0, frame, 0, 9);
+            System.arraycopy(payload, 0, frame, 9, payload.length);
+            return frame;
+        }
+
         private byte[] readMessageInternal(int timeoutMs) throws Exception {
             socket.setSoTimeout(timeoutMs);
+            if (plain) return readPlainFrame();
 
             // FIX: reverting to 20 bytes (4-byte LE length + 16-byte tag) --
             // a real past session reached an actual, complete, documented

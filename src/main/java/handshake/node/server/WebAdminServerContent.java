@@ -68,24 +68,16 @@ public final class WebAdminServerContent {
 
                     <div class="column">
                         <section class="card">
-                            <h2>Connected Peers</h2>
-                            <table id="peers-table">
+                            <h2>Peers</h2>
+                            <p id="peers-summary" class="hint">Loading...</p>
+                            <div class="peer-scroll">
+                            <table id="peertable">
                                 <thead>
-                                    <tr><th>Address</th><th>Agent</th><th>Height</th><th>Direction</th></tr>
+                                    <tr><th>Peer</th><th>Status</th><th>Score</th></tr>
                                 </thead>
-                                <tbody><tr><td colspan="4">Loading...</td></tr></tbody>
+                                <tbody><tr><td colspan="3">Loading...</td></tr></tbody>
                             </table>
-                        </section>
-
-                        <section class="card">
-                            <h2>Banned Peers</h2>
-                            <table id="bans-table">
-                                <thead>
-                                    <tr><th>IP</th><th>Reason</th><th>Banned at</th><th></th></tr>
-                                </thead>
-                                <tbody><tr><td colspan="4">Loading...</td></tr></tbody>
-                            </table>
-                            <button id="clear-bans-btn">Clear all bans</button>
+                            </div>
                         </section>
                     </div>
 
@@ -283,6 +275,27 @@ public final class WebAdminServerContent {
             button:hover {
                 background: var(--accent-dark);
             }
+            .pill {
+                display: inline-block;
+                padding: 0.05rem 0.5rem;
+                border-radius: 999px;
+                font-size: 0.78rem;
+                font-weight: 600;
+                white-space: nowrap;
+            }
+            .pill.connected   { background: #dcefdf; color: #2b6636; }
+            .pill.banned      { background: #f4d4cf; color: #8c2f21; }
+            .pill.blacklisted { background: #4a1f1a; color: #fdfdfd; }
+            .pill.backoff     { background: #fbe9c4; color: #7d5208; }
+            .pill.idle        { background: #e8e4e0; color: #55565c; }
+            .pill.plain       { background: #e4e9ee; color: #4d5b69; }
+            .score-high { color: #2b6636; font-weight: 600; }
+            .score-mid  { color: #9a6408; font-weight: 600; }
+            .score-low  { color: #a8402f; font-weight: 600; }
+            .sub { display: block; font-size: 0.75rem; color: var(--text-muted); }
+            #peertable td, #peertable th { padding: 0.3rem 0.4rem; vertical-align: top; }
+            .peer-scroll { max-height: 560px; overflow-y: auto; }
+            #peertable th { position: sticky; top: 0; background: var(--surface); }
             button.unban-btn {
                 padding: 0.2rem 0.6rem;
                 font-size: 0.8rem;
@@ -488,7 +501,6 @@ public final class WebAdminServerContent {
                 setInterval(refreshAll, 2000);
 
                 document.getElementById("config-form").addEventListener("submit", onSaveConfig);
-                document.getElementById("clear-bans-btn").addEventListener("click", onClearBans);
                 document.getElementById("stop-node-btn").addEventListener("click", onStopNode);
 
                 setupRpcPanel();
@@ -582,9 +594,8 @@ public final class WebAdminServerContent {
 
             function refreshAll() {
                 loadStatus();
-                loadPeers();
+                loadPeerTable();
                 loadMempool();
-                loadBans();
             }
 
             async function loadStatus() {
@@ -623,38 +634,95 @@ public final class WebAdminServerContent {
                 }
             }
 
-            async function loadPeers() {
-                const tbody = document.querySelector("#peers-table tbody");
-                try {
-                    const res = await fetch("/api/peers");
-                    const peers = await res.json();
-                    if (peers.length === 0) {
-                        tbody.innerHTML = "<tr><td colspan=\\"4\\">No peers currently connected.</td></tr>";
-                        return;
-                    }
-                    tbody.innerHTML = peers.map(p => `
-                        <tr>
-                            <td>${escapeHtml(addrHost(p.addr))}</td>
-                            <td>${escapeHtml(p.subver || "")}</td>
-                            <td>${p.bestheight ?? ""}</td>
-                            <td>${p.inbound ? "inbound" : "outbound"}</td>
-                        </tr>
-                    `).join("");
-                } catch (e) {
-                    tbody.innerHTML = "<tr><td colspan=\\"4\\">Failed to load.</td></tr>";
+            function fmtAgo(ts) {
+                if (!ts) return "never";
+                const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+                if (sec < 60) return sec + "s ago";
+                if (sec < 3600) return Math.floor(sec / 60) + "m ago";
+                if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+                return Math.floor(sec / 86400) + "d ago";
+            }
+
+            function fmtDur(ms) {
+                const sec = Math.ceil(ms / 1000);
+                if (sec < 60) return sec + "s";
+                if (sec < 3600) return Math.ceil(sec / 60) + "m";
+                return Math.round(sec / 3600) + "h";
+            }
+
+            function scoreClass(n) {
+                return n >= 70 ? "score-high" : (n >= 40 ? "score-mid" : "score-low");
+            }
+
+            function pillFor(p) {
+                switch (p.state) {
+                    case "banned":
+                        return '<span class="pill banned">Banned</span>';
+                    case "connected":
+                        return '<span class="pill connected">Connected &middot; ' + escapeHtml(p.direction)
+                            + (p.transport === "plain" ? ' &middot; cleartext' : '') + '</span>';
+                    case "blacklisted":
+                        return '<span class="pill blacklisted">Blacklisted</span>';
+                    case "backoff":
+                        return '<span class="pill backoff">Backoff ' + fmtDur(p.backoffMs) + '</span>';
+                    case "plain":
+                        return '<span class="pill plain">Cleartext</span>';
+                    default:
+                        return '<span class="pill idle">Idle</span>';
                 }
             }
 
-            // Strips ":<port>" for display. Outbound peers are always
-            // :44806 (brontide-only, nothing else to connect to), and an
-            // inbound peer's port here is just its remote ephemeral source
-            // port for that TCP connection, not its actual listening
-            // port -- neither is meaningful to show, so this applies to
-            // both the same way rather than special-casing outbound.
-            function addrHost(addr) {
-                if (!addr) return "";
-                const i = addr.lastIndexOf(":");
-                return i === -1 ? addr : addr.slice(0, i);
+            function tooltipFor(p) {
+                const lines = [
+                    p.ip + ":" + p.port + (p.label ? " (" + p.label + ")" : ""),
+                    "source: " + (p.source || "unknown") + (p.seed ? " (seed)" : ""),
+                    "transport: " + (p.state === "connected" ? p.transport : (p.hasKey ? "brontide" : "cleartext (no brontide key)")),
+                    "agent: " + (p.agent || "?") + "  height: " + (p.height || "?"),
+                    "successes: " + p.successes + "  failures: " + p.failures,
+                    "valid data: " + p.validData + "  invalid data: " + p.invalidData,
+                    "avg latency: " + (p.latencyMs >= 0 ? p.latencyMs + " ms" : "n/a"),
+                    "last failure: " + fmtAgo(p.lastFailure)
+                ];
+                if (p.state === "banned") {
+                    lines.push("ban reason: " + (p.banReason || ""));
+                }
+                return lines.join(String.fromCharCode(10));
+            }
+
+            async function loadPeerTable() {
+                const tbody = document.querySelector("#peertable tbody");
+                const summary = document.getElementById("peers-summary");
+                try {
+                    const res = await fetch("/api/peertable");
+                    const peers = await res.json();
+                    const count = st => peers.filter(p => p.state === st).length;
+                    summary.textContent = count("connected") + " connected \u00b7 "
+                        + count("backoff") + " backed off \u00b7 "
+                        + count("banned") + " banned \u00b7 "
+                        + count("plain") + " cleartext \u00b7 "
+                        + peers.length + " known";
+                    if (peers.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="3">No peers known yet.</td></tr>';
+                        return;
+                    }
+                    peers.sort((a, b) => (b.score - a.score) || a.ip.localeCompare(b.ip));
+                    tbody.innerHTML = peers.map(p => `
+                        <tr title="${escapeHtml(tooltipFor(p))}">
+                            <td>${escapeHtml(p.ip)}${p.seed ? " &#9733;" : ""}
+                                <span class="sub">${escapeHtml(p.agent || (p.label || p.source || ""))}${p.height ? " &middot; " + p.height : ""}</span></td>
+                            <td>${pillFor(p)}${p.state === "banned"
+                                ? ' <button class="unban-btn" data-ip="' + escapeHtml(p.ip) + '">Unban</button>'
+                                    + '<span class="sub">' + escapeHtml(p.banReason || "") + '</span>'
+                                : ""}</td>
+                            <td class="${scoreClass(p.score)}">${p.score}</td>
+                        </tr>
+                    `).join("");
+                    tbody.querySelectorAll(".unban-btn").forEach(btn => {
+                        btn.addEventListener("click", () => onUnban(btn.dataset.ip));
+                    });
+                } catch (e) {
+                    tbody.innerHTML = '<tr><td colspan="3">Failed to load.</td></tr>';
+                }
             }
 
             async function loadMempool() {
@@ -669,31 +737,6 @@ public final class WebAdminServerContent {
                 }
             }
 
-            async function loadBans() {
-                const tbody = document.querySelector("#bans-table tbody");
-                try {
-                    const res = await fetch("/api/bans");
-                    const bans = await res.json();
-                    if (bans.length === 0) {
-                        tbody.innerHTML = "<tr><td colspan=\\"4\\">No banned peers.</td></tr>";
-                        return;
-                    }
-                    tbody.innerHTML = bans.map(b => `
-                        <tr>
-                            <td>${escapeHtml(b.ip)}</td>
-                            <td>${escapeHtml(b.reason || "")}</td>
-                            <td>${new Date(b.bannedAt).toLocaleString()}</td>
-                            <td><button class="unban-btn" data-ip="${escapeHtml(b.ip)}">Unban</button></td>
-                        </tr>
-                    `).join("");
-                    tbody.querySelectorAll(".unban-btn").forEach(btn => {
-                        btn.addEventListener("click", () => onUnban(btn.dataset.ip));
-                    });
-                } catch (e) {
-                    tbody.innerHTML = "<tr><td colspan=\\"4\\">Failed to load.</td></tr>";
-                }
-            }
-
             async function onUnban(ip) {
                 try {
                     await fetch("/api/bans/unban", {
@@ -701,14 +744,7 @@ public final class WebAdminServerContent {
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ ip })
                     });
-                    loadBans();
-                } catch (e) { /* silently retry on next poll */ }
-            }
-
-            async function onClearBans() {
-                try {
-                    await fetch("/api/bans/clear", { method: "POST" });
-                    loadBans();
+                    loadPeerTable();
                 } catch (e) { /* silently retry on next poll */ }
             }
 

@@ -46,6 +46,7 @@ public class NodeConfig {
 
     private static final String DEFAULT_NETWORK      = "mainnet";
     private static final int    DEFAULT_P2P_PORT      = 44806;
+    private static final int    DEFAULT_PLAIN_P2P_PORT = 12038;
     private static final int    DEFAULT_RPC_PORT      = 12037;
     private static final int    DEFAULT_SOCKET_PORT   = 12040;
     private static final int    DEFAULT_WEB_ADMIN_PORT = 12080;
@@ -125,6 +126,11 @@ public class NodeConfig {
      *  change. */
     public String  getNetwork()     { return DEFAULT_NETWORK; }
     public int     getP2pPort()     { return getInt("p2p.port",    DEFAULT_P2P_PORT); }
+    /** Cleartext (unencrypted) P2P listener, hsd's standard port. Inbound only
+     *  -- outbound dials to cleartext peers go to their own 12038. Open this TCP
+     *  port in the firewall to be reachable by plain hsd peers. */
+    public int     getPlainP2pPort() { return getInt("p2p.plain.port", DEFAULT_PLAIN_P2P_PORT); }
+    public boolean isPlainP2pEnabled() { return getBool("p2p.plain.enabled", true); }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
     /** Dedicated port for the Brontide-encrypted WebSocket event/call
      *  server -- separate from RPC's port since Java's built-in HTTP

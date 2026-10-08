@@ -73,6 +73,16 @@ public class PeerTable {
     private static final int   SCORE_BACKOFF_THRESHOLD   = 25;
     private static final int   SCORE_BLACKLIST           = 0;
 
+    /** Default hsd cleartext P2P port. Cleartext peers are only ever auto-dialed
+     *  on this port (a gossiped host:port is untrusted input -- never let it make
+     *  us connect to an arbitrary port). */
+    public static final int PLAIN_PORT = 12038;
+    /** Cleartext (keyless) peers are permanently downgraded: their score can
+     *  never rise above this, so they always rank below every healthy Brontide
+     *  peer (HEALTHY is 70+) and are only used when better peers are not
+     *  available. */
+    private static final int   SCORE_PLAIN_CAP           = 40;
+
     private static final double LATENCY_EMA_ALPHA        = 0.3;
     private static final double SCORE_FAST_THRESHOLD_MS  = 800;
     private static final double SCORE_SLOW_THRESHOLD_MS  = 5000;
@@ -188,14 +198,22 @@ public class PeerTable {
     }
 
     /**
-     * A peer we can attempt to connect to. brontideKey is always a real
-     * 33-byte key -- only ever constructed once one is confirmed present.
+     * A peer we can attempt to connect to. brontideKey is either a real
+     * 33-byte key (dial over Brontide) or null (a cleartext peer on
+     * {@link #PLAIN_PORT} -- see {@link #plain()}).
      */
-    public record ConnectTarget(String ip, int port, byte[] brontideKey, String label) {}
+    public record ConnectTarget(String ip, int port, byte[] brontideKey, String label) {
+        public boolean plain() { return brontideKey == null; }
+    }
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final ConcurrentHashMap<String, Peer> peers = new ConcurrentHashMap<>();
+
+    /** Our own confirmed public IP, if known -- never stored, listed or dialed
+     *  as a peer (our own self-announce comes back to us through gossip). */
+    private volatile String selfIp = null;
+    public void setSelfIp(String ip) { this.selfIp = ip; }
     private KVMap<String, String> peersMap;
 
     private PeerTable() {}
@@ -417,23 +435,56 @@ public class PeerTable {
         return (p != null && p.hasBrontideKey()) ? p.brontideKey : null;
     }
 
+    /** Upper bound on keyless ("plain", not-yet-connectable) peers we remember
+     *  from gossip, so the table can't grow without limit. Keyed peers are
+     *  never capped -- they are the ones we can actually connect to. */
+    private static final int MAX_KNOWN_PEERS = 2000;
+
     /** Adds a peer learned from ADDR gossip, an inbound connection, or RPC
-     *  addnode. No-op if already known (seed or otherwise) or tombstoned --
-     *  matches the old PeerDiscovery.addDiscovered()'s exact semantics. */
+     *  addnode. An already-known peer is left alone -- EXCEPT that a peer we
+     *  only know as keyless ("plain") is upgraded in place when a real
+     *  Brontide key for it finally turns up (a later ADDR entry, an inbound
+     *  Brontide connection, or RPC addnode), so learning a key is never
+     *  silently ignored just because the IP was already on file. */
     public void addDiscovered(String brontideKey, String ip, int port, String source) {
-        if (ip == null || ip.isBlank()) return;
-        if (isDeleted(ip)) return;
-        if (peers.containsKey(ip)) return; // already known, seed or otherwise
+        if (addDiscoveredNoCommit(brontideKey, ip, port, source)) {
+            ConfigDB.get().commit();
+        }
+    }
+
+    /** @return true if the table changed (caller is responsible for commit). */
+    private boolean addDiscoveredNoCommit(String brontideKey, String ip, int port, String source) {
+        if (ip == null || ip.isBlank()) return false;
+        if (isDeleted(ip)) return false;
+        if (ip.equals(selfIp)) return false;
+        String key = brontideKey != null ? brontideKey : "";
+        Peer existing = peers.get(ip);
+        if (existing != null) {
+            if (!existing.hasBrontideKey() && !key.isBlank()) {
+                existing.brontideKey = key;
+                existing.port = port;
+                peersMap.put(ip, existing.toStorage());
+                System.out.printf("[PeerTable] Learned Brontide key for already-known peer %s (%s) "
+                        + "-- now connectable.%n", ip, source);
+                return true;
+            }
+            return false; // already known, seed or otherwise
+        }
+        if (key.isBlank() && peers.size() >= MAX_KNOWN_PEERS) return false;
         Peer peer = new Peer(ip);
-        peer.brontideKey  = brontideKey != null ? brontideKey : "";
+        peer.brontideKey  = key;
         peer.port         = port;
         peer.source       = source;
         peer.discoveredAt = System.currentTimeMillis();
         peer.score        = SCORE_INITIAL_DISCOVERED;
         peers.put(ip, peer);
         peersMap.put(ip, peer.toStorage());
-        ConfigDB.get().commit();
-        System.out.printf("[PeerTable] Discovered peer: %s (%s)%n", ip, source);
+        // Keyed peers are rare and worth a line each; keyless gossip arrives
+        // dozens at a time and is summarised by onAddrMessage() instead.
+        if (!key.isBlank()) {
+            System.out.printf("[PeerTable] Discovered peer: %s (%s)%n", ip, source);
+        }
+        return true;
     }
 
     /**
@@ -464,6 +515,8 @@ public class PeerTable {
         }
         int entryCount = msg[0] & 0xFF;
         int newlyAdded = 0;
+        int newPlain = 0;
+        boolean tableChanged = false;
         int skippedWrongPort = 0;
         int skippedKeyless = 0;
         int skippedInvalidIp = 0;
@@ -488,30 +541,41 @@ public class PeerTable {
                         + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
                 if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
 
-                boolean wrongPort = port != 44806;
                 boolean keyless = isAllZero(keyBytes);
-                if (wrongPort || keyless) {
-                    if (wrongPort) skippedWrongPort++;
-                    if (keyless) skippedKeyless++;
+                if (keyless) {
+                    // Plain (cleartext, typically port 12038) peer: we can't
+                    // dial it over Brontide without its key, but remember it
+                    // so the table reflects the network we can see, and so a
+                    // key can be attached later if one ever turns up.
+                    skippedKeyless++;
+                    if (port != 44806) skippedWrongPort++;
                     if (samplePort == null) {
                         samplePort = port;
                         sampleKeyHex = toHex(keyBytes);
                     }
+                    if (addDiscoveredNoCommit("", ip, port, "addr:" + fromIp)) {
+                        newPlain++;
+                        tableChanged = true;
+                    }
                     continue;
                 }
-
-                if (peers.containsKey(ip)) {
-                    skippedAlreadyKnown++;
+                if (port != 44806) {
+                    skippedWrongPort++;
                     continue;
                 }
 
                 String base32Key = NodeIdentity.base32Encode(keyBytes);
-                addDiscovered(base32Key, ip, port, "addr:" + fromIp);
-                newlyAdded++;
+                if (addDiscoveredNoCommit(base32Key, ip, port, "addr:" + fromIp)) {
+                    newlyAdded++;
+                    tableChanged = true;
+                } else {
+                    skippedAlreadyKnown++;
+                }
             }
-            System.out.printf("[PeerTable] ADDR from %s: %d entries (%d new, %d already known, "
-                            + "%d wrong-port, %d keyless, %d invalid IP)%s.%n",
-                    fromIp, entryCount, newlyAdded, skippedAlreadyKnown,
+            if (tableChanged) ConfigDB.get().commit();
+            System.out.printf("[PeerTable] ADDR from %s: %d entries (%d new brontide, %d new plain, "
+                            + "%d already known, %d non-44806 port, %d keyless, %d invalid IP)%s.%n",
+                    fromIp, entryCount, newlyAdded, newPlain, skippedAlreadyKnown,
                     skippedWrongPort, skippedKeyless, skippedInvalidIp,
                     samplePort != null
                             ? String.format(" -- first rejected entry: port=%d key=%s", samplePort, sampleKeyHex)
@@ -561,8 +625,17 @@ public class PeerTable {
     public List<ConnectTarget> getCandidates() {
         List<ConnectTarget> seedCandidates = new ArrayList<>();
         List<ConnectTarget> otherCandidates = new ArrayList<>();
+        List<ConnectTarget> plainCandidates = new ArrayList<>();
         for (Peer p : peers.values()) {
-            if (!p.hasBrontideKey()) continue;
+            if (p.ip.equals(selfIp)) continue;
+            if (!p.hasBrontideKey()) {
+                // Cleartext peer: only ever tried after every Brontide
+                // candidate, and only on the standard cleartext port.
+                if (p.port == PLAIN_PORT && !shouldSkip(p.ip)) {
+                    plainCandidates.add(new ConnectTarget(p.ip, p.port, null, "cleartext"));
+                }
+                continue;
+            }
             if (shouldSkip(p.ip)) continue;
             byte[] keyBytes = NodeIdentity.base32Decode(p.brontideKey);
             if (keyBytes == null || keyBytes.length != 33) continue;
@@ -573,6 +646,7 @@ public class PeerTable {
         List<ConnectTarget> candidates = new ArrayList<>();
         candidates.addAll(weightedOrderCandidates(seedCandidates));
         candidates.addAll(weightedOrderCandidates(otherCandidates));
+        candidates.addAll(weightedOrderCandidates(plainCandidates));
         return candidates;
     }
 
@@ -585,15 +659,33 @@ public class PeerTable {
 
     // ── Score updates (unchanged semantics from PeerScorecard) ──────────────────
 
+    /** Highest score this peer can ever reach. Cleartext (keyless) peers are
+     *  capped well below healthy Brontide peers. */
+    private static int scoreCeiling(Peer r) {
+        return r.hasBrontideKey() ? SCORE_MAX : SCORE_PLAIN_CAP;
+    }
+
     public void recordSuccess(String ip, String agent, int height) {
+        recordSuccess(ip, agent, height, true);
+    }
+
+    /** @param brontide whether THIS connection was Brontide-encrypted. A
+     *  cleartext connection earns only the base bonus, never the Brontide
+     *  bonus, and can never lift a score above the cleartext cap (it also never
+     *  lowers an existing higher score, e.g. a known Brontide peer that happens
+     *  to dial us in cleartext). */
+    public void recordSuccess(String ip, String agent, int height, boolean brontide) {
         Peer r = getOrCreate(ip);
-        int bonus = SCORE_SUCCESS_BONUS + SCORE_BRONTIDE_BONUS;
-        r.score           = Math.min(SCORE_MAX, r.score + bonus);
+        if (brontide) {
+            r.score = Math.min(scoreCeiling(r), r.score + SCORE_SUCCESS_BONUS + SCORE_BRONTIDE_BONUS);
+        } else {
+            r.score = Math.max(r.score, Math.min(SCORE_PLAIN_CAP, r.score + SCORE_SUCCESS_BONUS));
+        }
         r.successCount++;
         r.lastSuccessTime = System.currentTimeMillis();
         r.lastAgent       = agent;
         r.lastHeight      = height;
-        r.usesBrontide    = true;
+        r.usesBrontide    = brontide;
         r.backoffLevel    = Math.max(0, r.backoffLevel - 1);
         r.backoffUntil    = 0;
         persist(r);
@@ -605,7 +697,7 @@ public class PeerTable {
                 ? millis
                 : (LATENCY_EMA_ALPHA * millis + (1 - LATENCY_EMA_ALPHA) * r.avgLatencyMs);
         if (r.avgLatencyMs < SCORE_FAST_THRESHOLD_MS) {
-            r.score = Math.min(SCORE_MAX, r.score + SCORE_LATENCY_ADJUST);
+            r.score = Math.min(scoreCeiling(r), r.score + SCORE_LATENCY_ADJUST);
         } else if (r.avgLatencyMs > SCORE_SLOW_THRESHOLD_MS) {
             r.score = Math.max(0, r.score - SCORE_LATENCY_ADJUST);
         }
@@ -614,7 +706,7 @@ public class PeerTable {
 
     public void recordValidData(String ip) {
         Peer r = getOrCreate(ip);
-        r.score = Math.min(SCORE_MAX, r.score + SCORE_VALID_DATA_BONUS);
+        r.score = Math.min(scoreCeiling(r), r.score + SCORE_VALID_DATA_BONUS);
         r.validDataCount++;
         persist(r);
     }
@@ -700,6 +792,13 @@ public class PeerTable {
         }
     }
 
+    /** Snapshot of every peer record (seeds, discovered, inbound-learned, banned...). */
+    public List<Peer> listAllPeers() {
+        List<Peer> all = new ArrayList<>(peers.values());
+        all.removeIf(p -> p.ip.equals(selfIp));
+        return all;
+    }
+
     public List<Peer> listBannedPeers() {
         return peers.values().stream().filter(r -> r.banned).toList();
     }
@@ -721,6 +820,7 @@ public class PeerTable {
 
     public List<Peer> getRankedPeers() {
         return peers.values().stream()
+                .filter(r -> r.hasBrontideKey() || r.port == PLAIN_PORT)   // connectable peers only
                 .filter(r -> !r.isBackedOff())
                 .sorted((a, b) -> Integer.compare(b.score, a.score))
                 .toList();
@@ -781,10 +881,10 @@ public class PeerTable {
     public void applyDecay() {
         long now = System.currentTimeMillis();
         for (Peer r : peers.values()) {
-            if (r.score < SCORE_MAX && r.lastSuccessTime > 0) {
+            if (r.score < scoreCeiling(r) && r.lastSuccessTime > 0) {
                 long minutesSinceSuccess = (now - r.lastSuccessTime) / 60_000;
                 if (minutesSinceSuccess < 60) {
-                    r.score = Math.min(SCORE_MAX, r.score + 1);
+                    r.score = Math.min(scoreCeiling(r), r.score + 1);
                     persist(r);
                 }
             }

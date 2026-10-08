@@ -120,6 +120,7 @@ public class WebAdminServer {
         server.createContext("/api/apikey", this::handleApiKey);
         server.createContext("/api/status", this::handleStatus);
         server.createContext("/api/peers", this::handlePeers);
+        server.createContext("/api/peertable", this::handlePeerTable);
         server.createContext("/api/mempool", this::handleMempool);
         server.createContext("/api/bans", this::handleBans);
         server.createContext("/api/bans/unban", this::handleUnban);
@@ -257,6 +258,64 @@ public class WebAdminServer {
                 return;
             }
             respondJson(ex, 200, chainSync.getPeerInfoJson());
+        } finally {
+            ex.close();
+        }
+    }
+
+    /** Every peer in the unified PeerTable with its live state and score.
+     *  state: banned | connected | blacklisted | backoff | idle. */
+    private void handlePeerTable(HttpExchange ex) throws IOException {
+        try {
+            if (!ex.getRequestMethod().equals("GET")) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            java.util.Map<String, String> dirs = chainSync != null
+                    ? chainSync.getConnectionDirections() : java.util.Map.of();
+            java.util.Map<String, String> transports = chainSync != null
+                    ? chainSync.getConnectionTransports() : java.util.Map.of();
+            long now = System.currentTimeMillis();
+            StringBuilder sb = new StringBuilder("[");
+            boolean first = true;
+            for (PeerTable.Peer r : PeerTable.get().listAllPeers()) {
+                String dir = dirs.get(r.ip);
+                String state;
+                if (r.banned) state = "banned";
+                else if (dir != null) state = "connected";
+                else if (r.isBlacklisted()) state = "blacklisted";
+                else if (r.isBackedOff()) state = "backoff";
+                else if (!r.hasBrontideKey()) state = "plain";
+                else state = "idle";
+                if (!first) sb.append(",");
+                first = false;
+                sb.append("{")
+                        .append("\"ip\":\"").append(jsonEscape(r.ip)).append("\",")
+                        .append("\"port\":").append(r.port).append(",")
+                        .append("\"label\":\"").append(jsonEscape(r.label == null ? "" : r.label)).append("\",")
+                        .append("\"source\":\"").append(jsonEscape(r.source == null ? "" : r.source)).append("\",")
+                        .append("\"seed\":").append(r.isSeed).append(",")
+                        .append("\"hasKey\":").append(r.hasBrontideKey()).append(",")
+                        .append("\"score\":").append(r.score).append(",")
+                        .append("\"state\":\"").append(state).append("\",")
+                        .append("\"direction\":\"").append(dir == null ? "" : dir).append("\",")
+                        .append("\"transport\":\"").append(transports.getOrDefault(r.ip, "")).append("\",")
+                        .append("\"backoffMs\":").append(Math.max(0L, r.backoffUntil - now)).append(",")
+                        .append("\"banReason\":\"").append(jsonEscape(r.banReason == null ? "" : r.banReason)).append("\",")
+                        .append("\"banTime\":").append(r.banTime).append(",")
+                        .append("\"successes\":").append(r.successCount).append(",")
+                        .append("\"failures\":").append(r.failureCount).append(",")
+                        .append("\"validData\":").append(r.validDataCount).append(",")
+                        .append("\"invalidData\":").append(r.invalidDataCount).append(",")
+                        .append("\"lastSuccess\":").append(r.lastSuccessTime).append(",")
+                        .append("\"lastFailure\":").append(r.lastFailureTime).append(",")
+                        .append("\"agent\":\"").append(jsonEscape(r.lastAgent == null ? "" : r.lastAgent)).append("\",")
+                        .append("\"height\":").append(r.lastHeight).append(",")
+                        .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs))
+                        .append("}");
+            }
+            sb.append("]");
+            respondJson(ex, 200, sb.toString());
         } finally {
             ex.close();
         }

@@ -1188,7 +1188,11 @@ public class RpcServer {
 
         String[] parts = hostPart.split(":");
         String ip = parts[0];
-        int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 44806;
+        // Keyed address: Brontide, default 44806. Bare host (no key): a
+        // cleartext peer, default 12038 -- the only keyless port the node
+        // will ever dial (see PeerTable.getCandidates()).
+        int port = parts.length > 1 ? Integer.parseInt(parts[1])
+                : (key.isEmpty() ? PeerTable.PLAIN_PORT : 44806);
 
         PeerTable.get().addDiscovered(key, ip, port, "rpc-addnode");
         return "null";
