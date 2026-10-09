@@ -674,7 +674,7 @@ public final class WebAdminServerContent {
                     case "plain":
                         return '<span class="pill plain">Cleartext</span>';
                     default:
-                        return '<span class="pill idle">Idle</span>';
+                        return '<span class="pill idle" title="Known peer with a key; no open connection right now">Not connected</span>';
                 }
             }
 
@@ -689,6 +689,10 @@ public final class WebAdminServerContent {
                     "avg latency: " + (p.latencyMs >= 0 ? p.latencyMs + " ms" : "n/a"),
                     "last failure: " + fmtAgo(p.lastFailure)
                 ];
+                if (p.penalties && p.penalties.length) {
+                    lines.push("recent penalties (this run):");
+                    p.penalties.forEach(x => lines.push("  " + x));
+                }
                 if (p.state === "banned") {
                     lines.push("ban reason: " + (p.banReason || ""));
                 }
@@ -702,13 +706,38 @@ public final class WebAdminServerContent {
                     const res = await fetch("/api/peertable");
                     const peers = await res.json();
                     const count = st => peers.filter(p => p.state === st).length;
+                    // "Verified" = we actually talked to it (connected now, ever succeeded, or a curated seed).
+                    // Everything else is just an address another node mentioned in gossip: it may be
+                    // stale, unreachable or junk, so it is counted and shown separately.
+                    const isVerified = p => p.state === "connected" || p.successes > 0 || p.seed;
+                    const verified = peers.filter(isVerified);
+                    // Peers we tried but never reached (backoff/banned/blacklisted) stay visible; only
+                    // addresses we have never even attempted count as "gossip only".
+                    const isGossipOnly = p => !isVerified(p) && p.state !== "backoff"
+                        && p.state !== "banned" && p.state !== "blacklisted";
+                    const unverified = peers.filter(isGossipOnly).length;
                     summary.textContent = count("connected") + " connected \u00b7 "
                         + count("backoff") + " backed off \u00b7 "
                         + count("banned") + " banned \u00b7 "
-                        + count("plain") + " cleartext \u00b7 "
-                        + peers.length + " known";
+                        + verified.length + " verified \u00b7 "
+                        + unverified + " unverified gossip addresses";
+                    let toggle = document.getElementById("peers-toggle");
+                    if (!toggle) {
+                        summary.insertAdjacentHTML("afterend",
+                            '<p><button id="peers-toggle" class="unban-btn"></button></p>');
+                        toggle = document.getElementById("peers-toggle");
+                        toggle.addEventListener("click", () => {
+                            window.showUnverifiedPeers = !window.showUnverifiedPeers;
+                            loadPeerTable();
+                        });
+                    }
+                    toggle.textContent = (window.showUnverifiedPeers ? "Hide" : "Show")
+                        + " " + unverified + " unverified gossip addresses";
+                    if (!window.showUnverifiedPeers) {
+                        peers.splice(0, peers.length, ...peers.filter(p => !isGossipOnly(p)));
+                    }
                     if (peers.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="3">No peers known yet.</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="3">No peers to show yet.</td></tr>';
                         return;
                     }
                     peers.sort((a, b) => (b.score - a.score) || a.ip.localeCompare(b.ip));

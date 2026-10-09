@@ -88,6 +88,16 @@ public class PeerTable {
     private static final double SCORE_SLOW_THRESHOLD_MS  = 5000;
     private static final int    SCORE_LATENCY_ADJUST     = 1;
 
+    // ── Gossip address hygiene ────────────────────────────────────────────────
+    /** Ignore an ADDR entry whose own 'last seen' timestamp is older than this. */
+    static final long ADDR_MAX_AGE_MS     = 24 * 3600_000L;
+    /** Forget a gossip-learned address nobody has re-announced for this long. */
+    static final long ADDR_EXPIRE_MS      = 48 * 3600_000L;
+    /** Forget a gossip-learned address after this many failed dials with no success ever. */
+    static final int  ADDR_MAX_FAILURES   = 5;
+    /** Tolerated clock skew for a timestamp in the future (clamped to now beyond it). */
+    static final long ADDR_FUTURE_SLACK_MS = 10 * 60_000L;
+
     private static final long[] BACKOFF_MS = {
             5  * 60_000L,   // 0: 5 minutes
             30 * 60_000L,   // 1: 30 minutes  <- seed cap
@@ -133,6 +143,9 @@ public class PeerTable {
         public boolean banned;             // in-memory only; permanent until process restart
         public String  banReason;          // in-memory only
         public long    banTime;            // in-memory only
+        public final java.util.ArrayDeque<String> penalties = new java.util.ArrayDeque<>(); // in-memory: last few score-lowering events
+        public long    gossipTime;         // ms: newest 'last seen' timestamp any peer announced for this address (0 = unknown)
+        public long    lastRecoveryTime;   // in-memory only; when applyDecay last gave this peer another chance
 
         Peer(String ip) { this.ip = ip; }
 
@@ -162,7 +175,7 @@ public class PeerTable {
             return port + "|" + nz(brontideKey) + "|" + isSeed + "|" + nz(label) + "|" + nz(source) + "|"
                     + discoveredAt + "|" + score + "|" + extra1 + "|" + failureCount + "|" + extra3 + "|"
                     + successCount + "|" + backoffLevel + "|" + lastAttemptTime + "|" + lastSuccessTime + "|"
-                    + lastFailureTime + "|" + lastHeight + "|" + nz(lastAgent) + "|" + backoffUntil;
+                    + lastFailureTime + "|" + lastHeight + "|" + nz(lastAgent) + "|" + backoffUntil + "|" + gossipTime;
         }
 
         static Peer fromStorage(String ip, String s) {
@@ -186,6 +199,7 @@ public class PeerTable {
             p.lastHeight      = parseIntSafe(f, 15, 0);
             p.lastAgent       = f.length > 16 ? f[16] : "";
             p.backoffUntil    = parseLongSafe(f, 17, 0);
+            p.gossipTime      = parseLongSafe(f, 18, 0);
             return p;
         }
 
@@ -216,6 +230,56 @@ public class PeerTable {
     public void setSelfIp(String ip) { this.selfIp = ip; }
     private KVMap<String, String> peersMap;
 
+    // ── Pinned peers ──────────────────────────────────────────────────────────
+    //
+    // A pinned peer is one the operator explicitly wants a standing connection
+    // to (typically their own other node). Pinned peers are dialed before
+    // everything else, don't count against max.outbound, are never put in
+    // backoff, and their score is floored so ordinary penalties can't lock
+    // them out. Stored comma-separated under "peers.pinned" in the settings
+    // map. Managed with RPC: addnode "[key@]ip[:port]" add | remove.
+
+    private static final String PINNED_SETTING = "peers.pinned";
+    private static final int    SCORE_PINNED_FLOOR = 50;
+    private final Set<String> pinned = ConcurrentHashMap.newKeySet();
+    private KVMap<String, String> settingsMap;
+
+    public boolean isPinned(String ip) { return ip != null && pinned.contains(ip); }
+
+    public Set<String> getPinned() { return new TreeSet<>(pinned); }
+
+    /** Pins a peer (creating a row if needed) and clears any backoff / low score. */
+    public void pin(String ip) {
+        if (ip == null || ip.isBlank()) return;
+        pinned.add(ip);
+        Peer r = getOrCreate(ip);
+        r.banned = false;
+        lift(r);
+        persist(r);
+        savePinned();
+        System.out.printf("[PeerTable] Pinned peer %s (score %d).%n", ip, r.score);
+    }
+
+    public void unpin(String ip) {
+        if (pinned.remove(ip)) {
+            savePinned();
+            System.out.printf("[PeerTable] Unpinned peer %s.%n", ip);
+        }
+    }
+
+    private void savePinned() {
+        if (settingsMap == null) return;
+        settingsMap.put(PINNED_SETTING, String.join(",", new TreeSet<>(pinned)));
+        ConfigDB.get().commit();
+    }
+
+    /** Remove backoff and raise the score to the pinned floor. */
+    private void lift(Peer r) {
+        r.backoffUntil = 0;
+        r.backoffLevel = 0;
+        r.score = Math.max(r.score, SCORE_PINNED_FLOOR);
+    }
+
     private PeerTable() {}
 
     // ── Initialization ────────────────────────────────────────────────────────
@@ -241,6 +305,19 @@ public class PeerTable {
         }
         mergeFromResourceFile();
         resetAllBackoffs();
+        pruneGossip(true);
+        this.settingsMap = configDb.settingsMap();
+        String pinnedCsv = settingsMap.get(PINNED_SETTING);
+        if (pinnedCsv != null) {
+            for (String ip : pinnedCsv.split(",")) {
+                ip = ip.trim();
+                if (ip.isEmpty()) continue;
+                pinned.add(ip);
+                Peer r = peers.get(ip);
+                if (r != null) { lift(r); persist(r); }
+            }
+            if (!pinned.isEmpty()) System.out.println("[PeerTable] Pinned peers: " + new TreeSet<>(pinned));
+        }
         System.out.printf("[PeerTable] Loaded %d peers (%d seeds) from the config database.%n",
                 peers.size(), (int) peers.values().stream().filter(p -> p.isSeed).count());
     }
@@ -438,7 +515,7 @@ public class PeerTable {
     /** Upper bound on keyless ("plain", not-yet-connectable) peers we remember
      *  from gossip, so the table can't grow without limit. Keyed peers are
      *  never capped -- they are the ones we can actually connect to. */
-    private static final int MAX_KNOWN_PEERS = 2000;
+    private static final int MAX_KNOWN_PEERS = 500;
 
     /** Adds a peer learned from ADDR gossip, an inbound connection, or RPC
      *  addnode. An already-known peer is left alone -- EXCEPT that a peer we
@@ -454,12 +531,20 @@ public class PeerTable {
 
     /** @return true if the table changed (caller is responsible for commit). */
     private boolean addDiscoveredNoCommit(String brontideKey, String ip, int port, String source) {
+        return addDiscoveredNoCommit(brontideKey, ip, port, source, System.currentTimeMillis());
+    }
+
+    private boolean addDiscoveredNoCommit(String brontideKey, String ip, int port, String source, long seenMs) {
         if (ip == null || ip.isBlank()) return false;
         if (isDeleted(ip)) return false;
         if (ip.equals(selfIp)) return false;
         String key = brontideKey != null ? brontideKey : "";
         Peer existing = peers.get(ip);
         if (existing != null) {
+            if (seenMs > existing.gossipTime) {
+                existing.gossipTime = seenMs;
+                peersMap.put(ip, existing.toStorage());   // committed with the next commit
+            }
             if (!existing.hasBrontideKey() && !key.isBlank()) {
                 existing.brontideKey = key;
                 existing.port = port;
@@ -476,6 +561,7 @@ public class PeerTable {
         peer.port         = port;
         peer.source       = source;
         peer.discoveredAt = System.currentTimeMillis();
+        peer.gossipTime   = seenMs;
         peer.score        = SCORE_INITIAL_DISCOVERED;
         peers.put(ip, peer);
         peersMap.put(ip, peer.toStorage());
@@ -521,12 +607,18 @@ public class PeerTable {
         int skippedKeyless = 0;
         int skippedInvalidIp = 0;
         int skippedAlreadyKnown = 0;
+        int skippedStale = 0;
+        long nowMs = System.currentTimeMillis();
         Integer samplePort = null;
         String sampleKeyHex = null;
         try {
             int pos = 1;
             for (int i = 0; i < entryCount && pos + 88 <= msg.length; i++) {
-                pos += 8 + 4 + 4; // skip time + services + hiServices
+                long tsSec = 0;
+                for (int b = 7; b >= 0; b--) tsSec = (tsSec << 8) | (msg[pos + b] & 0xFF);
+                long seenMs = (tsSec < 0 || tsSec > 100_000_000_000L) ? 0 : tsSec * 1000L;
+                if (seenMs > nowMs + ADDR_FUTURE_SLACK_MS) seenMs = nowMs;   // bad clock: treat as just seen
+                pos += 8 + 4 + 4; // time (read above) + services + hiServices
                 pos += 1;         // skip addrType
                 byte[] ipBytes = new byte[4];
                 System.arraycopy(msg, pos + 12, ipBytes, 0, 4);
@@ -540,6 +632,7 @@ public class PeerTable {
                 String ip = (ipBytes[0] & 0xFF) + "." + (ipBytes[1] & 0xFF)
                         + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
                 if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
+                if (seenMs == 0 || nowMs - seenMs > ADDR_MAX_AGE_MS) { skippedStale++; continue; }
 
                 boolean keyless = isAllZero(keyBytes);
                 if (keyless) {
@@ -553,7 +646,7 @@ public class PeerTable {
                         samplePort = port;
                         sampleKeyHex = toHex(keyBytes);
                     }
-                    if (addDiscoveredNoCommit("", ip, port, "addr:" + fromIp)) {
+                    if (addDiscoveredNoCommit("", ip, port, "addr:" + fromIp, seenMs)) {
                         newPlain++;
                         tableChanged = true;
                     }
@@ -565,7 +658,7 @@ public class PeerTable {
                 }
 
                 String base32Key = NodeIdentity.base32Encode(keyBytes);
-                if (addDiscoveredNoCommit(base32Key, ip, port, "addr:" + fromIp)) {
+                if (addDiscoveredNoCommit(base32Key, ip, port, "addr:" + fromIp, seenMs)) {
                     newlyAdded++;
                     tableChanged = true;
                 } else {
@@ -574,9 +667,9 @@ public class PeerTable {
             }
             if (tableChanged) ConfigDB.get().commit();
             System.out.printf("[PeerTable] ADDR from %s: %d entries (%d new brontide, %d new plain, "
-                            + "%d already known, %d non-44806 port, %d keyless, %d invalid IP)%s.%n",
+                            + "%d already known, %d non-44806 port, %d keyless, %d invalid IP, %d stale)%s.%n",
                     fromIp, entryCount, newlyAdded, newPlain, skippedAlreadyKnown,
-                    skippedWrongPort, skippedKeyless, skippedInvalidIp,
+                    skippedWrongPort, skippedKeyless, skippedInvalidIp, skippedStale,
                     samplePort != null
                             ? String.format(" -- first rejected entry: port=%d key=%s", samplePort, sampleKeyHex)
                             : "");
@@ -626,8 +719,21 @@ public class PeerTable {
         List<ConnectTarget> seedCandidates = new ArrayList<>();
         List<ConnectTarget> otherCandidates = new ArrayList<>();
         List<ConnectTarget> plainCandidates = new ArrayList<>();
+        List<ConnectTarget> pinnedCandidates = new ArrayList<>();
         for (Peer p : peers.values()) {
             if (p.ip.equals(selfIp)) continue;
+            if (pinned.contains(p.ip) && !p.banned) {
+                if (p.hasBrontideKey()) {
+                    byte[] kb = NodeIdentity.base32Decode(p.brontideKey);
+                    if (kb != null && kb.length == 33) {
+                        pinnedCandidates.add(new ConnectTarget(p.ip, p.port, kb, "pinned"));
+                        continue;
+                    }
+                } else if (p.port == PLAIN_PORT) {
+                    pinnedCandidates.add(new ConnectTarget(p.ip, p.port, null, "pinned"));
+                    continue;
+                }
+            }
             if (!p.hasBrontideKey()) {
                 // Cleartext peer: only ever tried after every Brontide
                 // candidate, and only on the standard cleartext port.
@@ -643,7 +749,7 @@ public class PeerTable {
                     p.isSeed ? p.label : "discovered");
             if (p.isSeed) seedCandidates.add(target); else otherCandidates.add(target);
         }
-        List<ConnectTarget> candidates = new ArrayList<>();
+        List<ConnectTarget> candidates = new ArrayList<>(pinnedCandidates);
         candidates.addAll(weightedOrderCandidates(seedCandidates));
         candidates.addAll(weightedOrderCandidates(otherCandidates));
         candidates.addAll(weightedOrderCandidates(plainCandidates));
@@ -711,13 +817,30 @@ public class PeerTable {
         persist(r);
     }
 
+    /** Remembers why a peer lost score (newest last, max 5) so the admin panel can show it. */
+    private void notePenalty(Peer r, int delta, String what) {
+        synchronized (r.penalties) {
+            r.penalties.addLast(new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date())
+                    + "  -" + delta + "  " + what);
+            while (r.penalties.size() > 5) r.penalties.removeFirst();
+        }
+    }
+
+    public List<String> recentPenalties(Peer r) {
+        synchronized (r.penalties) { return new ArrayList<>(r.penalties); }
+    }
+
     public void recordInvalidData(String ip, String reason) {
         Peer r = getOrCreate(ip);
+        notePenalty(r, SCORE_INVALID_DATA_PENALTY, "invalid data: " + reason);
         r.score = Math.max(0, r.score - SCORE_INVALID_DATA_PENALTY);
         r.invalidDataCount++;
         persist(r);
         System.out.printf("[PeerTable] %s sent invalid data (score now %d): %s%n", ip, r.score, reason);
-        if (r.score < SCORE_BACKOFF_THRESHOLD) {
+        if (pinned.contains(ip)) {
+            lift(r);
+            persist(r);
+        } else if (r.score < SCORE_BACKOFF_THRESHOLD) {
             applyBackoff(r);
             persist(r);
         }
@@ -725,10 +848,13 @@ public class PeerTable {
 
     public void recordFailure(String ip, String reason) {
         Peer r = getOrCreate(ip);
+        notePenalty(r, SCORE_FAILURE_PENALTY, "failure: " + reason);
         r.score = Math.max(0, r.score - SCORE_FAILURE_PENALTY);
         r.failureCount++;
         r.lastFailureTime = System.currentTimeMillis();
-        if (r.score < SCORE_BACKOFF_THRESHOLD) {
+        if (pinned.contains(ip)) {
+            lift(r);   // pinned: never backed off, score floored
+        } else if (r.score < SCORE_BACKOFF_THRESHOLD) {
             applyBackoff(r);
         }
         persist(r);
@@ -740,15 +866,25 @@ public class PeerTable {
         }
     }
 
+    /** Raises the displayed/known height for an existing peer (never lowers it, never creates a row).
+     *  In-memory only: the next successful connect persists a fresh value anyway. */
+    public void updateHeight(String ip, int height) {
+        Peer r = peers.get(ip);
+        if (r != null && height > r.lastHeight) r.lastHeight = height;
+    }
+
     public void recordStaleTip(String ip, int peerHeight, int ourHeight) {
         Peer r = getOrCreate(ip);
+        notePenalty(r, SCORE_STALE_TIP_PENALTY, "stale tip: peer " + peerHeight + " vs ours " + ourHeight);
         r.score = Math.max(0, r.score - SCORE_STALE_TIP_PENALTY);
         r.lastHeight = peerHeight;
+        if (pinned.contains(ip)) lift(r);
         persist(r);
     }
 
     public void recordImplausibleTip(String ip, int claimedHeight, int consensusHeight) {
         Peer r = getOrCreate(ip);
+        notePenalty(r, SCORE_IMPLAUSIBLE_TIP_PENALTY, "implausible tip claim " + claimedHeight + " (consensus ~" + consensusHeight + ")");
         r.score = Math.max(0, r.score - SCORE_IMPLAUSIBLE_TIP_PENALTY);
         persist(r);
         System.out.printf("[PeerTable] %s: implausible height claim %d (recent consensus ~%d), score now %d%n",
@@ -770,7 +906,15 @@ public class PeerTable {
 
     public boolean shouldSkip(String ip) {
         Peer r = peers.get(ip);
-        return r != null && (r.banned || r.isBackedOff());
+        if (r == null) return false;
+        if (pinned.contains(ip)) return r.banned;   // pinned: backoff never applies
+        return r.banned || r.isBackedOff();
+    }
+
+    /** True only for an explicit ban (not backoff). Used to gate inbound connections. */
+    public boolean isBanned(String ip) {
+        Peer r = peers.get(ip);
+        return r != null && r.banned && !pinned.contains(ip);
     }
 
     public void banPeer(String ip, String reason) {
@@ -815,6 +959,7 @@ public class PeerTable {
 
     public boolean isGood(String ip) {
         Peer r = peers.get(ip);
+        if (r != null && pinned.contains(ip)) return !r.banned;   // pinned bypasses the score floor
         return r == null || (!r.isBackedOff() && r.score >= SCORE_BACKOFF_THRESHOLD);
     }
 
@@ -878,9 +1023,61 @@ public class PeerTable {
         if (reset > 0) System.out.printf("[PeerTable] Reset %d peer backoff(s).%n", reset);
     }
 
+    /** A formerly-working peer whose score fell below the dial threshold can
+     *  never earn points back (it is never dialed), so after this long
+     *  without any activity it is given another chance. */
+    private static final long RECOVERY_RETRY_MS = 60 * 60_000L;
+
+    /**
+     * Forgets gossip-learned addresses that have gone stale. Applies only to
+     * peers that came from ADDR gossip, were never connected to, and are not
+     * seeds / pinned / banned -- so anything with real history is untouched.
+     * Removal is NOT a tombstone: if the node comes back, a later ADDR or its
+     * own connection to us simply re-adds it.
+     * @param legacyToo also drop gossip rows saved before timestamps were tracked
+     */
+    private void pruneGossip(boolean legacyToo) {
+        long now = System.currentTimeMillis();
+        int expired = 0, failed = 0, legacy = 0;
+        for (Peer r : new ArrayList<>(peers.values())) {
+            if (r.isSeed || r.banned || r.successCount > 0 || pinned.contains(r.ip)) continue;
+            if (r.source == null || !r.source.startsWith("addr:")) continue;
+            boolean drop = false;
+            if (r.gossipTime == 0) {
+                if (legacyToo) { drop = true; legacy++; }
+            } else if (now - r.gossipTime > ADDR_EXPIRE_MS) {
+                drop = true; expired++;
+            }
+            if (!drop && r.failureCount >= ADDR_MAX_FAILURES) { drop = true; failed++; }
+            if (drop) {
+                peers.remove(r.ip);
+                if (peersMap != null) peersMap.remove(r.ip);
+            }
+        }
+        int total = expired + failed + legacy;
+        if (total > 0) {
+            if (peersMap != null) ConfigDB.get().commit();
+            System.out.printf("[PeerTable] Forgot %d stale gossip address(es): %d unseen >%dh, "
+                            + "%d failed %d+ dials, %d pre-timestamp.%n",
+                    total, expired, ADDR_EXPIRE_MS / 3600_000L, failed, ADDR_MAX_FAILURES, legacy);
+        }
+    }
+
     public void applyDecay() {
+        pruneGossip(false);
         long now = System.currentTimeMillis();
         for (Peer r : peers.values()) {
+            if (r.successCount > 0 && !r.banned && r.score < SCORE_BACKOFF_THRESHOLD
+                    && !r.isBackedOff()) {
+                long ref = Math.max(Math.max(r.lastFailureTime, r.lastSuccessTime), r.lastRecoveryTime);
+                if (now - ref >= RECOVERY_RETRY_MS) {
+                    System.out.printf("[PeerTable] %s gets another chance (score %d -> %d, quiet for %d min).%n",
+                            r.ip, r.score, SCORE_BACKOFF_THRESHOLD, (now - ref) / 60_000);
+                    r.score = SCORE_BACKOFF_THRESHOLD;
+                    r.lastRecoveryTime = now;   // restart the quiet period
+                    persist(r);
+                }
+            }
             if (r.score < scoreCeiling(r) && r.lastSuccessTime > 0) {
                 long minutesSinceSuccess = (now - r.lastSuccessTime) / 60_000;
                 if (minutesSinceSuccess < 60) {

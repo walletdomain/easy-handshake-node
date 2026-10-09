@@ -1310,8 +1310,9 @@ public class RpcServer {
         if (addr == null || cmd == null) throw new RpcException(-1,
                 "addnode \"validator\" \"add|remove|onetry\"");
         if ("remove".equals(cmd)) {
-            // No persistent "added nodes" list separate from discovered
-            // peers in this project; nothing to explicitly remove.
+            // Unpins the peer (the row stays in the peer table as an ordinary peer).
+            String h = addr.contains("@") ? addr.substring(addr.indexOf('@') + 1) : addr;
+            PeerTable.get().unpin(h.split(":")[0]);
             return "null";
         }
 
@@ -1339,6 +1340,8 @@ public class RpcServer {
                 : (key.isEmpty() ? PeerTable.PLAIN_PORT : 44806);
 
         PeerTable.get().addDiscovered(key, ip, port, "rpc-addnode");
+        // "add" = standing connection (pinned); "onetry" only registers the address.
+        if ("add".equals(cmd)) PeerTable.get().pin(ip);
         return "null";
     }
 

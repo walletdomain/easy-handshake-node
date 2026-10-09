@@ -107,8 +107,10 @@ public class P2PServer {
     private void handleAcceptedPlain(Socket socket) {
         String ip = socket.getInetAddress().getHostAddress();
         System.out.printf("[P2PServer] Inbound CLEARTEXT connection attempt from %s%n", ip);
-        if (PeerTable.get().shouldSkip(ip)) {
-            System.out.printf("[P2PServer] Rejected inbound cleartext from %s -- currently backed off/banned.%n", ip);
+        // Only an explicit ban blocks an inbound peer. Backoff records OUR failures
+        // dialing THEM; it says nothing about whether they may dial us.
+        if (PeerTable.get().isBanned(ip)) {
+            System.out.printf("[P2PServer] Rejected inbound cleartext from %s -- banned.%n", ip);
             closeQuietly(socket);
             return;
         }
@@ -136,8 +138,9 @@ public class P2PServer {
         // -- this one line alone answers that going forward.
         System.out.printf("[P2PServer] Inbound connection attempt from %s%n", ip);
 
-        if (PeerTable.get().shouldSkip(ip)) {
-            System.out.printf("[P2PServer] Rejected inbound from %s -- currently backed off.%n", ip);
+        // See handleAcceptedPlain(): backoff must not block inbound; only a ban does.
+        if (PeerTable.get().isBanned(ip)) {
+            System.out.printf("[P2PServer] Rejected inbound from %s -- banned.%n", ip);
             closeQuietly(socket);
             return;
         }

@@ -311,8 +311,15 @@ public class WebAdminServer {
                         .append("\"lastFailure\":").append(r.lastFailureTime).append(",")
                         .append("\"agent\":\"").append(jsonEscape(r.lastAgent == null ? "" : r.lastAgent)).append("\",")
                         .append("\"height\":").append(r.lastHeight).append(",")
-                        .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs))
-                        .append("}");
+                        .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs)).append(",")
+                        .append("\"penalties\":[");
+                boolean fp = true;
+                for (String pen : PeerTable.get().recentPenalties(r)) {
+                    if (!fp) sb.append(",");
+                    fp = false;
+                    sb.append("\"").append(jsonEscape(pen)).append("\"");
+                }
+                sb.append("]}");
             }
             sb.append("]");
             respondJson(ex, 200, sb.toString());

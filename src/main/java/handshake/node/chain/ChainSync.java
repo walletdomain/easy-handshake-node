@@ -636,7 +636,7 @@ public class ChainSync {
             // reflects blockTip, so lowering it would make blocks get
             // re-applied on top of state that already contains them.
             System.out.printf("[ChainSync] Block tip %d is above header tip %d (header rollback "
-                    + "in progress) -- leaving block state untouched until headers catch up.%n",
+                            + "in progress) -- leaving block state untouched until headers catch up.%n",
                     blockTip, db.getHeaderTip());
         } else if (blockTip >= 0) {
             byte[] header = db.getHeader(blockTip);
@@ -848,9 +848,7 @@ public class ChainSync {
                     // back (the peer replied empty/unknown), and stamping it
                     // onto the peer made lagging peers (e.g. a node still
                     // at ~200000) falsely display our height.
-                    if (newTip > localTip && newTip > peer.peerHeight) {
-                        peer.peerHeight = newTip;
-                    }
+                    if (newTip > localTip) raisePeerHeight(peer, newTip);
 
                     // Download missing blocks. Its own return value feeds
                     // into madeProgress too now (see downloadBlocks()'s
@@ -902,10 +900,26 @@ public class ChainSync {
                     return;
                 } catch (Exception e) {
                     peerBroken = true;
-                    PeerTable.get().recordFailure(peer.ip,
-                            e.getClass().getSimpleName() + ": " + e.getMessage());
-                    System.out.printf("[ChainSync] Peer %s error: %s%n",
-                            peer.ip, e.getMessage());
+                    // A connection that had been sitting idle in the pool for a
+                    // while and then turns out to be dead is usually the remote
+                    // side's idle timeout, not misbehaviour -- don't charge the
+                    // peer for it. maintainOutboundPool() will redial, and a
+                    // failed REDIAL is what counts against the peer. A failure
+                    // on a fresh connection is still penalized as before.
+                    long ageMs = Long.MAX_VALUE;
+                    for (PeerInfo pi : connectedPeers) {
+                        if (pi.conn() == peer) { ageMs = System.currentTimeMillis() - pi.connTime(); break; }
+                    }
+                    if (ageMs > STALE_POOL_CONN_MS) {
+                        System.out.printf("[ChainSync] Pooled connection to %s was %ds old and has died (%s: %s) "
+                                        + "-- dropping it, no penalty; will redial.%n",
+                                peer.ip, ageMs / 1000, e.getClass().getSimpleName(), e.getMessage());
+                    } else {
+                        PeerTable.get().recordFailure(peer.ip,
+                                e.getClass().getSimpleName() + ": " + e.getMessage());
+                        System.out.printf("[ChainSync] Peer %s error: %s%n",
+                                peer.ip, e.getMessage());
+                    }
                 } finally {
                     // NEW (outbound pooling): a peer that finished this
                     // cycle without a connection-level error stays open
@@ -955,14 +969,42 @@ public class ChainSync {
         if (!running) return;
         try {
             int target = config.getMaxOutbound();
-            if (countOutboundPeers() >= target) return;
+            PeerTable table = PeerTable.get();
 
-            List<PeerTable.ConnectTarget> candidates = PeerTable.get().getCandidates();
+            List<PeerTable.ConnectTarget> candidates = table.getCandidates();
             Set<String> alreadyConnected = new HashSet<>();
             for (PeerInfo p : connectedPeers) alreadyConnected.add(p.ip());
 
+            // Pinned peers first: they sit outside the max.outbound budget, so a
+            // full pool can never crowd them out. Retried at most once a minute.
+            long now = System.currentTimeMillis();
             for (PeerTable.ConnectTarget cand : candidates) {
-                if (countOutboundPeers() >= target) break;
+                if (!table.isPinned(cand.ip())) continue;
+                if (alreadyConnected.contains(cand.ip())) continue;
+                if (cand.ip().equals(confirmedSelfIp)) continue;
+                Long last = pinnedLastAttempt.get(cand.ip());
+                if (last != null && now - last < PINNED_RETRY_MS) continue;
+                pinnedLastAttempt.put(cand.ip(), now);
+                try {
+                    PeerConnection conn = connectPeer(cand);
+                    if (conn == null) continue;
+                    connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
+                    alreadyConnected.add(cand.ip());
+                    System.out.printf("[ChainSync] Pinned peer connected: %s (h=%d)%n",
+                            conn.ip, conn.peerHeight);
+                } catch (Exception e) {
+                    table.recordFailure(cand.ip(),
+                            e.getClass().getSimpleName() + ": " + e.getMessage());
+                    System.out.printf("[ChainSync] Pinned peer %s unreachable (%s); will retry.%n",
+                            cand.ip(), e.getMessage());
+                }
+            }
+
+            if (countOutboundUnpinned() >= target) return;
+
+            for (PeerTable.ConnectTarget cand : candidates) {
+                if (countOutboundUnpinned() >= target) break;
+                if (table.isPinned(cand.ip())) continue;
                 if (alreadyConnected.contains(cand.ip())) continue;
                 if (cand.ip().equals(confirmedSelfIp)) continue;
                 if (!PeerTable.get().isGood(cand.ip())) continue;
@@ -971,7 +1013,7 @@ public class ChainSync {
                     if (conn == null) continue;
                     connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
                     System.out.printf("[ChainSync] Outbound pool: added %s (h=%d) -- now %d/%d%n",
-                            conn.ip, conn.peerHeight, countOutboundPeers(), target);
+                            conn.ip, conn.peerHeight, countOutboundUnpinned(), target);
                 } catch (Exception e) {
                     PeerTable.get().recordFailure(cand.ip(),
                             e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -980,6 +1022,22 @@ public class ChainSync {
         } catch (Exception e) {
             System.err.println("[ChainSync] Outbound pool maintenance error: " + e.getMessage());
         }
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> pinnedLastAttempt =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long PINNED_RETRY_MS = 60_000L;
+    /** A pooled connection older than this that fails is treated as an idle-timeout casualty, not a peer fault. */
+    private static final long STALE_POOL_CONN_MS = 30_000L;
+    /** Blocks a peer may trail our tip before it counts as 'stale'. */
+    private static final int  STALE_TIP_TOLERANCE = 3;
+
+    /** Outbound connections that count against max.outbound (pinned ones don't). */
+    private int countOutboundUnpinned() {
+        int n = 0;
+        for (PeerInfo p : connectedPeers)
+            if (!p.inbound() && !PeerTable.get().isPinned(p.ip())) n++;
+        return n;
     }
 
     private int countOutboundPeers() {
@@ -1248,7 +1306,7 @@ public class ChainSync {
                 // entry sitting here. Closing that stale entry first
                 // (removing it via close()'s own connectedPeers.removeIf())
                 // turns every such reconnect into a genuine refresh --
-                // same IP, one live entry, an up-to-date height -- 
+                // same IP, one live entry, an up-to-date height --
                 // instead of a second, permanently-stale duplicate.
                 for (PeerInfo existing : connectedPeers) {
                     if (!existing.inbound() && existing.ip().equals(target.ip()) && existing.conn() != conn) {
@@ -1260,7 +1318,10 @@ public class ChainSync {
                 maxPeerHeight = Math.max(maxPeerHeight, conn.peerHeight);
                 connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
 
-                if (conn.peerHeight >= ourTip) {
+                // A peer a block or two behind us is normal (blocks reach nodes at
+                // slightly different moments), not a fault -- only penalize and drop
+                // a peer that is meaningfully behind.
+                if (conn.peerHeight >= ourTip - STALE_TIP_TOLERANCE) {
                     return conn; // good peer found
                 }
 
@@ -1577,7 +1638,7 @@ public class ChainSync {
                     }
                     noteAnnouncedHeaders(peer, candidate); // refresh its height
                     System.out.printf("[ChainSync] Ignoring unsolicited/stale HEADERS from %s "
-                            + "(doesn't answer our locator) -- still waiting for the real reply.%n",
+                                    + "(doesn't answer our locator) -- still waiting for the real reply.%n",
                             peer.ip);
                 } else {
                     handleNonBlockMessage(candidate, peer);
@@ -1722,7 +1783,7 @@ public class ChainSync {
                     java.util.function.IntFunction<byte[]> look = x ->
                             x >= batchBase ? (x - batchBase < vh.size() ? vh.get(x - batchBase) : null)
                                     : (x == 0 ? (batchBase == 1 ? REAL_GENESIS_HEADER : db.getHeader(0))
-                                              : db.getHeader(x));
+                                    : db.getHeader(x));
                     try {
                         int want = BlockTemplates.expectedBits(look, thisHeight - 1, powParams);
                         if (HeaderUtil.bits(h) != want) {
@@ -2056,6 +2117,12 @@ public class ChainSync {
     private static final long PEER_HEIGHT_PROBE_TIMEOUT_MS = 3_000;
     private volatile long lastPeerHeightRefresh = 0;
 
+    /** Raises the height we hold for a peer (connection snapshot AND the peer-table value the admin panel shows). */
+    private void raisePeerHeight(PeerConnection c, int h) {
+        if (h > c.peerHeight) c.peerHeight = h;
+        PeerTable.get().updateHeight(c.ip, h);
+    }
+
     /** Lower bound on the peer's height implied by its reply to a tip-only locator, or -1 if uninformative. */
     static int heightFromTipProbeReply(List<byte[]> replyHeaders, byte[] tipHash, int ourTip) {
         if (replyHeaders.isEmpty()) return ourTip;
@@ -2095,9 +2162,15 @@ public class ChainSync {
                 }
                 if (msg == null) continue;
                 int h = heightFromTipProbeReply(parseHeaders(msg), tipHash, ourTip);
-                if (h > c.peerHeight) c.peerHeight = h;
+                raisePeerHeight(c, h);
+            } catch (RuntimeException e) {
+                // a bug-class failure while interpreting a message is not evidence the socket is dead
             } catch (Exception e) {
-                // a flaky idle peer is not worth reporting here; normal sync handles real failures
+                // The read/write itself failed (not just silence): the connection is dead, so drop it
+                // now instead of leaving a corpse in the pool and the peers panel.
+                System.out.printf("[ChainSync] Dropping dead pooled connection to %s (%s).%n",
+                        c.ip, e.getClass().getSimpleName());
+                try { c.close(); } catch (Exception ignored) {}
             }
         }
     }
@@ -2233,8 +2306,8 @@ public class ChainSync {
                 byte[] h = hs.get(i);
                 if (!HeaderUtil.checkPOW(h)) return false; // junk / spam: ignore entirely
                 int prevHeight = db.getHeightByHash(HeaderUtil.prevBlock(h));
-                if (prevHeight >= 0 && prevHeight <= db.getHeaderTip() && prevHeight + 1 > conn.peerHeight) {
-                    conn.peerHeight = prevHeight + 1;
+                if (prevHeight >= 0 && prevHeight <= db.getHeaderTip()) {
+                    raisePeerHeight(conn, prevHeight + 1);
                 }
                 if (!haveHeader(HeaderUtil.hash(h))) isNew = true;
             }
