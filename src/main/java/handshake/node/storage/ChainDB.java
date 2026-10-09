@@ -145,6 +145,11 @@ public class ChainDB {
     private final KVMap<Long,   byte[]>    headers;
     private final KVMap<Long,   byte[]>    blocks;
     private final KVMap<Long,   byte[]>    chainwork;
+    /** Per-block undo records (see UndoRecord); null only for a read-only handle on a DB that predates it. */
+    private final KVMap<Long,   byte[]>    undo;
+    /** Reorg side stores: header/block bytes by block hash (old and new branch while a reorg is in progress). */
+    private final KVMap<byte[], byte[]>    sideHeaders;
+    private final KVMap<byte[], byte[]>    sideBlocks;
     // RE-ARCHITECTURE: utxos/names/hashIndex/urkelNodes all moved from
     // hex-string keys to raw bytes -- see KVStore.openBytesBytesMap()'s
     // own comment and META_STORAGE_FORMAT_VERSION's own comment for why.
@@ -294,6 +299,15 @@ public class ChainDB {
         this.headers   = store.openLongBytesMap("headers");
         this.blocks    = store.openLongBytesMap("blocks");
         this.chainwork = store.openLongBytesMap("chainwork");
+        KVMap<Long, byte[]> undoMap;
+        try { undoMap = store.openLongBytesMap("undo"); }
+        catch (IllegalStateException readOnlyWithoutUndo) { undoMap = null; }
+        this.undo = undoMap;
+        KVMap<byte[], byte[]> sh, sb;
+        try { sh = store.openBytesBytesMap("side_headers"); sb = store.openBytesBytesMap("side_blocks"); }
+        catch (IllegalStateException readOnlyWithoutSide) { sh = null; sb = null; }
+        this.sideHeaders = sh;
+        this.sideBlocks = sb;
         this.meta      = store.openStringStringMap("meta");
         this.peers     = store.openStringStringMap("peers");
 
@@ -509,6 +523,7 @@ public class ChainDB {
             // and re-affirm hashIndex/newTip exactly as if it were a
             // fresh write, since it IS the same data either way.
             hashIndex.put(HeaderUtil.hash(header), h);
+            putChainwork((int) h, header);
             newTip = (int) h;
         }
         if (newTip > existingTip) {
@@ -543,6 +558,12 @@ public class ChainDB {
     public int getHeightByHash(byte[] hash) {
         Long h = hashIndex.get(hash);
         return h != null ? h.intValue() : -1;
+    }
+
+    /** Drops a hash from the hash index (used when a just-inserted header is
+     *  backed out because its block failed validation). */
+    public void forgetHeaderHash(byte[] hash) {
+        hashIndex.remove(hash);
     }
 
     /**
@@ -634,6 +655,9 @@ public class ChainDB {
         store.commit();
         headers.clear();
         chainwork.clear();
+        if (undo != null) undo.clear();
+        if (sideHeaders != null) { sideHeaders.clear(); sideBlocks.clear(); }
+        meta.remove("reorg_meta"); meta.remove("reorg_old"); meta.remove("reorg_new");
         blocks.clear();
         utxos.clear();
         names.clear();
@@ -680,6 +704,241 @@ public class ChainDB {
     public BigInteger getChainwork(int height) {
         byte[] b = chainwork.get((long) height);
         return b != null ? new BigInteger(1, b) : BigInteger.ZERO;
+    }
+
+    private static byte[] work32(BigInteger w) {
+        byte[] raw = w.toByteArray();
+        byte[] out = new byte[32];
+        int start = raw[0] == 0 ? 1 : 0;
+        int len = raw.length - start;
+        if (len > 32) throw new IllegalStateException("chainwork exceeds 256 bits");
+        System.arraycopy(raw, start, out, 32 - len, len);
+        return out;
+    }
+
+    /** cumulative work at {@code height} = work(height-1) + proof(bits of this header). */
+    private void putChainwork(int height, byte[] header) {
+        BigInteger prev = height > 0 ? getChainwork(height - 1) : BigInteger.ZERO;
+        chainwork.put((long) height, work32(prev.add(
+                handshake.node.chain.BlockTemplates.proof(HeaderUtil.bits(header)))));
+    }
+
+    /**
+     * Cumulative chainwork was never populated by earlier builds. Fills it in
+     * for every stored header the first time this runs (monotone: work is
+     * contiguous from height 0), so later runs return immediately.
+     */
+    public void backfillChainworkIfNeeded() {
+        int tip = getHeaderTip();
+        if (tip < 0) return;
+        if (chainwork.containsKey((long) tip)) return;
+        int lo = -1, hi = tip; // lo = highest height known to have work
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (chainwork.containsKey((long) mid)) lo = mid; else hi = mid - 1;
+        }
+        System.out.printf("[ChainDB] Backfilling cumulative chainwork from height %d to %d...%n", lo + 1, tip);
+        BigInteger acc = lo >= 0 ? getChainwork(lo) : BigInteger.ZERO;
+        for (int h = lo + 1; h <= tip; h++) {
+            byte[] header = headers.get((long) h);
+            if (header == null) break; // gap: stop; contiguous prefix only
+            acc = acc.add(handshake.node.chain.BlockTemplates.proof(HeaderUtil.bits(header)));
+            chainwork.put((long) h, work32(acc));
+            if (h % 50_000 == 0) store.commit();
+        }
+        store.commit();
+        System.out.println("[ChainDB] Chainwork backfill complete.");
+    }
+
+    // ── Undo records (reorg support) ──────────────────────────────────────────
+
+    /** How many blocks of undo data are kept behind the tip. */
+    public static final int UNDO_RETENTION = 288;
+
+    /**
+     * Everything needed to exactly reverse one connected block: ordered logs of
+     * (key, previous value or null) for the UTXO map, the name map and the Urkel
+     * tree, plus the tree's live/committed roots before the block. Replaying
+     * each log in REVERSE restores the prior values.
+     */
+    public static final class UndoRecord {
+        public int height;
+        public byte[] liveRootBefore;
+        public byte[] committedRootBefore;
+        public final List<byte[][]> utxoOps = new ArrayList<>();
+        public final List<byte[][]> nameOps = new ArrayList<>();
+        public final List<byte[][]> treeOps = new ArrayList<>();
+    }
+
+    private volatile UndoRecord recording = null;
+
+    private static byte[] strBytes(String s) {
+        return s == null ? null : s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Starts recording state changes for the block at {@code height}. */
+    public void beginUndo(int height) {
+        if (undo == null) return;
+        UndoRecord u = new UndoRecord();
+        u.height = height;
+        u.liveRootBefore = nameTree.liveRoot().clone();
+        u.committedRootBefore = nameTree.committedRoot().clone();
+        recording = u;
+        nameTree.setUndoSink((hash, prevEncoded) -> u.treeOps.add(new byte[][] { hash.clone(), prevEncoded }));
+    }
+
+    /** Persists the record for the block just processed and prunes the oldest. */
+    public void endUndo() {
+        UndoRecord u = recording;
+        if (u == null) return;
+        recording = null;
+        nameTree.setUndoSink(null);
+        undo.put((long) u.height, encodeUndo(u));
+        if (u.height - UNDO_RETENTION >= 0) undo.remove((long) (u.height - UNDO_RETENTION));
+    }
+
+    /** Drops an in-progress recording (block rejected / error). Safe to call anytime. */
+    public void abortUndo() {
+        if (recording == null) return;
+        recording = null;
+        nameTree.setUndoSink(null);
+    }
+
+    public boolean hasUndo(int height) { return undo != null && undo.containsKey((long) height); }
+
+    public UndoRecord getUndo(int height) {
+        if (undo == null) return null;
+        byte[] raw = undo.get((long) height);
+        return raw == null ? null : decodeUndo(raw);
+    }
+
+    /**
+     * Reverses the effects of the connected block at {@code height} (which must
+     * be the current block tip) using its undo record: UTXO map, name map and
+     * Urkel tree are restored, the tree roots rewound, the stored block and
+     * undo record removed, and the block tip moved to height-1. Throws if no
+     * undo record exists or the restored tree root does not match the recorded
+     * one (in which case local state must be treated as damaged).
+     */
+    public void disconnectBlock(int height) {
+        UndoRecord u = getUndo(height);
+        if (u == null) throw new IllegalStateException("no undo record for height " + height);
+        if (getBlockTip() != height) {
+            throw new IllegalStateException("can only disconnect the block tip (tip=" + getBlockTip()
+                    + ", requested=" + height + ")");
+        }
+        pendingNameWrites.clear();
+        for (int i = u.utxoOps.size() - 1; i >= 0; i--) {
+            byte[][] op = u.utxoOps.get(i);
+            if (op[1] == null) utxos.remove(op[0]);
+            else utxos.put(op[0], new String(op[1], java.nio.charset.StandardCharsets.UTF_8));
+        }
+        for (int i = u.nameOps.size() - 1; i >= 0; i--) {
+            byte[][] op = u.nameOps.get(i);
+            if (op[1] == null) names.remove(op[0]);
+            else names.put(op[0], new String(op[1], java.nio.charset.StandardCharsets.UTF_8));
+        }
+        for (int i = u.treeOps.size() - 1; i >= 0; i--) {
+            byte[][] op = u.treeOps.get(i);
+            nameTree.applyRaw(op[0], op[1]);
+        }
+        nameTree.persistBlock();
+        if (!java.util.Arrays.equals(nameTree.liveRoot(), u.liveRootBefore)) {
+            throw new IllegalStateException("Urkel live root after undo of height " + height + " is "
+                    + hex(nameTree.liveRoot()) + " but expected " + hex(u.liveRootBefore));
+        }
+        nameTree.restoreCommittedRoot(u.committedRootBefore);
+        meta.put(META_URKEL_LIVE_ROOT, hex(nameTree.liveRoot()));
+        meta.put(META_URKEL_COMMITTED_ROOT, hex(nameTree.committedRoot()));
+        blocks.remove((long) height);
+        setBlockTip(height - 1);
+        undo.remove((long) height);
+        commit();
+    }
+
+    public void removeUndo(int height) { if (undo != null) undo.remove((long) height); }
+
+    private static void writeOps(java.io.DataOutputStream o, List<byte[][]> ops) throws java.io.IOException {
+        o.writeInt(ops.size());
+        for (byte[][] op : ops) {
+            o.writeInt(op[0].length); o.write(op[0]);
+            if (op[1] == null) { o.writeBoolean(false); }
+            else { o.writeBoolean(true); o.writeInt(op[1].length); o.write(op[1]); }
+        }
+    }
+
+    private static void readOps(java.io.DataInputStream in, List<byte[][]> ops) throws java.io.IOException {
+        int n = in.readInt();
+        for (int i = 0; i < n; i++) {
+            byte[] k = new byte[in.readInt()]; in.readFully(k);
+            byte[] v = null;
+            if (in.readBoolean()) { v = new byte[in.readInt()]; in.readFully(v); }
+            ops.add(new byte[][] { k, v });
+        }
+    }
+
+    static byte[] encodeUndo(UndoRecord u) {
+        try {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            java.io.DataOutputStream o = new java.io.DataOutputStream(bos);
+            o.writeByte(1); // format version
+            o.writeInt(u.height);
+            o.write(u.liveRootBefore);
+            o.write(u.committedRootBefore);
+            writeOps(o, u.utxoOps);
+            writeOps(o, u.nameOps);
+            writeOps(o, u.treeOps);
+            return bos.toByteArray();
+        } catch (java.io.IOException e) { throw new RuntimeException(e); }
+    }
+
+    static UndoRecord decodeUndo(byte[] raw) {
+        try {
+            java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw));
+            if (in.readByte() != 1) throw new IllegalStateException("unknown undo format");
+            UndoRecord u = new UndoRecord();
+            u.height = in.readInt();
+            u.liveRootBefore = new byte[32]; in.readFully(u.liveRootBefore);
+            u.committedRootBefore = new byte[32]; in.readFully(u.committedRootBefore);
+            readOps(in, u.utxoOps);
+            readOps(in, u.nameOps);
+            readOps(in, u.treeOps);
+            return u;
+        } catch (java.io.IOException e) { throw new RuntimeException(e); }
+    }
+
+    // ── Reorg support: side stores, header rollback, marker ───────────────────
+
+    public void putSideHeader(byte[] hash, byte[] header) { sideHeaders.put(hash, header); }
+    public byte[] getSideHeader(byte[] hash) { return sideHeaders.get(hash); }
+    public void putSideBlock(byte[] hash, byte[] raw) { sideBlocks.put(hash, raw); }
+    public byte[] getSideBlock(byte[] hash) { return sideBlocks.get(hash); }
+    public void clearSideStores() { sideHeaders.clear(); sideBlocks.clear(); }
+
+    /** Generic small string metadata (reorg marker etc.). */
+    public String getMeta(String key) { return meta.get(key); }
+    public void putMeta(String key, String value) { meta.put(key, value); }
+    public void removeMeta(String key) { meta.remove(key); }
+
+    /**
+     * Removes every header above {@code targetHeight} from the main chain
+     * (headers, chainwork AND hash index), saving each removed header into the
+     * side store first so it can be restored. Block data is not touched.
+     */
+    public void rollbackHeadersTo(int targetHeight) {
+        int current = getHeaderTip();
+        for (int h = current; h > targetHeight; h--) {
+            byte[] hd = headers.get((long) h);
+            if (hd != null) {
+                byte[] hash = HeaderUtil.hash(hd);
+                sideHeaders.put(hash, hd);
+                hashIndex.remove(hash);
+            }
+            headers.remove((long) h);
+            chainwork.remove((long) h);
+        }
+        meta.put(META_HEADER_TIP, String.valueOf(targetHeight));
+        store.commit();
     }
 
     // ── UTXO operations ───────────────────────────────────────────────────────
@@ -754,7 +1013,10 @@ public class ChainDB {
     }
 
     public void saveUtxo(String txid, int index, UtxoEntry entry) {
-        utxos.put(utxoKey(txid, index), entry.toStorage());
+        byte[] key = utxoKey(txid, index);
+        UndoRecord u = recording;
+        if (u != null) u.utxoOps.add(new byte[][] { key, strBytes(utxos.get(key)) });
+        utxos.put(key, entry.toStorage());
     }
 
     public UtxoEntry getUtxo(String txid, int index) {
@@ -763,7 +1025,13 @@ public class ChainDB {
     }
 
     public void removeUtxo(String txid, int index) {
-        utxos.remove(utxoKey(txid, index));
+        byte[] key = utxoKey(txid, index);
+        UndoRecord u = recording;
+        if (u != null) {
+            String prev = utxos.get(key);
+            if (prev != null) u.utxoOps.add(new byte[][] { key, strBytes(prev) });
+        }
+        utxos.remove(key);
     }
 
     /** Returns all UTXOs at a given address hash (requires address index). */
@@ -918,6 +1186,10 @@ public class ChainDB {
         java.util.Map<byte[], String> toWrite = new java.util.LinkedHashMap<>();
         for (var e : pendingNameWrites.entrySet()) {
             toWrite.put(HexUtil.decode(e.getKey()), e.getValue());
+        }
+        UndoRecord u = recording;
+        if (u != null) {
+            for (byte[] k : toWrite.keySet()) u.nameOps.add(new byte[][] { k, strBytes(names.get(k)) });
         }
         names.putAll(toWrite);
         pendingNameWrites.clear();

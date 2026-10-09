@@ -20,6 +20,7 @@ import handshake.node.peer.NodeIdentity;
 
 import handshake.node.chain.BlockProcessor;
 import handshake.node.chain.ChainSync;
+import handshake.node.chain.BlockTemplates;
 import handshake.node.chain.HeaderUtil;
 import handshake.node.chain.Mempool;
 import handshake.node.NodeConfig;
@@ -108,6 +109,10 @@ public class RpcServer {
 
     public interface BlockListener {
         void onNewBlock(int height, byte[] hash, byte[] rawBlock);
+
+        /** A block that was part of our chain has been undone by a reorganization
+         *  (called newest-first, before the replacement blocks are announced). */
+        default void onBlockDisconnected(int height, byte[] hash, byte[] rawBlock) {}
     }
 
     public void addBlockListener(BlockListener listener) {
@@ -117,6 +122,15 @@ public class RpcServer {
     public void notifyNewBlock(int height, byte[] hash, byte[] rawBlock) {
         for (BlockListener l : blockListeners) {
             try { l.onNewBlock(height, hash, rawBlock); }
+            catch (Exception e) {
+                System.err.println("[RPC] Block listener error: " + e.getMessage());
+            }
+        }
+    }
+
+    public void notifyBlockDisconnected(int height, byte[] hash, byte[] rawBlock) {
+        for (BlockListener l : blockListeners) {
+            try { l.onBlockDisconnected(height, hash, rawBlock); }
             catch (Exception e) {
                 System.err.println("[RPC] Block listener error: " + e.getMessage());
             }
@@ -243,6 +257,7 @@ public class RpcServer {
             "getblockcount",
             "getblockhash",
             "getblockheader",
+            "getblocktemplate",
             "getchaintips",
             "getconnectioncount",
             "getdifficulty",
@@ -274,6 +289,7 @@ public class RpcServer {
             "setban",
             "signmessagewithprivkey",
             "stop",
+            "submitblock",
             "validateaddress",
             "verifyblock",
             "verifymessage",
@@ -289,6 +305,8 @@ public class RpcServer {
             case "getblockcount"      -> getBlockCount();
             case "getblockhash"       -> getBlockHash(params);
             case "getblockheader"     -> getBlockHeader(params);
+            case "getblocktemplate"   -> getBlockTemplate(params);
+            case "submitblock"        -> submitBlock(params);
             case "getblock"           -> getBlock(params);
             case "getblockbyheight"   -> getBlockByHeight(params);
             case "getbestblockhash"   -> getBestBlockHash();
@@ -977,6 +995,132 @@ public class RpcServer {
      * successfully-decoded address is treated as spendable, which is
      * correct for the overwhelming majority of real addresses.
      */
+    // ── Mining ────────────────────────────────────────────────────────────────
+
+    /**
+     * getblocktemplate {"address":"hs1q...", "coinbaseflags":"text"} (or just the address
+     * string). Returns a coinbase-only template extending our current tip,
+     * in hsd/BIP22 style field names, plus the pieces a miner needs to build the
+     * header (treeroot, reservedroot, merkleroot, witnessroot, bits, target)
+     * and the finished coinbase transaction.
+     */
+    private String getBlockTemplate(String params) throws RpcException {
+        if (chainSync == null) throw new RpcException(-1, "Node not ready");
+        String addr = null;
+        String flags = "easy-handshake";
+        List<String> pl = parseParamList(params);
+        if (!pl.isEmpty()) {
+            String f = pl.get(0).trim();
+            if (f.startsWith("{")) {
+                java.util.LinkedHashMap<String, String> o = parseObjectParam(params, 0);
+                addr = unquote(o.get("address"));
+                String cf = unquote(o.get("coinbaseflags"));
+                if (cf != null) flags = cf;
+            } else {
+                addr = unquote(f);
+            }
+        }
+        if (addr == null || addr.isEmpty())
+            throw new RpcException(-8, "getblocktemplate {\"address\":\"hs1...\"} -- a reward address is required");
+
+        int addrVersion;
+        byte[] addrHash;
+        try {
+            Object[] d = Bech32.decode(addr);
+            if (!"hs".equals(d[0])) throw new RpcException(-5, "Not a mainnet (hs1...) address");
+            addrVersion = (int) d[1];
+            addrHash = (byte[]) d[2];
+            if (addrVersion != 0 || (addrHash.length != 20 && addrHash.length != 32))
+                throw new RpcException(-5, "Unsupported reward address type");
+        } catch (RpcException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RpcException(-5, "Invalid address");
+        }
+
+        byte[] flagBytes = flags.getBytes(StandardCharsets.UTF_8);
+        if (flagBytes.length > 100) throw new RpcException(-8, "coinbaseflags too long");
+
+        int tipH = db.getBlockTip();
+        if (tipH < 0 || db.getHeaderTip() != tipH)
+            throw new RpcException(-10, "Node is still syncing");
+        byte[] tipHeader = db.getHeader(tipH);
+        if (tipHeader == null) throw new RpcException(-10, "Node is still syncing");
+        long now = System.currentTimeMillis() / 1000;
+        if (now - HeaderUtil.time(tipHeader) > 6 * 3600)
+            throw new RpcException(-10, "Chain tip is more than 6 hours old -- node is not caught up");
+        if (chainSync.getConnectedPeerCount() == 0)
+            throw new RpcException(-9, "Node is not connected to any peers");
+
+        BlockTemplates.Template t;
+        try {
+            t = BlockTemplates.build(db, addrVersion, addrHash, flagBytes, now, BlockTemplates.Params.MAINNET);
+        } catch (Exception e) {
+            throw new RpcException(-1, "Could not build template: " + e.getMessage());
+        }
+        byte[] target = new byte[32];
+        byte[] tb = HeaderUtil.targetFromBits(t.bits).toByteArray();
+        for (int i = 0; i < tb.length && i < 32; i++) target[31 - i] = tb[tb.length - 1 - i];
+
+        return "{"
+                + "\"capabilities\":[\"proposal\"],"
+                + "\"mutable\":[\"time\"],"
+                + "\"version\":" + t.version + ","
+                + "\"rules\":[],"
+                + "\"vbavailable\":{},"
+                + "\"vbrequired\":0,"
+                + "\"height\":" + t.height + ","
+                + "\"previousblockhash\":\"" + hex(t.prevHash) + "\","
+                + "\"treeroot\":\"" + hex(t.treeRoot) + "\","
+                + "\"reservedroot\":\"" + hex(t.reservedRoot) + "\","
+                + "\"merkleroot\":\"" + hex(t.merkleRoot) + "\","
+                + "\"witnessroot\":\"" + hex(t.witnessRoot) + "\","
+                + "\"mask\":\"" + hex(new byte[32]) + "\","
+                + "\"target\":\"" + hex(target) + "\","
+                + "\"bits\":\"" + String.format("%08x", t.bits) + "\","
+                + "\"noncerange\":\"00000000ffffffff\","
+                + "\"curtime\":" + t.curTime + ","
+                + "\"mintime\":" + t.minTime + ","
+                + "\"maxtime\":" + t.maxTime + ","
+                + "\"expires\":" + (t.curTime + 600) + ","
+                + "\"sizelimit\":" + BlockTemplates.MAX_BLOCK_SIZE + ","
+                + "\"weightlimit\":" + BlockTemplates.MAX_BLOCK_WEIGHT + ","
+                + "\"coinbasevalue\":" + t.coinbaseValue + ","
+                + "\"coinbasetxn\":{\"data\":\"" + hex(t.coinbase.raw) + "\","
+                + "\"hash\":\"" + hex(t.coinbase.txid) + "\","
+                + "\"witnesshash\":\"" + hex(t.coinbase.witnessHash) + "\"},"
+                + "\"transactions\":[],"
+                + "\"claims\":[],\"airdrops\":[],"
+                + "\"header\":\"" + hex(t.header(0, t.curTime, new byte[24], new byte[32])) + "\""
+                + "}";
+    }
+
+    /**
+     * submitblock "hexdata". BIP22 result: null when accepted, otherwise a
+     * short reason string ("high-hash", "bad-prevblk", "duplicate", ...).
+     */
+    private String submitBlock(String params) throws RpcException {
+        if (chainSync == null) throw new RpcException(-1, "Node not ready");
+        String hexBlock = parseStringParam(params, 0);
+        if (hexBlock == null || hexBlock.isEmpty())
+            throw new RpcException(-22, "submitblock \"hexdata\"");
+        byte[] raw;
+        try {
+            raw = fromHex(hexBlock);
+        } catch (Exception e) {
+            throw new RpcException(-22, "Block decode failed");
+        }
+        String result = chainSync.submitBlock(raw);
+        return result == null ? "null" : "\"" + escape(result) + "\"";
+    }
+
+    private static String unquote(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (v.length() >= 2 && v.startsWith("\"") && v.endsWith("\"")) return v.substring(1, v.length() - 1);
+        return v;
+    }
+
     private String validateAddress(String params) throws RpcException {
         String str = parseStringParam(params, 0);
         if (str == null) throw new RpcException(-1, "validateaddress \"address\"");

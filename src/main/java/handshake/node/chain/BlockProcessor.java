@@ -262,12 +262,15 @@ public class BlockProcessor {
      *  rejection (a smaller, but still real, follow-on problem). */
     public enum Result { VALID, REJECTED, INTERNAL_ERROR }
 
+    private static Result finishUndo(ChainDB db, Result r) { db.abortUndo(); return r; }
+
     public static Result process(byte[] rawBlock, int height,
                                  ChainDB db, Mempool mempool, int bestKnownPeerHeight) {
         try {
             return processInternal(rawBlock, height, db, mempool, bestKnownPeerHeight)
-                    ? Result.VALID : Result.REJECTED;
+                    ? finishUndo(db, Result.VALID) : finishUndo(db, Result.REJECTED);
         } catch (UrkelTreeMismatchException e) {
+            db.abortUndo();
             // FIX: this exact exception was being caught by the
             // broader `catch (Exception e)` below FIRST, converting it
             // into a plain Result.INTERNAL_ERROR value -- silently
@@ -294,6 +297,7 @@ public class BlockProcessor {
             // tree's on-disk state may be incomplete or inconsistent
             // for this height. This is categorically an internal
             // failure, not evidence the peer sent us anything invalid.
+            db.abortUndo();
             System.err.printf("[BlockProcessor] Internal error at height %d: %s -- "
                     + "NOT advancing past it (will be retried), and NOT blaming "
                     + "whichever peer happened to send it%n", height, e.getMessage());
@@ -399,6 +403,13 @@ public class BlockProcessor {
                         + "This needs direct investigation, not automatic recovery.%n");
             }
             throw new UrkelTreeMismatchException(height, claimedTreeRoot, ourCommittedRoot, firstRisky);
+        }
+
+        // Reorg support: record exactly what this block changes so it can be
+        // reversed later. Only needed within UNDO_RETENTION blocks of the tip
+        // (deep history can never be reorganized), so skipped during bulk sync.
+        if (bestKnownPeerHeight <= 0 || (bestKnownPeerHeight - height) <= ChainDB.UNDO_RETENTION) {
+            db.beginUndo(height);
         }
 
         for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
@@ -556,6 +567,7 @@ public class BlockProcessor {
         ChainDB.PersistTiming timing = db.persistNameTreeStateTimed(height, bestKnownPeerHeight);
         persistBlockNanos += timing.persistBlockNanos();
         maybeCommitNanos += timing.maybeCommitNanos();
+        db.endUndo();
         logTimingIfDue(height);
 
         // Step 4: Evict confirmed transactions from mempool
@@ -830,7 +842,7 @@ public class BlockProcessor {
                     || (claimState == 3 && !entry.registered);
             if (!validClaimState) {
                 System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d "
-                                + "(state=%d, registered=%s) -- skipping, not applying%n",
+                        + "(state=%d, registered=%s) -- skipping, not applying%n",
                         entry.name, height, claimState, entry.registered);
                 return;
             }
@@ -838,8 +850,8 @@ public class BlockProcessor {
             int claimedHeight = extractU32(items, 5);
             if (claimedHeight <= entry.claimed) {
                 System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                                + "claimed height %d does not exceed existing %d (also implicitly rejects "
-                                + "the genesis block) -- skipping, not applying%n",
+                        + "claimed height %d does not exceed existing %d (also implicitly rejects "
+                        + "the genesis block) -- skipping, not applying%n",
                         entry.name, height, claimedHeight, entry.claimed);
                 return;
             }
@@ -848,14 +860,14 @@ public class BlockProcessor {
                 boolean hasOwner = entry.ownerTxid != null && !entry.ownerTxid.isEmpty();
                 if (!hasOwner && claimedHeight != 1) {
                     System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                                    + "initial claim must commit to height 1, got %d -- skipping, not applying%n",
+                            + "initial claim must commit to height 1, got %d -- skipping, not applying%n",
                             entry.name, height, claimedHeight);
                     return;
                 }
                 if (hasOwner && height < entry.height + CLAIM_FREQUENCY) {
                     System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                                    + "re-claim before CLAIM_FREQUENCY (%d) has elapsed since %d -- "
-                                    + "skipping, not applying%n",
+                            + "re-claim before CLAIM_FREQUENCY (%d) has elapsed since %d -- "
+                            + "skipping, not applying%n",
                             entry.name, height, CLAIM_FREQUENCY, entry.height);
                     return;
                 }
@@ -902,7 +914,7 @@ public class BlockProcessor {
                 // this check.
                 if (state != 0 || entry.height != height) {
                     System.err.printf("[BlockProcessor] Invalid OPEN for name '%s' at height %d "
-                                    + "(state=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, entry.height);
                     return;
                 }
@@ -917,7 +929,7 @@ public class BlockProcessor {
             case COV_BID -> {
                 if (state != 1 || start != entry.height) {
                     System.err.printf("[BlockProcessor] Invalid BID for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -925,7 +937,7 @@ public class BlockProcessor {
             case COV_REVEAL -> {
                 if (start != entry.height || state != 2) {
                     System.err.printf("[BlockProcessor] Invalid REVEAL for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -956,7 +968,7 @@ public class BlockProcessor {
                         && spentInput.prevIndex == entry.ownerIndex;
                 if (start != entry.height || (state != 3 && state != 4) || spentIsWinner) {
                     System.err.printf("[BlockProcessor] Invalid REDEEM for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d, spentIsWinner=%s) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d, spentIsWinner=%s) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, spentIsWinner);
                     return;
                 }
@@ -964,7 +976,7 @@ public class BlockProcessor {
             case COV_REGISTER -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid REGISTER for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -972,7 +984,7 @@ public class BlockProcessor {
             case COV_UPDATE -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid UPDATE for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -988,7 +1000,7 @@ public class BlockProcessor {
                 if (start != entry.height || state != 3
                         || height < entry.renewal + TREE_INTERVAL_CONST) {
                     System.err.printf("[BlockProcessor] Invalid RENEW for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d, entry.renewal=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d, entry.renewal=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, entry.renewal);
                     return;
                 }
@@ -996,7 +1008,7 @@ public class BlockProcessor {
             case COV_TRANSFER -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid TRANSFER for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -1009,7 +1021,7 @@ public class BlockProcessor {
                 if (start != entry.height || state != 3
                         || height < entry.transfer + TRANSFER_LOCKUP) {
                     System.err.printf("[BlockProcessor] Invalid FINALIZE for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d, entry.transfer=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d, entry.transfer=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, entry.transfer);
                     return;
                 }
@@ -1017,7 +1029,7 @@ public class BlockProcessor {
             case COV_REVOKE -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid REVOKE for name '%s' at height %d "
-                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }

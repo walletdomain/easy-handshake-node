@@ -1,7 +1,5 @@
 package handshake.node.urkeltree;
 
-import handshake.node.storage.KVStore;
-import handshake.node.storage.DiskBackedHashKeySet;
 import handshake.node.storage.DiskBackedOrphanQueue;
 import handshake.node.storage.PersistentLog;
 
@@ -460,12 +458,27 @@ public class UrkelNameTree {
      *  by itself change committedRoot(); that only happens via
      *  maybeCommit() at an actual interval boundary. */
     public void applyNameState(byte[] nameHash, UrkelNameState state) {
+        java.util.function.BiConsumer<byte[], byte[]> sink = undoSink;
+        if (sink != null) sink.accept(nameHash, tree.get(nameHash));
         if (state.isNull()) {
             tree.remove(nameHash);
         } else {
             tree.insert(nameHash, state.encode());
         }
     }
+
+    /** Reorg support: sets a name's raw tree value directly (null removes it). */
+    public void applyRaw(byte[] nameHash, byte[] rawOrNull) {
+        if (rawOrNull == null) tree.remove(nameHash); else tree.insert(nameHash, rawOrNull);
+    }
+
+    /** Reorg support: rewinds the committed root to its value before a disconnected block. */
+    public void restoreCommittedRoot(byte[] root) { lastCommittedRoot = root.clone(); }
+
+    private volatile java.util.function.BiConsumer<byte[], byte[]> undoSink = null;
+
+    /** Receives (nameHash, previous encoded value or null) before every change (undo recording). */
+    public void setUndoSink(java.util.function.BiConsumer<byte[], byte[]> sink) { this.undoSink = sink; }
 
     /** Call once per block, after all of that block's covenant outputs
      *  have been applied via applyNameState() -- writes any newly
@@ -723,7 +736,7 @@ public class UrkelNameTree {
      *  simply the calling thread draining chunk after chunk itself,
      *  nothing else could ever be running concurrently to wait for. */
     private void blockUntilBacklogDrains(boolean deepCatchUp, UrkelNode rootToPrune, int height,
-                                         String dataDir) {
+                                          String dataDir) {
         long resumeThreshold = HARD_BACKPRESSURE_CAP / 2;
         long startSize = accumulatedOrphanCandidates.size();
         // FIX: a backpressure episode is exactly the kind of rare,

@@ -113,6 +113,7 @@ public class Main {
                 db.getHeaderCountEstimate(), db.getBlockCountEstimate(),
                 db.getUtxoCountEstimate(), db.getNameCountEstimate());
         db.backfillHashIndexIfNeeded();
+        db.backfillChainworkIfNeeded();
 
         // ── 3b. Resilience: verify consistency after an unclean shutdown ───────
         // NEW: see ChainDB.commit()'s own comment for the real, plausible
@@ -163,6 +164,14 @@ public class Main {
                     System.out.println("[Main] On-disk state verified consistent at height " + currentTip
                             + " -- no recovery needed.");
                 }
+            } else if (currentTip >= 0 && currentTip > db.getHeaderTip()) {
+                // Header tip was rolled back below the block tip (see
+                // ChainDB.resetHeaderTip): the header at the block tip is
+                // missing by design while headers re-sync. Blocks, UTXOs,
+                // names and the Urkel tree are intact -- do NOT reset.
+                System.out.println("[Main] Block tip " + currentTip + " is above header tip "
+                        + db.getHeaderTip() + " (header rollback) -- keeping all chain data; "
+                        + "headers will re-sync.");
             } else if (currentTip >= 0) {
                 // FIX: a real, confirmed production incident -- this
                 // branch used to be reached whenever currentHeader was

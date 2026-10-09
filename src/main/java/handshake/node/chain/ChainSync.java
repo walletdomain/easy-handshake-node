@@ -52,7 +52,10 @@ public class ChainSync {
 
     // ── Constants ─────────────────────────────────────────────────────────────
 
-    private static final int POLL_INTERVAL_SEC  = 60;
+    // Lowered from 60: pooled outbound connections are not read between
+    // sync cycles, so a pushed announcement can only be acted on at the next
+    // cycle there. Inbound connections trigger an immediate cycle instead.
+    private static final int POLL_INTERVAL_SEC  = 30;
     private static final int CONNECT_TIMEOUT_MS = 5_000;
     private static final int READ_TIMEOUT_MS    = 30_000;
     private static final int MAX_HEADERS_BATCH  = 2000;
@@ -623,7 +626,19 @@ public class ChainSync {
         }
 
         int blockTip = db.getBlockTip();
-        if (blockTip >= 0) {
+        if (blockTip >= 0 && blockTip > db.getHeaderTip()) {
+            // The header tip is BELOW the block tip. That is the expected
+            // state after a header-tip rollback (resetHeaderTip only drops
+            // headers/chainwork; blocks, UTXOs, names and the Urkel tree are
+            // untouched) while headers re-sync. The header at blockTip is
+            // legitimately missing, so this is NOT evidence of corruption.
+            // Never trim the block tip here: UTXO/name state already
+            // reflects blockTip, so lowering it would make blocks get
+            // re-applied on top of state that already contains them.
+            System.out.printf("[ChainSync] Block tip %d is above header tip %d (header rollback "
+                    + "in progress) -- leaving block state untouched until headers catch up.%n",
+                    blockTip, db.getHeaderTip());
+        } else if (blockTip >= 0) {
             byte[] header = db.getHeader(blockTip);
             byte[] block = db.getBlock(blockTip);
             boolean blockMatches = header != null && block != null && block.length >= 236
@@ -717,7 +732,21 @@ public class ChainSync {
                     + "before sync can resume.");
             return;
         }
+        if (haltedDueToFork != null) {
+            System.err.println("[ChainSync] Not syncing -- " + haltedDueToFork);
+            return;
+        }
+        if (ReorgExecutor.inProgress(db)) {
+            try {
+                ReorgExecutor.resume(db, reorgHook());
+            } catch (Exception e) {
+                haltedDueToFork = "Could not resume the interrupted reorganization: " + e;
+                System.err.println("[ChainSync] " + haltedDueToFork);
+                return;
+            }
+        }
         try {
+            refreshPeerHeights();
             // Loop internally (fast, NOT gated by the 60-second scheduler
             // interval) as long as real progress is being made. This is
             // what lets syncHeaders() hand back control mid-sync (e.g. to
@@ -813,7 +842,13 @@ public class ChainSync {
                     // auto-rollback check above aren't permanently
                     // working off a connect-time snapshot for a
                     // long-lived pooled connection.
-                    if (newTip > peer.peerHeight) {
+                    // Only raise it when THIS peer actually delivered headers
+                    // (newTip > localTip): then it provably has at least
+                    // newTip. Otherwise newTip is just OUR OWN tip echoed
+                    // back (the peer replied empty/unknown), and stamping it
+                    // onto the peer made lagging peers (e.g. a node still
+                    // at ~200000) falsely display our height.
+                    if (newTip > localTip && newTip > peer.peerHeight) {
                         peer.peerHeight = newTip;
                     }
 
@@ -1213,7 +1248,7 @@ public class ChainSync {
                 // entry sitting here. Closing that stale entry first
                 // (removing it via close()'s own connectedPeers.removeIf())
                 // turns every such reconnect into a genuine refresh --
-                // same IP, one live entry, an up-to-date height --
+                // same IP, one live entry, an up-to-date height -- 
                 // instead of a second, permanently-stale duplicate.
                 for (PeerInfo existing : connectedPeers) {
                     if (!existing.inbound() && existing.ip().equals(target.ip()) && existing.conn() != conn) {
@@ -1540,8 +1575,9 @@ public class ChainSync {
                         msg = candidate;
                         break;
                     }
+                    noteAnnouncedHeaders(peer, candidate); // refresh its height
                     System.out.printf("[ChainSync] Ignoring unsolicited/stale HEADERS from %s "
-                                    + "(doesn't answer our locator) -- still waiting for the real reply.%n",
+                            + "(doesn't answer our locator) -- still waiting for the real reply.%n",
                             peer.ip);
                 } else {
                     handleNonBlockMessage(candidate, peer);
@@ -1583,7 +1619,9 @@ public class ChainSync {
             // the wrong height labels).
             byte[] previousHeader = tip >= 0 ? db.getHeader(tip) : null;
             List<byte[]> validHeaders = new ArrayList<>();
+            int headerIdx = -1;
             for (byte[] h : headers) {
+                headerIdx++;
                 // FIX: observed once in practice -- a peer's "next" header
                 // came back byte-for-byte IDENTICAL to the header we
                 // already have stored immediately before it (confirmed via
@@ -1604,6 +1642,14 @@ public class ChainSync {
                     continue;
                 }
                 if (previousHeader != null && !HeaderUtil.chainsFrom(h, previousHeader)) {
+                    // PHASE 0 (reorg handling): before treating this as bad
+                    // data, check whether the header simply forks off OUR
+                    // chain at a known ancestor. That is normal network
+                    // behaviour (competing blocks), not misbehaviour: never
+                    // penalize the peer for it.
+                    if (handleFork(peer, headers, headerIdx, tip + validHeaders.size())) {
+                        break;
+                    }
                     // DIAGNOSTIC (temporary, pending root-cause): every
                     // real occurrence of this so far has been at a
                     // height hundreds of thousands of blocks behind
@@ -1664,6 +1710,33 @@ public class ChainSync {
                             "sent header at height " + badHeight
                                     + " with invalid proof-of-work");
                     break;
+                }
+                // PHASE 1: difficulty (bits) must equal what the retarget
+                // rules dictate. Enforced near the tip only (old, deeply
+                // buried history is protected by cumulative PoW already and
+                // this keeps a fresh sync independent of this check).
+                final int batchBase = (localTip < 0 && tip == localTip) ? 1 : tip + 1;
+                final List<byte[]> vh = validHeaders;
+                int thisHeight = batchBase + validHeaders.size();
+                if (thisHeight >= bestKnownPeerHeight - 2016 && thisHeight > 146) {
+                    java.util.function.IntFunction<byte[]> look = x ->
+                            x >= batchBase ? (x - batchBase < vh.size() ? vh.get(x - batchBase) : null)
+                                    : (x == 0 ? (batchBase == 1 ? REAL_GENESIS_HEADER : db.getHeader(0))
+                                              : db.getHeader(x));
+                    try {
+                        int want = BlockTemplates.expectedBits(look, thisHeight - 1, powParams);
+                        if (HeaderUtil.bits(h) != want) {
+                            System.out.printf("[ChainSync] %s: header at height %d has bits=0x%08X "
+                                            + "but the difficulty rules require 0x%08X -- rejecting batch.%n",
+                                    peer.ip, thisHeight, HeaderUtil.bits(h), want);
+                            PeerTable.get().banPeer(peer.ip, "sent header at height " + thisHeight
+                                    + " with wrong difficulty bits");
+                            break;
+                        }
+                    } catch (IllegalStateException e) {
+                        System.out.println("[ChainSync] Skipping bits check at height " + thisHeight
+                                + " (" + e.getMessage() + ")");
+                    }
                 }
                 validHeaders.add(h);
                 previousHeader = h;
@@ -1882,6 +1955,332 @@ public class ChainSync {
             if (Arrays.equals(prev, l)) return true;
         }
         return false;
+    }
+
+    // ── Locally produced / RPC-submitted blocks ───────────────────────────────
+
+    /**
+     * Accepts a block that extends OUR current tip (submitblock). The work runs
+     * on the sync thread, so it can never overlap a sync cycle, and the result
+     * is a BIP22-style reason string, or null when the block was accepted.
+     */
+    public String submitBlock(byte[] raw) {
+        if (!running) return "node-not-running";
+        try {
+            return scheduler.submit(() -> acceptSubmittedBlock(raw)).get(60, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            return "node-busy-syncing";
+        } catch (Exception e) {
+            return "internal-error: " + e.getMessage();
+        }
+    }
+
+    // Consensus parameters used to judge submitted blocks. Always mainnet in
+    // production; the integration tests swap in an easy-difficulty copy.
+    private volatile BlockTemplates.Params powParams = BlockTemplates.Params.MAINNET;
+
+    private String acceptSubmittedBlock(byte[] raw) {
+        if (haltedDueToTreeMismatch != null || haltedDueToFork != null) return "node-halted";
+        long now = System.currentTimeMillis() / 1000;
+        String err = BlockTemplates.checkBlock(db, mempool, raw, now, powParams);
+        if (err != null) {
+            System.out.printf("[ChainSync] submitblock rejected: %s%n", err);
+            return err;
+        }
+        int height = db.getBlockTip() + 1;
+        byte[] header = Arrays.copyOf(raw, 236);
+        byte[] hash = HeaderUtil.hash(header);
+
+        db.insertHeaders(List.of(header), height);
+        byte[] msg = new byte[9 + raw.length];
+        System.arraycopy(raw, 0, msg, 9, raw.length);
+        boolean ok = false;
+        try {
+            ok = processBlock(msg, height, null);
+        } catch (UrkelTreeMismatchException e) {
+            haltedDueToTreeMismatch = e;
+            System.err.printf("[ChainSync] submitblock: Urkel mismatch at %d -- sync halted.%n", e.height);
+            return "urkel-mismatch";
+        } catch (Exception e) {
+            System.err.printf("[ChainSync] submitblock: processing failed: %s%n", e);
+        }
+        if (!ok) {
+            // Back the header out again so the chain is exactly as it was.
+            db.resetHeaderTip(height - 1);
+            db.forgetHeaderHash(hash);
+            db.commit();
+            return "rejected";
+        }
+        db.commit();
+        System.out.printf("[ChainSync] Accepted submitted block %d (%s)%n", height, toHex(hash));
+        return null;
+    }
+
+    // ── Push-driven sync and block relay ──────────────────────────────────────
+
+    private final AtomicBoolean syncTriggerPending = new AtomicBoolean(false);
+    private volatile byte[] lastAnnouncedHash;
+
+    /**
+     * Runs a sync cycle as soon as the (single) sync thread is free, instead
+     * of waiting for the next scheduled tick. Safe to call from any thread:
+     * cycles still run one at a time on the same executor, and at most one
+     * extra cycle is ever queued.
+     */
+    void triggerSync(String why) {
+        if (!running) return;
+        if (!syncTriggerPending.compareAndSet(false, true)) return;
+        System.out.printf("[ChainSync] New block announced (%s) -- syncing now.%n", why);
+        try {
+            scheduler.execute(() -> {
+                syncTriggerPending.set(false);
+                syncCycle();
+            });
+            // The peer we ask may not have the new block yet (it can lag the
+            // announcing peer by a second or two), so look once more shortly.
+            scheduler.schedule(this::syncCycle, 5, TimeUnit.SECONDS);
+        } catch (RejectedExecutionException e) {
+            syncTriggerPending.set(false);
+        }
+    }
+
+    // ── Peer height refresh ───────────────────────────────────────────────────
+    // A pooled outbound connection is only read when it is picked as the sync
+    // peer, so its height would otherwise stay at the connect-time snapshot.
+    // Every PEER_HEIGHT_REFRESH_MS the sync thread sends each idle outbound peer a
+    // GETHEADERS whose locator is ONLY our tip. A peer that knows our tip answers
+    // empty (it is at our height) or with headers continuing from our tip (it is
+    // ahead). A peer that does not know our tip answers from genesis, which tells
+    // us nothing, so such a reply is ignored. The result is a lower bound.
+    private static final long PEER_HEIGHT_REFRESH_MS = 120_000;
+    private static final long PEER_HEIGHT_PROBE_TIMEOUT_MS = 3_000;
+    private volatile long lastPeerHeightRefresh = 0;
+
+    /** Lower bound on the peer's height implied by its reply to a tip-only locator, or -1 if uninformative. */
+    static int heightFromTipProbeReply(List<byte[]> replyHeaders, byte[] tipHash, int ourTip) {
+        if (replyHeaders.isEmpty()) return ourTip;
+        if (Arrays.equals(HeaderUtil.prevBlock(replyHeaders.get(0)), tipHash)) {
+            return ourTip + replyHeaders.size();
+        }
+        return -1;
+    }
+
+    private void refreshPeerHeights() {
+        long now = System.currentTimeMillis();
+        if (now - lastPeerHeightRefresh < PEER_HEIGHT_REFRESH_MS) return;
+        lastPeerHeightRefresh = now;
+        int ourTip = db.getHeaderTip();
+        byte[] tipHeader = ourTip >= 0 ? db.getHeader(ourTip) : null;
+        if (tipHeader == null) return;
+        byte[] tipHash = HeaderUtil.hash(tipHeader);
+        List<byte[]> locator = List.of(tipHash);
+        long budgetEnd = now + 12_000;
+        for (PeerInfo p : connectedPeers) {
+            if (!running || System.currentTimeMillis() > budgetEnd) break;
+            if (p.inbound()) continue; // inbound peers push their own announcements
+            PeerConnection c = p.conn();
+            try {
+                c.sendGetHeaders(locator);
+                byte[] msg = null;
+                long deadline = System.currentTimeMillis() + PEER_HEIGHT_PROBE_TIMEOUT_MS;
+                while (System.currentTimeMillis() < deadline) {
+                    byte[] candidate = c.readMessage((int) PEER_HEIGHT_PROBE_TIMEOUT_MS);
+                    if (candidate == null) break;
+                    if (getMessageType(candidate) == MSG_HEADERS) {
+                        if (headersAnswerLocator(candidate, locator)) { msg = candidate; break; }
+                        noteAnnouncedHeaders(c, candidate);
+                        continue;
+                    }
+                    handleNonBlockMessage(candidate, c);
+                }
+                if (msg == null) continue;
+                int h = heightFromTipProbeReply(parseHeaders(msg), tipHash, ourTip);
+                if (h > c.peerHeight) c.peerHeight = h;
+            } catch (Exception e) {
+                // a flaky idle peer is not worth reporting here; normal sync handles real failures
+            }
+        }
+    }
+
+    /** Deepest fork we will even describe precisely (matches the planned undo retention). */
+    public static final int MAX_FORK_DEPTH = 288;
+
+    /** Set when a peer proves a heavier competing branch exists that we cannot yet switch to. */
+    private volatile String haltedDueToFork = null;
+
+    public String haltedDueToFork() { return haltedDueToFork; }
+
+    /**
+     * Phase 0 fork handling. {@code headers[idx]} does not chain from our
+     * header at {@code curTip}. If its parent is an earlier header of OUR
+     * chain, this is a fork: validate the competing branch (links + PoW),
+     * compare cumulative work with our branch over the same span, and
+     * either ignore it (not heavier) or halt sync with a clear message
+     * (heavier -- a reorg is required and not implemented yet).
+     * Never penalizes the peer. Returns false if this is NOT a recognizable
+     * fork (caller falls back to the old invalid-data path).
+     */
+    private boolean handleFork(PeerConnection peer, List<byte[]> headers, int idx, int curTip) {
+        byte[] first = headers.get(idx);
+        byte[] parent = HeaderUtil.prevBlock(first);
+        int forkH = db.getHeightByHash(parent);
+        if (forkH < 0 || forkH >= curTip || forkH > db.getHeaderTip()) return false;
+        byte[] ours = db.getHeader(forkH);
+        if (ours == null || !Arrays.equals(HeaderUtil.hash(ours), parent)) return false;
+        if (!HeaderUtil.checkPOW(first)) return false;
+
+        int depth = curTip - forkH;
+        java.math.BigInteger theirWork = java.math.BigInteger.ZERO;
+        int theirLen = 0;
+        byte[] prev = null;
+        for (int j = idx; j < headers.size(); j++) {
+            byte[] hj = headers.get(j);
+            if (prev != null && !HeaderUtil.chainsFrom(hj, prev)) break;
+            if (!HeaderUtil.checkPOW(hj)) break;
+            // difficulty on the side branch must follow the same retarget rules
+            final int fh = forkH, fi = idx, bh = forkH + 1 + (j - idx);
+            final List<byte[]> hs = headers;
+            java.util.function.IntFunction<byte[]> look = x ->
+                    x <= fh ? db.getHeader(x) : (x - fh - 1 + fi < hs.size() ? hs.get(x - fh - 1 + fi) : null);
+            try {
+                if (bh > 146 && HeaderUtil.bits(hj) != BlockTemplates.expectedBits(look, bh - 1, powParams)) {
+                    System.out.printf("[ChainSync] Fork branch header at height %d has wrong difficulty bits.%n", bh);
+                    break;
+                }
+            } catch (IllegalStateException e) {
+                break;
+            }
+            theirWork = theirWork.add(BlockTemplates.proof(HeaderUtil.bits(hj)));
+            theirLen++;
+            prev = hj;
+        }
+        java.math.BigInteger ourWork = java.math.BigInteger.ZERO;
+        for (int hh = forkH + 1; hh <= curTip; hh++) {
+            byte[] oh = db.getHeader(hh);
+            if (oh != null) ourWork = ourWork.add(BlockTemplates.proof(HeaderUtil.bits(oh)));
+        }
+        System.out.printf("[ChainSync] FORK DETECTED from %s: branch leaves our chain at height %d "
+                        + "(our tip %d, depth %d). Their valid branch: %d header(s), work %s vs ours %s.%n",
+                peer.ip, forkH, curTip, depth, theirLen, theirWork.toString(16), ourWork.toString(16));
+        if (theirWork.compareTo(ourWork) > 0) {
+            List<byte[]> branch = new ArrayList<>(headers.subList(idx, idx + theirLen));
+            boolean knownBad = false;
+            for (byte[] bh : branch) if (ReorgExecutor.isKnownInvalid(db, HeaderUtil.hash(bh))) { knownBad = true; break; }
+            if (ReorgExecutor.inProgress(db)) {
+                System.out.println("[ChainSync] A reorganization is already in progress -- ignoring this branch for now.");
+            } else if (knownBad) {
+                System.out.println("[ChainSync] That branch contains a block that already failed validation -- ignoring it.");
+            } else if (!ReorgExecutor.canReorg(db, forkH)) {
+                haltedDueToFork = "A heavier competing branch forks from our chain at height " + forkH
+                        + " (depth " + depth + ", " + theirLen + " header(s) offered by " + peer.ip + "), but we "
+                        + "cannot undo that far (beyond " + ChainDB.UNDO_RETENTION + " blocks, or the blocks were "
+                        + "applied before undo records existed). Sync is halted to keep local data consistent.";
+                System.err.println("[ChainSync] " + haltedDueToFork);
+            } else {
+                try {
+                    ReorgExecutor.start(db, forkH, branch, reorgHook());
+                } catch (Exception e) {
+                    haltedDueToFork = "Reorganization failed: " + e + ". Local data may need attention; sync halted.";
+                    System.err.println("[ChainSync] " + haltedDueToFork);
+                }
+            }
+        } else {
+            System.out.println("[ChainSync] Competing branch is not heavier than ours -- ignoring it "
+                    + "(no peer penalty).");
+        }
+        return true;
+    }
+
+    /** Bridges ReorgExecutor events to the RPC listeners and the mempool. */
+    private ReorgExecutor.ListenerHook reorgHook() {
+        return new ReorgExecutor.ListenerHook() {
+            public void blockDisconnected(int height, byte[] hash, byte[] rawBlock) {
+                if (rpc != null) rpc.notifyBlockDisconnected(height, hash, rawBlock);
+            }
+            public void reorgCompleted(List<byte[]> disconnectedTxs) {
+                Mempool mp = mempool;
+                if (mp == null) return;
+                int readded = 0;
+                for (byte[] raw : disconnectedTxs) {
+                    try { if (mp.submit(raw) == null) readded++; } catch (Exception ignored) {}
+                }
+                System.out.printf("[Reorg] %d of %d transaction(s) from undone blocks returned to the mempool.%n",
+                        readded, disconnectedTxs.size());
+            }
+        };
+    }
+
+    /** True if we already have this header on our chain. */
+    private boolean haveHeader(byte[] hash) {
+        int h = db.getHeightByHash(hash);
+        return h >= 0 && h <= db.getHeaderTip() && db.getHeader(h) != null;
+    }
+
+    /**
+     * Looks at an unsolicited HEADERS announcement (a peer that got SENDHEADERS
+     * from us pushes one for every new block). Returns true if it carries a
+     * header we don't have yet that satisfies its own proof-of-work -- i.e. a
+     * real new block worth syncing for. Also refreshes the peer's height when
+     * the header extends a header we know, so the peer table no longer shows
+     * only the connect-time snapshot.
+     */
+    private boolean noteAnnouncedHeaders(PeerConnection conn, byte[] msg) {
+        try {
+            List<byte[]> hs = parseHeaders(msg);
+            boolean isNew = false;
+            int limit = Math.min(hs.size(), 4); // PoW hashing is not free
+            for (int i = 0; i < limit; i++) {
+                byte[] h = hs.get(i);
+                if (!HeaderUtil.checkPOW(h)) return false; // junk / spam: ignore entirely
+                int prevHeight = db.getHeightByHash(HeaderUtil.prevBlock(h));
+                if (prevHeight >= 0 && prevHeight <= db.getHeaderTip() && prevHeight + 1 > conn.peerHeight) {
+                    conn.peerHeight = prevHeight + 1;
+                }
+                if (!haveHeader(HeaderUtil.hash(h))) isNew = true;
+            }
+            return isNew;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Tells our peers about a block we just accepted (relay). Skips the peer
+     * that gave it to us and any peer already at that height. Peers that sent
+     * SENDHEADERS get a HEADERS message, the rest an INV. Not sent during
+     * initial sync: only blocks whose timestamp is recent count as news.
+     */
+    void announceNewBlock(int height, byte[] header, byte[] hash, String excludeIp) {
+        long ageSec = System.currentTimeMillis() / 1000 - HeaderUtil.time(header);
+        if (ageSec > 2 * 3600) return;
+        byte[] last = lastAnnouncedHash;
+        if (last != null && Arrays.equals(last, hash)) return;
+        lastAnnouncedHash = hash;
+
+        byte[] hdrPayload = new byte[1 + 236];
+        hdrPayload[0] = 1;
+        System.arraycopy(header, 0, hdrPayload, 1, 236);
+        byte[] invPayload = new byte[1 + 36];
+        invPayload[0] = 1;
+        writeLE32(invPayload, 1, 2); // 2 = BLOCK
+        System.arraycopy(hash, 0, invPayload, 5, 32);
+
+        int sent = 0;
+        for (PeerInfo p : connectedPeers) {
+            PeerConnection c = p.conn();
+            if (c.ip.equals(excludeIp)) continue;
+            if (c.peerHeight >= height) continue;
+            try {
+                if (c.wantsHeaders) c.sendMessage(MSG_HEADERS, hdrPayload);
+                else c.sendMessage(MSG_INV, invPayload);
+                sent++;
+            } catch (Exception e) {
+                // best-effort, like transaction relay
+            }
+        }
+        if (sent > 0) {
+            System.out.printf("[ChainSync] Announced block %d to %d peer(s).%n", height, sent);
+        }
     }
 
     /**
@@ -2110,7 +2509,7 @@ public class ChainSync {
             byte[] storedHash = HeaderUtil.hash(storedHeader);
             if (!Arrays.equals(hash, storedHash)) {
                 System.err.printf("[ChainSync] Block %d hash mismatch!%n", height);
-                PeerTable.get().recordInvalidData(fromIp,
+                if (fromIp != null) PeerTable.get().recordInvalidData(fromIp,
                         "block " + height + " hash mismatch");
                 return false;
             }
@@ -2127,8 +2526,18 @@ public class ChainSync {
             // A genuine consensus violation (bad merkle root, failed
             // signature) -- this peer actually sent us something
             // invalid, so banning it is correct.
-            PeerTable.get().banPeer(fromIp,
+            if (fromIp != null) PeerTable.get().banPeer(fromIp,
                     "sent block " + height + " that failed validation");
+            if (ReorgExecutor.connecting(db)) {
+                // The block belongs to a branch we just reorganized onto: go back to the old chain.
+                try {
+                    ReorgExecutor.restoreOldBranch(db, hash, reorgHook());
+                } catch (Exception e) {
+                    haltedDueToFork = "Could not restore the previous chain after a failed reorganization: "
+                            + e + ". Local data needs attention; sync halted.";
+                    System.err.println("[ChainSync] " + haltedDueToFork);
+                }
+            }
             return false;
         }
         if (result == BlockProcessor.Result.INTERNAL_ERROR) {
@@ -2142,16 +2551,21 @@ public class ChainSync {
             // actually their fault.
             return false;
         }
-        PeerTable.get().recordValidData(fromIp);
+        if (fromIp != null) PeerTable.get().recordValidData(fromIp);
 
         // Store block
         db.saveBlock(rawBlock, height);
         db.setBlockTip(height);
+        ReorgExecutor.onBlockConnected(db, height, reorgHook());
         blocksDownloaded.incrementAndGet();
         lastBlockTime.set(System.currentTimeMillis());
 
         // Notify listeners (wallet app, DNS app)
         if (rpc != null) rpc.notifyNewBlock(height, hash, rawBlock);
+
+        // Relay: tell our other peers (no-op during initial sync, see
+        // announceNewBlock()).
+        announceNewBlock(height, header, hash, fromIp);
 
         if (height % BLOCK_PROGRESS_LOG_EVERY == 0) {
             System.out.printf("[ChainSync] Block %d processed (total: %d)%n",
@@ -2176,6 +2590,12 @@ public class ChainSync {
             peer.sendMessage(MSG_ADDR, buildAddrMessage());
         } else if (type == MSG_INV) {
             handleInv(peer, Arrays.copyOfRange(msg, 9, msg.length));
+        } else if (type == MSG_SENDHEADERS) {
+            peer.wantsHeaders = true;
+        } else if (type == MSG_HEADERS) {
+            // Unsolicited announcement read while we were busy with this
+            // peer: only refresh its height (we are already syncing).
+            noteAnnouncedHeaders(peer, msg);
         }
         // Anything else (SENDCMPCT, etc.) is intentionally ignored here.
     }
@@ -2354,6 +2774,11 @@ public class ChainSync {
                     serveGetData(conn, Arrays.copyOfRange(msg, 9, msg.length));
                 } else if (type == MSG_INV) {
                     handleInv(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                } else if (type == MSG_SENDHEADERS) {
+                    conn.wantsHeaders = true;
+                } else if (type == MSG_HEADERS) {
+                    // Unsolicited: a peer pushing a new block to us.
+                    if (noteAnnouncedHeaders(conn, msg)) triggerSync("HEADERS from " + conn.ip);
                 } else if (type == MSG_FILTERLOAD) {
                     handleFilterLoad(conn, Arrays.copyOfRange(msg, 9, msg.length));
                 } else if (type == MSG_FILTERADD) {
@@ -2456,7 +2881,13 @@ public class ChainSync {
             int itemType = (int) readLE32(payload, pos);
             byte[] hash = Arrays.copyOfRange(payload, pos + 4, pos + 36);
             pos += 36;
-            if (itemType != 1) continue; // only TX announcements are handled here
+            if (itemType == 2) {
+                // Block announcement: we fetch blocks via headers, so just
+                // start a sync cycle if we don't have it yet.
+                if (!haveHeader(hash)) triggerSync("INV from " + conn.ip);
+                continue;
+            }
+            if (itemType != 1) continue; // only TX and BLOCK announcements are handled here
             String txidHex = toHex(hash);
             if (mempool != null && mempool.getEntry(txidHex) == null) {
                 toRequest.add(hash);
@@ -2727,6 +3158,8 @@ public class ChainSync {
         final String        ip;
         volatile String     agent  = "";
         volatile int        peerHeight = 0;
+        /** True once the peer has sent SENDHEADERS: it wants new blocks announced as HEADERS, not INV. */
+        volatile boolean    wantsHeaders = false;
         volatile int        protocolVersion = 0;
         volatile int        services = 0;
         volatile long       bytesSent = 0;
@@ -2806,6 +3239,8 @@ public class ChainSync {
                 } else if (type == MSG_VERACK) {
                     System.out.printf("[Handshake] <- %s VERACK received%n", ip);
                     verackReceived = true;
+                } else if (type == MSG_SENDHEADERS) {
+                    wantsHeaders = true;
                 } else {
                     // DEBUG: previously silently ignored -- if a peer sends
                     // anything else this early (PING, or something
@@ -3008,14 +3443,20 @@ public class ChainSync {
             writeLE32(frame, 5, payload.length);
             System.arraycopy(payload, 0, frame, 9, payload.length);
 
-            byte[] encrypted = plain ? frame : brontide.encryptMessage(frame);
-            if (VERBOSE_WIRE_LOGGING) {
-                System.out.printf("[Handshake] -> %s SEND type=%d frame(%d bytes): %s%n",
-                        ip, type, frame.length, toHex(frame));
-                System.out.printf("[Handshake] -> %s encrypted wire (%d bytes): %s%n",
-                        ip, encrypted.length, toHex(encrypted));
-            }
+            byte[] encrypted;
+            // Encrypt AND write under the same lock: Brontide uses a
+            // per-direction nonce counter, so two threads sending on one
+            // connection (e.g. a block/tx relay while the sync thread sends a
+            // GETHEADERS) must hit the wire in the same order they were
+            // encrypted, or the peer's decryption fails and the stream dies.
             synchronized (out) {
+                encrypted = plain ? frame : brontide.encryptMessage(frame);
+                if (VERBOSE_WIRE_LOGGING) {
+                    System.out.printf("[Handshake] -> %s SEND type=%d frame(%d bytes): %s%n",
+                            ip, type, frame.length, toHex(frame));
+                    System.out.printf("[Handshake] -> %s encrypted wire (%d bytes): %s%n",
+                            ip, encrypted.length, toHex(encrypted));
+                }
                 out.write(encrypted);
                 out.flush();
             }

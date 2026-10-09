@@ -404,6 +404,9 @@ public final class WebAdminServerContent {
               ]},
               "getchaintips": { params: [] },
               "getconnectioncount": { params: [] },
+              "getblocktemplate": { params: [
+                {name:"address", type:"string", required:true}
+              ]},
               "getdifficulty": { params: [] },
               "getinfo": { params: [] },
               "getmemoryinfo": { params: [] },
@@ -459,6 +462,9 @@ public final class WebAdminServerContent {
                 {name:"txid", type:"string", required:true}
               ]},
               "pruneblockchain": { params: [] },
+              "submitblock": { params: [
+                {name:"block hex", type:"string", required:true}
+              ]},
               "sendrawtransaction": { params: [
                 {name:"hexstring", type:"string", required:true}
               ]},
