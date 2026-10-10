@@ -1007,7 +1007,18 @@ public class ChainSync {
                 if (table.isPinned(cand.ip())) continue;
                 if (alreadyConnected.contains(cand.ip())) continue;
                 if (cand.ip().equals(confirmedSelfIp)) continue;
-                if (!PeerTable.get().isGood(cand.ip())) continue;
+                if (!PeerTable.get().isGood(cand.ip())) {
+                    // Below the score floor: normally skipped, but a peer that has
+                    // worked before gets a test dial every RETRY_PROBE_MS so it can
+                    // earn its score back (a successful dial adds points).
+                    if (!table.isRetryable(cand.ip())) continue;
+                    Long lp = lowScoreLastProbe.get(cand.ip());
+                    long t0 = System.currentTimeMillis();
+                    if (lp != null && t0 - lp < RETRY_PROBE_MS) continue;
+                    lowScoreLastProbe.put(cand.ip(), t0);
+                    System.out.printf("[ChainSync] Test-dialing low-score peer %s (score below the dial floor, retry every %d min).%n",
+                            cand.ip(), RETRY_PROBE_MS / 60_000);
+                }
                 try {
                     PeerConnection conn = connectPeer(cand);
                     if (conn == null) continue;
@@ -1027,6 +1038,10 @@ public class ChainSync {
     private final java.util.concurrent.ConcurrentHashMap<String, Long> pinnedLastAttempt =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final long PINNED_RETRY_MS = 60_000L;
+    /** How often a formerly-good peer under the dial floor gets a test dial. */
+    private static final long RETRY_PROBE_MS = 10 * 60_000L;
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> lowScoreLastProbe =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** A pooled connection older than this that fails is treated as an idle-timeout casualty, not a peer fault. */
     private static final long STALE_POOL_CONN_MS = 30_000L;
     /** Blocks a peer may trail our tip before it counts as 'stale'. */
@@ -2967,6 +2982,8 @@ public class ChainSync {
             }
         }
         if (!toRequest.isEmpty()) {
+            System.out.printf("[Mempool] %s announced %d new transaction(s); requesting them. (%s)%n",
+                    conn.ip, toRequest.size(), mempool != null ? mempool.peerTxStats() : "n/a");
             conn.sendGetData(toRequest, 1); // type 1 = TX
         }
     }

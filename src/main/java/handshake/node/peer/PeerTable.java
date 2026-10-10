@@ -963,6 +963,16 @@ public class PeerTable {
         return r == null || (!r.isBackedOff() && r.score >= SCORE_BACKOFF_THRESHOLD);
     }
 
+    /** A peer below the dial threshold that is worth an occasional test dial: it has
+     *  connected successfully before, isn't banned or in backoff. Without this, a
+     *  formerly-good peer that fell under the threshold is never dialed again, so it
+     *  can never earn its score back. */
+    public boolean isRetryable(String ip) {
+        Peer r = peers.get(ip);
+        return r != null && !r.banned && !r.isBackedOff() && r.successCount > 0
+                && r.hasBrontideKey() && r.score < SCORE_BACKOFF_THRESHOLD;
+    }
+
     public List<Peer> getRankedPeers() {
         return peers.values().stream()
                 .filter(r -> r.hasBrontideKey() || r.port == PLAIN_PORT)   // connectable peers only

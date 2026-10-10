@@ -689,6 +689,9 @@ public final class WebAdminServerContent {
                     "avg latency: " + (p.latencyMs >= 0 ? p.latencyMs + " ms" : "n/a"),
                     "last failure: " + fmtAgo(p.lastFailure)
                 ];
+                if (p.state === "idle" && p.score < 25) {
+                    lines.push("not being dialed normally: score " + p.score + " is under the 25 dial floor (test dial every 10 min if it has worked before)");
+                }
                 if (p.penalties && p.penalties.length) {
                     lines.push("recent penalties (this run):");
                     p.penalties.forEach(x => lines.push("  " + x));

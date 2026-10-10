@@ -138,10 +138,37 @@ public class Mempool {
      * meaning any transaction that reached us this way was a dead end
      * for further propagation).
      */
+    /** Peer-sourced transaction counters, shown in the periodic stats line. */
+    private final java.util.concurrent.atomic.AtomicInteger peerTxReceived = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger peerTxAccepted = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger peerTxRejected = new java.util.concurrent.atomic.AtomicInteger();
+    private volatile long rejectLogWindowStart = 0;
+    private int rejectLogsInWindow = 0;
+
+    public String peerTxStats() {
+        return peerTxReceived.get() + " received from peers, " + peerTxAccepted.get()
+                + " accepted, " + peerTxRejected.get() + " rejected";
+    }
+
     public String submitFromPeer(byte[] raw, String fromIp) {
+        peerTxReceived.incrementAndGet();
         try {
-            return submitInternal(raw, fromIp);
+            String id = submitInternal(raw, fromIp);
+            if (id != null) peerTxAccepted.incrementAndGet();
+            return id;
         } catch (Exception e) {
+            String why = String.valueOf(e.getMessage());
+            // A tx we already hold is the normal result of several peers announcing it.
+            if (!why.startsWith("txn-already-in-mempool")) {
+                peerTxRejected.incrementAndGet();
+                long now = System.currentTimeMillis();
+                synchronized (this) {
+                    if (now - rejectLogWindowStart > 60_000) { rejectLogWindowStart = now; rejectLogsInWindow = 0; }
+                    if (rejectLogsInWindow++ < 10) {
+                        System.out.printf("[Mempool] Rejected tx from %s: %s%n", fromIp, why);
+                    }
+                }
+            }
             return null;
         }
     }
