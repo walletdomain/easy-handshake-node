@@ -150,14 +150,46 @@ public class Mempool {
                 + " accepted, " + peerTxRejected.get() + " rejected";
     }
 
+    /** What happened to a transaction a peer sent us. */
+    public static final class PeerTxResult {
+        /** txid (hex) if accepted, else null. */
+        public final String txid;
+        /** Non-null when the tx should be answered with a REJECT packet. */
+        public final String rejectReason;
+        /** hsd reject code (RejectPacket.codes): 0x01 malformed, 0x10 invalid, 0x40 nonstandard, 0x42 insufficient fee. */
+        public final int rejectCode;
+        /** The 32-byte txid to put in the REJECT packet (all zero if it could not be computed). */
+        public final byte[] txidBytes;
+        PeerTxResult(String txid, String rejectReason, int rejectCode, byte[] txidBytes) {
+            this.txid = txid; this.rejectReason = rejectReason; this.rejectCode = rejectCode; this.txidBytes = txidBytes;
+        }
+    }
+
     public String submitFromPeer(byte[] raw, String fromIp) {
+        return submitFromPeerChecked(raw, fromIp).txid;
+    }
+
+    /** Same as submitFromPeer(), but also says whether (and how) to REJECT, as hsd does. */
+    public PeerTxResult submitFromPeerChecked(byte[] raw, String fromIp) {
         peerTxReceived.incrementAndGet();
         try {
             String id = submitInternal(raw, fromIp);
             if (id != null) peerTxAccepted.incrementAndGet();
-            return id;
+            return new PeerTxResult(id, null, 0, null);
         } catch (Exception e) {
             String why = String.valueOf(e.getMessage());
+            String rejectReason = null;
+            int rejectCode = 0x10; // INVALID
+            if (!why.startsWith("txn-already-in-mempool")) {
+                rejectReason = why.length() > 100 ? why.substring(0, 100) : why;
+                if (why.startsWith("min relay fee")) { rejectCode = 0x42; rejectReason = "insufficient fee"; }
+                else if (why.startsWith("Failed to parse")) rejectCode = 0x01;
+                else if (why.startsWith("Transaction too large") || why.startsWith("Mempool full")) rejectCode = 0x40;
+                // reason travels as ASCII with a one-byte length
+                rejectReason = rejectReason.replaceAll("[^\\x20-\\x7E]", "?");
+            }
+            byte[] idBytes = new byte[32];
+            try { idBytes = HexUtil.decode(computeTxid(raw)); } catch (Exception ignored) { }
             // A tx we already hold is the normal result of several peers announcing it.
             if (!why.startsWith("txn-already-in-mempool")) {
                 peerTxRejected.incrementAndGet();
@@ -169,7 +201,7 @@ public class Mempool {
                     }
                 }
             }
-            return null;
+            return new PeerTxResult(null, rejectReason, rejectCode, idBytes);
         }
     }
 

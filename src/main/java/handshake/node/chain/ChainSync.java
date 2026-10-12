@@ -2670,7 +2670,7 @@ public class ChainSync {
             peer.sendMessage(MSG_PONG, pingPayload);
         } else if (type == MSG_TX && mempool != null) {
             byte[] raw = Arrays.copyOfRange(msg, 9, msg.length);
-            mempool.submitFromPeer(raw, peer.ip);
+            sendTxRejectIfAny(peer, mempool.submitFromPeerChecked(raw, peer.ip));
         } else if (type == MSG_ADDR) {
             PeerTable.get().onAddrMessage(
                     Arrays.copyOfRange(msg, 9, msg.length), peer.ip);
@@ -2850,7 +2850,7 @@ public class ChainSync {
                     conn.sendMessage(MSG_PONG, pingPayload);
                 } else if (type == MSG_TX) {
                     if (mempool != null) {
-                        mempool.submitFromPeer(Arrays.copyOfRange(msg, 9, msg.length), conn.ip);
+                        sendTxRejectIfAny(conn, mempool.submitFromPeerChecked(Arrays.copyOfRange(msg, 9, msg.length), conn.ip));
                     }
                 } else if (type == MSG_GETADDR) {
                     conn.sendMessage(MSG_ADDR, buildAddrMessage());
@@ -2947,6 +2947,24 @@ public class ChainSync {
             conn.bloomFilter.add(data);
         } catch (Exception e) {
             System.out.println("[ChainSync] Malformed FILTERADD from " + conn.ip + ": " + e.getMessage());
+        }
+    }
+
+    /** Tells the sender why its transaction was refused, the way hsd does
+     *  (REJECT packet: message type TX, code, reason with a length byte, txid). */
+    private void sendTxRejectIfAny(PeerConnection conn, Mempool.PeerTxResult r) {
+        if (r == null || r.rejectReason == null) return;
+        try {
+            byte[] reason = r.rejectReason.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            byte[] p = new byte[3 + reason.length + 32];
+            p[0] = (byte) MSG_TX;
+            p[1] = (byte) r.rejectCode;
+            p[2] = (byte) reason.length;
+            System.arraycopy(reason, 0, p, 3, reason.length);
+            System.arraycopy(r.txidBytes, 0, p, 3 + reason.length, 32);
+            conn.sendMessage(MSG_REJECT, p);
+        } catch (Exception ignored) {
+            // best effort: the sender may already have gone
         }
     }
 
