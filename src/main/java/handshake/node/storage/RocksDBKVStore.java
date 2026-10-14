@@ -87,6 +87,19 @@ class RocksDBKVStore implements KVStore {
     // non-HotSpot JVM that doesn't implement this interface) --
     // detection failing should never be fatal for something this
     // secondary.
+    /** Total physical RAM in bytes, or -1 if it cannot be detected. */
+    private static long physicalMemoryBytes() {
+        try {
+            return ((com.sun.management.OperatingSystemMXBean) java.lang.management.ManagementFactory.getOperatingSystemMXBean())
+                    .getTotalMemorySize();
+        } catch (Exception | LinkageError e) { return -1; }
+    }
+
+    /** Memory tier for the write buffers: 2 = 12 GiB or more (full size), 1 = 6 to 12 GiB (half), 0 = under 6 GiB or
+     *  unknown (the original small buffers). The big buffers cut disk writes but cost up to ~1.5 GB of native memory,
+     *  which a small server cannot spare next to the Java heap and the block cache. */
+    private static final int MEMORY_TIER = physicalMemoryBytes() >= 12L << 30 ? 2 : physicalMemoryBytes() >= 6L << 30 ? 1 : 0;
+
     private static long detectSharedBlockCacheBytes() {
         long floor = 256L * 1024 * 1024;
         long ceiling = 8L * 1024 * 1024 * 1024;
@@ -94,7 +107,7 @@ class RocksDBKVStore implements KVStore {
             var osBean = (com.sun.management.OperatingSystemMXBean)
                     java.lang.management.ManagementFactory.getOperatingSystemMXBean();
             long totalPhysical = osBean.getTotalMemorySize();
-            long tenPercent = totalPhysical / 4;     // a quarter of RAM: tree-path and UTXO reads served from memory instead of disk
+            long tenPercent = MEMORY_TIER == 2 ? totalPhysical / 4 : totalPhysical / 10;   // a quarter of RAM on a big machine: tree-path and UTXO reads served from memory
             return Math.max(floor, Math.min(tenPercent, ceiling));
         } catch (Exception | LinkageError e) {
             System.out.println("[RocksDBKVStore] Could not detect physical memory ("
@@ -104,12 +117,12 @@ class RocksDBKVStore implements KVStore {
     }
 
     private static final long DEFAULT_WRITE_BUFFER_SIZE_BYTES = 16L * 1024 * 1024;  // 16MB per memtable for low-write-volume column families
-    private static final long HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES = 256L * 1024 * 1024; // 64MB for "urkelNodes" specifically -- close to RocksDB's own original default
+    private static final long HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES = (MEMORY_TIER == 2 ? 256L : MEMORY_TIER == 1 ? 128L : 64L) * 1024 * 1024; // 64MB for "urkelNodes" specifically -- close to RocksDB's own original default
     private static final String HIGH_VOLUME_COLUMN_FAMILY = "urkelNodes";
     private static final long INDEX_WRITE_BUFFER_SIZE_BYTES = 32L * 1024 * 1024;  // tx/address index column families: heavy sequential-ish writes during sync
     /** utxos and names also churn (entries updated and spent again within a few blocks): a bigger memtable lets
      *  most of that cancel out in memory instead of being written to disk and compacted later. */
-    private static final long CHURN_WRITE_BUFFER_SIZE_BYTES = 128L * 1024 * 1024;
+    private static final long CHURN_WRITE_BUFFER_SIZE_BYTES = (MEMORY_TIER == 2 ? 128L : MEMORY_TIER == 1 ? 64L : 16L) * 1024 * 1024;
     private static boolean isChurnFamily(String n) { return n.equals("utxos") || n.equals("names"); }
     private static boolean isIndexFamily(String n) { return n.equals("txindex") || n.equals("addrtx") || n.equals("addrcoin"); }
     private static final int MAX_WRITE_BUFFER_NUMBER = 2;                      // RocksDB's own default -- kept, not reduced further, since going lower would force more frequent flushes and hurt write throughput for little further memory benefit
@@ -179,6 +192,10 @@ class RocksDBKVStore implements KVStore {
      *  read are added to the totals reported by {@link #scratchIoStats()}, so that disk activity is not invisible. */
     public RocksDBKVStore(String path, boolean readOnly, long blockCacheBytesOverride, boolean countAsScratch) {
         this.countAsScratch = countAsScratch;
+        if (!countAsScratch && !readOnly && blockCacheBytesOverride < 0)
+            System.out.printf("[RocksDBKVStore] RAM %.1f GB -> memory tier %d: Urkel write buffer %d MB, names/UTXO buffer %d MB, block cache %d MB%n",
+                    physicalMemoryBytes() / 1073741824.0, MEMORY_TIER, HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES >> 20,
+                    CHURN_WRITE_BUFFER_SIZE_BYTES >> 20, detectSharedBlockCacheBytes() >> 20);
         RocksDB.loadLibrary();
         this.path = path;
         this.readOnly = readOnly;
@@ -260,7 +277,7 @@ class RocksDBKVStore implements KVStore {
                 ? HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES
                 : isChurnFamily(cfName) ? CHURN_WRITE_BUFFER_SIZE_BYTES
                 : isIndexFamily(cfName) ? INDEX_WRITE_BUFFER_SIZE_BYTES : DEFAULT_WRITE_BUFFER_SIZE_BYTES;
-        boolean churn = HIGH_VOLUME_COLUMN_FAMILY.equals(cfName) || isChurnFamily(cfName);
+        boolean churn = MEMORY_TIER > 0 && (HIGH_VOLUME_COLUMN_FAMILY.equals(cfName) || isChurnFamily(cfName));
         ColumnFamilyOptions o = new ColumnFamilyOptions()
                 .setTableFormatConfig(tableConfig)
                 .setWriteBufferSize(writeBufferSize)
