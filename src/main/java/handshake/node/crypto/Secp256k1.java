@@ -192,6 +192,37 @@ public final class Secp256k1 {
     }
 
     /**
+     * Verifies a raw 64-byte (r || s) signature -- the format Handshake uses in
+     * transactions (hsd's bcrypto secp256k1.verify). Does not enforce low-S; see isLowS().
+     */
+    public static boolean verifyRaw(byte[] msgHash, byte[] sig64, byte[] pubKey) {
+        if (sig64 == null || sig64.length != 64) return false;
+        try {
+            BigInteger r = new BigInteger(1, Arrays.copyOfRange(sig64, 0, 32));
+            BigInteger s = new BigInteger(1, Arrays.copyOfRange(sig64, 32, 64));
+            if (r.signum() <= 0 || r.compareTo(N) >= 0) return false;
+            if (s.signum() <= 0 || s.compareTo(N) >= 0) return false;
+            BigInteger z = new BigInteger(1, msgHash);
+            BigInteger sInv = s.modInverse(N);
+            BigInteger u1 = z.multiply(sInv).mod(N);
+            BigInteger u2 = r.multiply(sInv).mod(N);
+            BigInteger[] Q = decompressPoint(pubKey);
+            BigInteger[] point = pointAdd(scalarMult(u1, G), scalarMult(u2, Q));
+            if (point == null) return false;
+            return point[0].mod(N).equals(r);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** hsd secp256k1.isLowS for a raw 64-byte signature: s must not exceed N/2. */
+    public static boolean isLowS(byte[] sig64) {
+        if (sig64 == null || sig64.length != 64) return false;
+        BigInteger s = new BigInteger(1, Arrays.copyOfRange(sig64, 32, 64));
+        return s.signum() > 0 && s.compareTo(N.shiftRight(1)) <= 0;
+    }
+
+    /**
      * Parses a DER-encoded ECDSA signature into (r, s).
      */
     public static BigInteger[] parseDerSignature(byte[] der) {

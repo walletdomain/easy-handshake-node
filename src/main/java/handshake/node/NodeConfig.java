@@ -186,6 +186,11 @@ public class NodeConfig {
     // single-purpose validator build), but exposed since the data is there.
     public boolean isFullNodeModuleEnabled() { return getBool("module.full_node", true); }
     public boolean isDnsModuleEnabled()      { return getBool("module.dns", false); }
+    /** Reward address (hs1...) for blocks built by getwork/getblocktemplate/generate; empty = none configured. */
+    public String  getMinerAddress()   { return get("miner.address", ""); }
+    public void    setMinerAddress(String addr) { set("miner.address", addr); }
+    /** Text placed in the coinbase witness of blocks this node builds. */
+    public String  getMinerCoinbaseFlags() { return get("miner.coinbase.flags", "easy-handshake"); }
     public boolean isMinerModuleEnabled()    { return getBool("module.miner", false); }
     public boolean isWalletModuleEnabled()   { return getBool("module.wallet", false); }
 

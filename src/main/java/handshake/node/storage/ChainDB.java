@@ -177,6 +177,30 @@ public class ChainDB {
 
     public UrkelNameTree getNameTree() { return nameTree; }
 
+    /** One-line storage engine picture (key estimate, memtables, level-0 files, pending compaction) for the big maps. */
+    public String storageStats() {
+        return "utxos[" + utxos.stats() + "] names[" + names.stats() + "] urkelNodes[" + urkelNodes.stats()
+                + "] blocks[" + blocks.stats() + "] " + store.ioStats() + " | " + RocksDBKVStore.scratchIoStats();
+    }
+
+    // ── tx / address indexes (see IndexStore) ─────────────────────────────────
+    private final IndexStore index;
+    private volatile boolean addressIndexEnabled = true;
+    public static final String META_INDEX_HEIGHT = "index_height";
+    /** The index store, or null when this (read-only) database predates the indexes. */
+    public IndexStore index() { return index; }
+    public boolean addressIndexEnabled() { return addressIndexEnabled; }
+    public void setAddressIndexEnabled(boolean on) { addressIndexEnabled = on; }
+    /** Height of the last block whose index entries are fully written (-1 = none). */
+    public int getIndexHeight() {
+        String v = meta.get(META_INDEX_HEIGHT);
+        try { return v == null ? -1 : Integer.parseInt(v); } catch (NumberFormatException e) { return -1; }
+    }
+    public void setIndexHeight(int h) { meta.put(META_INDEX_HEIGHT, String.valueOf(h)); }
+    /** Adds index undo ops to the block currently being recorded; returns the sink, or null when not recording. */
+    public List<byte[][]> indexUndoSink() { UndoRecord u = recording; return u == null ? null : u.indexOps; }
+
+
     /** NEW: self-healing support. Direct, surgical access to the Urkel
      *  tree's own node storage and the two meta keys that designate
      *  which root is "official" -- used ONLY by UrkelTreeRecovery, to
@@ -363,6 +387,10 @@ public class ChainDB {
         this.names     = store.openBytesStringMap("names");
         this.hashIndex = store.openBytesLongMap("hashIndex");
         this.urkelNodes = store.openBytesBytesMap("urkelNodes");
+        IndexStore idx = null;
+        try { idx = new IndexStore(store); }
+        catch (IllegalStateException e) { /* read-only diagnostic open of a database that predates the indexes */ }
+        this.index = idx;
 
         UrkelNodeStore nodeStore = new UrkelNodeStore(urkelNodes);
         byte[] persistedLiveRoot = fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT));
@@ -389,10 +417,14 @@ public class ChainDB {
         // reading from gets closed out from under it. See
         // UrkelNameTree.shutdownPruning()'s own comment for the full
         // reasoning.
+        long t0 = System.nanoTime();
         if (nameTree != null) {
             nameTree.shutdownPruning();
         }
+        long t1 = System.nanoTime();
         store.close();
+        System.out.printf("[ChainDB] close: name-tree scratch cleanup %.1f s, database close %.1f s%n",
+                (t1 - t0) / 1e9, (System.nanoTime() - t1) / 1e9);
     }
 
     // ── Commit ────────────────────────────────────────────────────────────────
@@ -768,6 +800,8 @@ public class ChainDB {
         public final List<byte[][]> utxoOps = new ArrayList<>();
         public final List<byte[][]> nameOps = new ArrayList<>();
         public final List<byte[][]> treeOps = new ArrayList<>();
+        /** Index changes: (mapId||key, previous value or null). */
+        public final List<byte[][]> indexOps = new ArrayList<>();
     }
 
     private volatile UndoRecord recording = null;
@@ -842,6 +876,10 @@ public class ChainDB {
             byte[][] op = u.treeOps.get(i);
             nameTree.applyRaw(op[0], op[1]);
         }
+        if (index != null && !u.indexOps.isEmpty()) {
+            index.undo(u.indexOps);
+        }
+        if (index != null && getIndexHeight() >= height) setIndexHeight(height - 1);
         nameTree.persistBlock();
         if (!java.util.Arrays.equals(nameTree.liveRoot(), u.liveRootBefore)) {
             throw new IllegalStateException("Urkel live root after undo of height " + height + " is "
@@ -881,13 +919,14 @@ public class ChainDB {
         try {
             java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
             java.io.DataOutputStream o = new java.io.DataOutputStream(bos);
-            o.writeByte(1); // format version
+            o.writeByte(2); // format version (2 adds index ops)
             o.writeInt(u.height);
             o.write(u.liveRootBefore);
             o.write(u.committedRootBefore);
             writeOps(o, u.utxoOps);
             writeOps(o, u.nameOps);
             writeOps(o, u.treeOps);
+            writeOps(o, u.indexOps);
             return bos.toByteArray();
         } catch (java.io.IOException e) { throw new RuntimeException(e); }
     }
@@ -895,7 +934,8 @@ public class ChainDB {
     static UndoRecord decodeUndo(byte[] raw) {
         try {
             java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw));
-            if (in.readByte() != 1) throw new IllegalStateException("unknown undo format");
+            int fmt = in.readByte();
+            if (fmt != 1 && fmt != 2) throw new IllegalStateException("unknown undo format");
             UndoRecord u = new UndoRecord();
             u.height = in.readInt();
             u.liveRootBefore = new byte[32]; in.readFully(u.liveRootBefore);
@@ -903,6 +943,7 @@ public class ChainDB {
             readOps(in, u.utxoOps);
             readOps(in, u.nameOps);
             readOps(in, u.treeOps);
+            if (fmt >= 2) readOps(in, u.indexOps);
             return u;
         } catch (java.io.IOException e) { throw new RuntimeException(e); }
     }
@@ -1019,9 +1060,27 @@ public class ChainDB {
         utxos.put(key, entry.toStorage());
     }
 
+    /** Drops the whole coin set (used only by the offline rebuild tool). */
+    public void clearUtxos() { utxos.clearFast(); }
+
+    /** Up to {@code limit} coins with key >= {@code from} (null = start), in key order, for paged scans. Entries: raw 36-byte key, stored value. */
+    public List<java.util.Map.Entry<byte[], String>> utxoPage(byte[] from, int limit) {
+        return utxos.scanRange(from, null, limit, false);
+    }
+
     public UtxoEntry getUtxo(String txid, int index) {
         String s = utxos.get(utxoKey(txid, index));
         return s != null ? UtxoEntry.fromStorage(s) : null;
+    }
+
+    /** Removes a coin and returns what was stored (null if it was not there). */
+    public UtxoEntry spendUtxo(String txid, int index) {
+        byte[] key = utxoKey(txid, index);
+        String prev = utxos.get(key);
+        UndoRecord u = recording;
+        if (u != null && prev != null) u.utxoOps.add(new byte[][] { key, strBytes(prev) });
+        if (prev != null) utxos.remove(key);
+        return prev == null ? null : UtxoEntry.fromStorage(prev);
     }
 
     public void removeUtxo(String txid, int index) {

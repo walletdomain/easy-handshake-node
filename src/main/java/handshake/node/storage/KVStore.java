@@ -73,4 +73,7 @@ public interface KVStore {
     String getFileName();
     long getDiskSizeBytes();
     void close();
+
+    /** Disk activity since the previous call (one line); engines that do not track it return "". */
+    default String ioStats() { return ""; }
 }

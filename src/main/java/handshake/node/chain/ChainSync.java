@@ -492,8 +492,16 @@ public class ChainSync {
         writeLE32(invPayload, 1, 1); // item type = 1 = TX
         System.arraycopy(txidBytes, 0, invPayload, 5, 32);
 
+        long txRate = -1; // dollarydoos per kB, as hsd's getRate
+        if (mempool != null) {
+            Mempool.MempoolEntry me = mempool.getEntry(txid);
+            if (me != null && me.size > 0) txRate = me.fee * 1000L / me.size;
+        }
+
         for (PeerInfo p : connectedPeers) {
             if (p.ip().equals(excludeIp)) continue;
+            long minRate = p.conn().feeRate;
+            if (minRate != -1 && txRate != -1 && txRate < minRate) continue; // peer's FEEFILTER
             try {
                 p.conn().sendMessage(MSG_INV, invPayload);
             } catch (Exception e) {
@@ -1814,6 +1822,11 @@ public class ChainSync {
                                 + " (" + e.getMessage() + ")");
                     }
                 }
+                if (ReorgExecutor.isKnownInvalid(db, HeaderUtil.hash(h))) {
+                    System.out.printf("[ChainSync] %s: header at height %d is marked invalid (invalidateblock) -- not accepting it.%n",
+                            peer.ip, thisHeight);
+                    break;
+                }
                 validHeaders.add(h);
                 previousHeader = h;
             }
@@ -2051,13 +2064,86 @@ public class ChainSync {
         }
     }
 
+    // ── invalidateblock / reconsiderblock / reset ─────────────────────────────
+
+    private <T> T onSyncThread(java.util.concurrent.Callable<T> job, T onFail) {
+        if (!running) return onFail;
+        try {
+            return scheduler.submit(job).get(120, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            System.err.println("[ChainSync] request on the sync thread failed: " + e);
+            return onFail;
+        }
+    }
+
+    /** hsd's invalidateblock: marks the block (and so everything built on it) invalid and rewinds the chain below it. Returns an error text, or null. */
+    public String invalidateBlock(byte[] hash) {
+        return onSyncThread(() -> {
+            if (ReorgExecutor.inProgress(db)) return "a chain reorganization is in progress";
+            int h = db.getHeightByHash(hash);
+            ReorgExecutor.markInvalid(db, hash);
+            if (h < 0) { db.commit(); return null; }                 // unknown block: just remembered, as hsd does
+            if (h == 0) return "cannot invalidate the genesis block";
+            byte[] hd = db.getHeader(h);
+            if (hd == null || !Arrays.equals(HeaderUtil.hash(hd), hash)) { db.commit(); return null; }
+            return rewindTo(h - 1);
+        }, "node-not-running");
+    }
+
+    /** hsd's reconsiderblock: forgets the invalid mark; the block is fetched again by the normal sync. */
+    public String reconsiderBlock(byte[] hash) {
+        ReorgExecutor.unmarkInvalid(db, hash);
+        triggerSync("reconsiderblock");
+        return null;
+    }
+
+    /** hsd's chain.reset(height): rewinds the chain to the given height (peers re-serve the rest). */
+    public String resetChain(int height) {
+        return onSyncThread(() -> {
+            if (ReorgExecutor.inProgress(db)) return "a chain reorganization is in progress";
+            if (height > Math.max(db.getBlockTip(), db.getHeaderTip())) return "Height cannot be greater than chain tip.";
+            return rewindTo(height);
+        }, "node-not-running");
+    }
+
+    /** Undoes blocks above {@code newTip} and drops the headers above it. Sync thread only. */
+    private String rewindTo(int newTip) {
+        int blockTip = db.getBlockTip();
+        List<byte[]> undone = new ArrayList<>();
+        if (blockTip > newTip) {
+            if (!ReorgExecutor.canReorg(db, newTip))
+                return "cannot undo that far (undo data is kept for the last " + ChainDB.UNDO_RETENTION + " blocks)";
+            System.out.printf("[ChainSync] Rewinding the chain from %d to %d.%n", blockTip, newTip);
+            for (int h = blockTip; h > newTip; h--) {
+                byte[] hd = db.getHeader(h);
+                byte[] raw = db.getBlock(h);
+                byte[] hash = hd != null ? HeaderUtil.hash(hd) : null;
+                if (raw != null) {
+                    try {
+                        List<TxParser.ParsedTx> txs = BlockProcessor.parseBlockTxs(raw);
+                        for (int i = 1; i < txs.size(); i++) undone.add(txs.get(i).raw);
+                    } catch (RuntimeException ignored) { }
+                }
+                db.disconnectBlock(h);   // commits
+                if (rpc != null && hash != null && raw != null) rpc.notifyBlockDisconnected(h, hash, raw);
+            }
+        }
+        if (db.getHeaderTip() > newTip) db.rollbackHeadersTo(newTip);
+        db.commit();
+        if (!undone.isEmpty()) reorgHook().reorgCompleted(undone);
+        return null;
+    }
+
     // Consensus parameters used to judge submitted blocks. Always mainnet in
     // production; the integration tests swap in an easy-difficulty copy.
     private volatile BlockTemplates.Params powParams = BlockTemplates.Params.MAINNET;
+    public BlockTemplates.Params getPowParams() { return powParams; }
+    /** Test networks only: swaps the proof-of-work/retarget parameters used to judge and build blocks. */
+    public void setPowParams(BlockTemplates.Params p) { this.powParams = p; }
 
     private String acceptSubmittedBlock(byte[] raw) {
         if (haltedDueToTreeMismatch != null || haltedDueToFork != null) return "node-halted";
-        long now = System.currentTimeMillis() / 1000;
+        long now = handshake.node.util.NodeClock.nowSec();
         String err = BlockTemplates.checkBlock(db, mempool, raw, now, powParams);
         if (err != null) {
             System.out.printf("[ChainSync] submitblock rejected: %s%n", err);
@@ -2684,8 +2770,9 @@ public class ChainSync {
             // Unsolicited announcement read while we were busy with this
             // peer: only refresh its height (we are already syncing).
             noteAnnouncedHeaders(peer, msg);
+        } else {
+            handleServeMessage(peer, type, msg);
         }
-        // Anything else (SENDCMPCT, etc.) is intentionally ignored here.
     }
 
     // ── RPC support ───────────────────────────────────────────────────────────
@@ -2873,6 +2960,8 @@ public class ChainSync {
                     handleFilterAdd(conn, Arrays.copyOfRange(msg, 9, msg.length));
                 } else if (type == MSG_FILTERCLEAR) {
                     conn.bloomFilter = null;
+                } else {
+                    handleServeMessage(conn, type, msg);
                 }
             }
         } catch (Exception e) {
@@ -2950,11 +3039,21 @@ public class ChainSync {
         }
     }
 
-    /** Tells the sender why its transaction was refused, the way hsd does
-     *  (REJECT packet: message type TX, code, reason with a length byte, txid). */
+    /** Ban score per peer IP for bad transactions (hsd Peer.increaseBan; 100 = banned). */
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer> txBanScores = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Answers a peer's transaction the way hsd does: a refused tx gets a REJECT packet
+     *  (message type TX, code, reason with a length byte, txid) and adds the error's ban
+     *  score; a tx kept as an orphan makes us request its missing parents. */
     private void sendTxRejectIfAny(PeerConnection conn, Mempool.PeerTxResult r) {
-        if (r == null || r.rejectReason == null) return;
+        if (r == null) return;
         try {
+            if (!r.missing.isEmpty()) {
+                List<byte[]> parents = new ArrayList<>();
+                for (String id : r.missing) { byte[] b = fromHexOrNull(id); if (b != null && b.length == 32) parents.add(b); }
+                if (!parents.isEmpty()) conn.sendGetData(parents, 1); // type 1 = TX
+            }
+            if (r.rejectReason == null) return;
             byte[] reason = r.rejectReason.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
             byte[] p = new byte[3 + reason.length + 32];
             p[0] = (byte) MSG_TX;
@@ -2966,6 +3065,19 @@ public class ChainSync {
         } catch (Exception ignored) {
             // best effort: the sender may already have gone
         }
+        if (r.score > 0) {
+            int total = txBanScores.merge(conn.ip, r.score, Integer::sum);
+            if (total >= 100) {
+                txBanScores.remove(conn.ip);
+                System.out.printf("[Mempool] Banning %s: transaction ban score reached %d (last: %s)%n",
+                        conn.ip, total, r.rejectReason);
+                PeerTable.get().banPeer(conn.ip, "sent invalid transactions (" + r.rejectReason + ")");
+            }
+        }
+    }
+
+    private static byte[] fromHexOrNull(String s) {
+        try { return HexUtil.decode(s); } catch (Exception e) { return null; }
     }
 
     /**
@@ -2983,6 +3095,10 @@ public class ChainSync {
         pos += varintSize(count);
 
         List<byte[]> toRequest = new ArrayList<>();
+        // Like hsd, ignore transaction announcements until the chain is (nearly) caught up: while syncing, the coins
+        // those transactions spend do not exist yet, so every one would only be parked as an orphan.
+        int peerTip = bestKnownPeerHeight;
+        boolean chainSynced = peerTip <= 0 || db.getBlockTip() >= peerTip - 144;
         for (int i = 0; i < count && pos + 36 <= payload.length; i++) {
             int itemType = (int) readLE32(payload, pos);
             byte[] hash = Arrays.copyOfRange(payload, pos + 4, pos + 36);
@@ -2994,8 +3110,9 @@ public class ChainSync {
                 continue;
             }
             if (itemType != 1) continue; // only TX and BLOCK announcements are handled here
+            if (!chainSynced) continue;
             String txidHex = toHex(hash);
-            if (mempool != null && mempool.getEntry(txidHex) == null) {
+            if (mempool != null && mempool.getEntry(txidHex) == null && !mempool.hasReject(txidHex)) {
                 toRequest.add(hash);
             }
         }
@@ -3149,33 +3266,202 @@ public class ChainSync {
         }
     }
 
+    /**
+     * GETDATA, matching hsd's handleGetData: every item we cannot serve is collected and answered with one NOTFOUND
+     * (so the requester stops waiting instead of timing out), claims/airdrop proofs are never held here so they are
+     * always NOTFOUND, a compact-block request is served as a compact block when the block is within 10 of the tip
+     * and as a full block otherwise, and more than MAX_INV items is a ban plus disconnect.
+     */
     private void serveGetData(PeerConnection conn, byte[] payload) throws Exception {
-        int pos = 0;
-        int count = (int) readVarint(payload, pos);
-        pos += varintSize(count);
+        List<P2pMessages.Item> items;
+        try {
+            items = P2pMessages.parseItems(payload);
+        } catch (P2pMessages.MalformedPacket e) {
+            PeerTable.get().banPeer(conn.ip, "bad GETDATA: " + e.getMessage());
+            throw new java.io.IOException("bad GETDATA from " + conn.ip + ": " + e.getMessage());
+        }
 
-        for (int i = 0; i < count && pos + 36 <= payload.length; i++) {
-            int itemType = (int) readLE32(payload, pos);
-            byte[] hash = Arrays.copyOfRange(payload, pos + 4, pos + 36);
-            pos += 36;
-            String hashHex = toHex(hash);
+        List<P2pMessages.Item> notFound = new ArrayList<>();
+        int tipHeight = db.getBlockTip();
+        for (P2pMessages.Item item : items) {
+            byte[] hash = item.hash;
+            int type = item.type;
 
-            if (itemType == 2) { // BLOCK
-                int height = db.getHeightByHash(hashHex);
-                if (height < 0) continue;
-                byte[] rawBlock = db.getBlock(height);
-                if (rawBlock == null) continue; // header only, block not downloaded
-                if (conn.bloomFilter != null) {
+            if (type == P2pMessages.INV_TX) {
+                byte[] rawTx = mempool != null ? mempool.getRaw(toHex(hash)) : null;
+                if (rawTx == null) { notFound.add(item); continue; }
+                conn.sendMessage(MSG_TX, rawTx);
+                continue;
+            }
+
+            if (type == P2pMessages.INV_BLOCK || type == P2pMessages.INV_CMPCT_BLOCK
+                    || type == P2pMessages.INV_FILTERED_BLOCK) {
+                int height = db.getHeightByHash(hash);
+                byte[] rawBlock = height >= 0 ? db.getBlock(height) : null; // null: unknown, or header only
+                if (rawBlock == null || (type == P2pMessages.INV_FILTERED_BLOCK && conn.bloomFilter == null)) {
+                    notFound.add(item);
+                    continue;
+                }
+
+                if (type == P2pMessages.INV_CMPCT_BLOCK && conn.bloomFilter == null && height >= tipHeight - 10) {
+                    byte[] nonce = new byte[8];
+                    new java.security.SecureRandom().nextBytes(nonce);
+                    byte[] cmpct = P2pMessages.buildCompactBlock(rawBlock, nonce);
+                    if (cmpct != null) conn.sendMessage(P2pMessages.MSG_CMPCTBLOCK, cmpct);
+                    else conn.sendMessage(MSG_BLOCK, rawBlock);
+                } else if (conn.bloomFilter != null) {
                     serveFilteredBlock(conn, rawBlock);
                 } else {
                     conn.sendMessage(MSG_BLOCK, rawBlock);
                 }
-            } else if (itemType == 1 && mempool != null) { // TX
-                byte[] rawTx = mempool.getRaw(hashHex);
-                if (rawTx == null) continue;
-                conn.sendMessage(MSG_TX, rawTx);
+
+                // hsd: once a peer asks for the last block of a truncated GETBLOCKS reply, announce the tip so it
+                // keeps going.
+                byte[] cont = conn.hashContinue;
+                if (cont != null && Arrays.equals(cont, hash)) {
+                    conn.hashContinue = null;
+                    byte[] tipHeader = db.getHeader(tipHeight);
+                    if (tipHeader != null) {
+                        conn.sendMessage(MSG_INV, P2pMessages.encodeItems(
+                                List.of(new P2pMessages.Item(P2pMessages.INV_BLOCK, HeaderUtil.hash(tipHeader)))));
+                    }
+                }
+                continue;
             }
+
+            // CLAIM / AIRDROP (we keep no claim or airdrop pool) and any unknown type.
+            notFound.add(item);
         }
+
+        for (int i = 0; i < notFound.size(); i += P2pMessages.INV_CHUNK) {
+            conn.sendMessage(MSG_NOTFOUND, P2pMessages.encodeItems(
+                    notFound.subList(i, Math.min(notFound.size(), i + P2pMessages.INV_CHUNK))));
+        }
+    }
+
+    // ── Step 2 packets: GETBLOCKS, MEMPOOL, FEEFILTER, SENDCMPCT, GETBLOCKTXN, GETPROOF, ... ──────────────
+
+    /** True once we are (nearly) caught up -- hsd's {@code chain.synced}. Serving getblocks/mempool before that
+     *  would only hand out a half-built chain. */
+    private boolean isChainSynced() {
+        int peerTip = bestKnownPeerHeight;
+        return peerTip <= 0 || db.getBlockTip() >= peerTip - 144;
+    }
+
+    /**
+     * Handles the Step 2 packet types for either connection direction. Returns true if the type was one of them
+     * (so the caller skips its own dispatch). A malformed packet closes the connection (IOException), like hsd.
+     */
+    private boolean handleServeMessage(PeerConnection conn, int type, byte[] msg) throws Exception {
+        switch (type) {
+            case MSG_GETBLOCKS:
+                serveGetBlocks(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                return true;
+            case MSG_MEMPOOL:
+                serveMempool(conn);
+                return true;
+            case P2pMessages.MSG_FEEFILTER: {
+                long rate = P2pMessages.parseFeeFilter(Arrays.copyOfRange(msg, 9, msg.length));
+                if (rate < 0 || rate > P2pMessages.MAX_MONEY) {
+                    PeerTable.get().banPeer(conn.ip, "invalid FEEFILTER rate " + rate);
+                    throw new java.io.IOException("invalid FEEFILTER from " + conn.ip);
+                }
+                conn.feeRate = rate;
+                return true;
+            }
+            case P2pMessages.MSG_SENDCMPCT: {
+                long[] mv = P2pMessages.parseSendCmpct(Arrays.copyOfRange(msg, 9, msg.length));
+                if (conn.compactMode == -1 && mv[1] <= 1 && mv[0] <= 1) conn.compactMode = (int) mv[0];
+                return true;
+            }
+            case P2pMessages.MSG_GETBLOCKTXN:
+                serveGetBlockTxn(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                return true;
+            case P2pMessages.MSG_GETPROOF:
+                serveGetProof(conn, Arrays.copyOfRange(msg, 9, msg.length));
+                return true;
+            case MSG_NOTFOUND:
+                // Answer to a getdata of ours; we never wait on individual items, so nothing to resolve.
+                return true;
+            case P2pMessages.MSG_PROOF:
+                // We never send GETPROOF, so a PROOF is unsolicited; hsd bans 100 for that.
+                PeerTable.get().banPeer(conn.ip, "unsolicited PROOF");
+                throw new java.io.IOException("unsolicited PROOF from " + conn.ip);
+            case P2pMessages.MSG_CLAIM:
+            case P2pMessages.MSG_AIRDROP:
+            case P2pMessages.MSG_CMPCTBLOCK:
+            case P2pMessages.MSG_BLOCKTXN:
+                // We never request these (no claim/airdrop pool; we do not advertise compact-block receipt), so
+                // hsd's rule for an unrequested one applies: drop the peer.
+                throw new java.io.IOException("unrequested packet type " + type + " from " + conn.ip);
+            default:
+                return false;
+        }
+    }
+
+    /** hsd handleGetBlocks: first locator hash on our main chain, then up to 500 following block hashes (stopping
+     *  before {@code stop}); if truncated, remember the last one so serving it triggers a tip announcement. */
+    private void serveGetBlocks(PeerConnection conn, byte[] payload) throws Exception {
+        P2pMessages.Locator loc = P2pMessages.parseLocator(payload);
+        if (!isChainSynced()) return;
+        int tip = db.getBlockTip();
+        int match = 0; // hsd: no locator hash found -> genesis
+        for (byte[] h : loc.hashes) {
+            int ht = db.getHeightByHash(h);
+            if (ht < 0 || ht > tip) continue;
+            byte[] hdr = db.getHeader(ht);
+            if (hdr != null && Arrays.equals(HeaderUtil.hash(hdr), h)) { match = ht; break; }
+        }
+        List<P2pMessages.Item> blocks = new ArrayList<>();
+        byte[] zero = new byte[32];
+        for (int ht = match + 1; ht <= tip; ht++) {
+            byte[] hdr = db.getHeader(ht);
+            if (hdr == null) break;
+            byte[] hash = HeaderUtil.hash(hdr);
+            if (Arrays.equals(hash, loc.stop) && !Arrays.equals(loc.stop, zero)) break;
+            blocks.add(new P2pMessages.Item(P2pMessages.INV_BLOCK, hash));
+            if (blocks.size() == P2pMessages.GETBLOCKS_LIMIT) { conn.hashContinue = hash; break; }
+        }
+        if (blocks.isEmpty()) return;
+        conn.sendMessage(MSG_INV, P2pMessages.encodeItems(blocks));
+    }
+
+    /** hsd handleMempool: INV of every mempool txid, in chunks of 1000. */
+    private void serveMempool(PeerConnection conn) throws Exception {
+        if (mempool == null || !isChainSynced()) return;
+        List<P2pMessages.Item> items = new ArrayList<>();
+        for (Mempool.MempoolEntry e : mempool.getAll()) {
+            byte[] id = fromHexStatic(e.txid);
+            if (id != null && id.length == 32) items.add(new P2pMessages.Item(P2pMessages.INV_TX, id));
+        }
+        for (int i = 0; i < items.size(); i += P2pMessages.INV_CHUNK) {
+            conn.sendMessage(MSG_INV, P2pMessages.encodeItems(
+                    items.subList(i, Math.min(items.size(), i + P2pMessages.INV_CHUNK))));
+        }
+    }
+
+    /** hsd handleGetBlockTxn: unknown block = ban 100; deeper than 15 below the tip = ignored. */
+    private void serveGetBlockTxn(PeerConnection conn, byte[] payload) throws Exception {
+        P2pMessages.TxRequest req = P2pMessages.parseGetBlockTxn(payload);
+        int height = db.getHeightByHash(req.hash);
+        if (height < 0) {
+            PeerTable.get().banPeer(conn.ip, "GETBLOCKTXN for unknown block");
+            throw new java.io.IOException("GETBLOCKTXN for unknown block from " + conn.ip);
+        }
+        byte[] rawBlock = db.getBlock(height);
+        if (rawBlock == null) return; // header only
+        if (height < db.getBlockTip() - 15) return;
+        conn.sendMessage(P2pMessages.MSG_BLOCKTXN, P2pMessages.buildBlockTxn(rawBlock, req));
+    }
+
+    /** hsd handleGetProof: prove {@code key} against {@code root}. Only the last committed tree root can be proved
+     *  here (no historical tree snapshots are kept); a request for any other root is ignored. */
+    private void serveGetProof(PeerConnection conn, byte[] payload) throws Exception {
+        byte[][] rk = P2pMessages.parseGetProof(payload);
+        byte[] committed = db.getNameTree().committedRoot();
+        if (committed == null || !Arrays.equals(committed, rk[0])) return;
+        handshake.node.urkeltree.UrkelProof proof = db.getNameTree().proveCommitted(rk[1]);
+        conn.sendMessage(P2pMessages.MSG_PROOF, P2pMessages.encodeProofPacket(rk[0], rk[1], proof));
     }
 
     /** Builds an ADDR message payload (no frame wrapper -- sendMessage adds
@@ -3285,6 +3571,13 @@ public class ChainSync {
         // UrkelNode.Internal's left/right and UrkelTree's
         // awaitingNextCommit earlier this session, not a new pattern.
         volatile BloomFilter bloomFilter = null;
+
+        /** Peer's FEEFILTER rate (dollarydoos per kB); -1 until it sends one. Txs below it are not announced. */
+        volatile long feeRate = -1;
+        /** Peer's SENDCMPCT mode (0 or 1); -1 until it sends one. */
+        volatile int compactMode = -1;
+        /** Last hash of a truncated GETBLOCKS reply; serving it triggers a tip INV (hsd hashContinue). */
+        volatile byte[] hashContinue = null;
 
         // DIAGNOSTIC: what this peer's own VERSION message reported
         // seeing as OUR address (see parseVersion()'s own comment on

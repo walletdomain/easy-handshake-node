@@ -86,7 +86,7 @@ public class WebAdminServer {
      *  occasionally useful setting, e.g. binding somewhere other than
      *  loopback for a deliberate remote-RPC setup). */
     private static final Set<String> EDITABLE_KEYS = Set.of(
-            "rpc.host"
+            "rpc.host", "miner.address"
     );
 
     private static final Set<String> REQUIRES_RESTART = Set.of(
@@ -528,6 +528,7 @@ public class WebAdminServer {
             if (ex.getRequestMethod().equals("GET")) {
                 StringBuilder sb = new StringBuilder("{");
                 sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\"");
+                sb.append(",\"miner.address\":\"").append(jsonEscape(config.getMinerAddress())).append("\"");
                 sb.append("}");
                 respondJson(ex, 200, sb.toString());
                 return;
@@ -562,7 +563,7 @@ public class WebAdminServer {
                 // -- a partial write on the first bad field would leave
                 // config in a mixed, confusing state.
                 for (var entry : fields.entrySet()) {
-                    config.set(entry.getKey(), entry.getValue());
+                    config.set(entry.getKey(), entry.getKey().equals("miner.address") ? entry.getValue().trim() : entry.getValue());
                 }
 
                 respondJson(ex, 200, "{\"ok\":true,\"restartRequired\":" + restartRequired + "}");
@@ -589,6 +590,12 @@ public class WebAdminServer {
         // Removed as part of the project's dead-code cleanup pass.
         return switch (key) {
             case "rpc.host" -> value.isBlank() ? "Host cannot be empty" : null;
+            case "miner.address" -> {
+                String v = value.trim();
+                if (v.isEmpty()) yield null;                       // empty = mining disabled
+                try { MiningService.decodeAddress(v); yield null; }
+                catch (RpcServer.RpcException e) { yield "Invalid mining reward address: " + e.getMessage(); }
+            }
             default -> "Unknown key";
         };
     }

@@ -70,15 +70,33 @@ public class TxVerify {
         byte[] computedHash = Blake2b.hash(pubkey, 20);
         if (!Arrays.equals(computedHash, addrHash)) return false;
 
-        // Standard convention: signature has the 1-byte sighash type
-        // appended after the DER-encoded signature itself.
-        int sighashType = sigWithType[sigWithType.length - 1] & 0xFF;
-        byte[] derSig = Arrays.copyOf(sigWithType, sigWithType.length - 1);
+        // Handshake signatures (hsd Script.checkSig / common.isSignatureEncoding): exactly
+        // 65 bytes -- a raw 64-byte (r || s) signature followed by the 1-byte sighash type,
+        // low-S, with a valid sighash type. NOT DER (unlike Bitcoin).
+        if (sigWithType.length != 65) return false;
+        int sighashType = sigWithType[64] & 0xFF;
+        int baseType = sighashType & ~SIGHASH_NOINPUT & ~SIGHASH_ANYONECANPAY;
+        if (baseType < SIGHASH_ALL || baseType > SIGHASH_SINGLEREVERSE) return false;
+        byte[] rawSig = Arrays.copyOf(sigWithType, 64);
+        if (!Secp256k1.isLowS(rawSig)) return false;
 
         byte[] prevScript = buildP2PKHScript(addrHash);
         byte[] sighash = computeSignatureHash(tx, inputIndex, prevScript, value, sighashType);
 
-        return Secp256k1.verify(sighash, derSig, pubkey);
+        return Secp256k1.verifyRaw(sighash, rawSig, pubkey);
+    }
+
+    /**
+     * Signs input {@code index} (a standard witness-pubkeyhash coin of {@code value}) and returns the
+     * 65-byte witness signature (raw r||s, low-S, then the sighash type byte).
+     */
+    public static byte[] signInput(TxParser.ParsedTx tx, int index, byte[] addrHash20, long value,
+                                   byte[] privateKey, int sighashType) {
+        byte[] hash = computeSignatureHash(tx, index, buildP2PKHScript(addrHash20), value, sighashType);
+        byte[] sig = Secp256k1.sign(hash, privateKey);
+        byte[] out = Arrays.copyOf(sig, 65);
+        out[64] = (byte) sighashType;
+        return out;
     }
 
     /**
@@ -91,7 +109,7 @@ public class TxVerify {
     // project's own copy of this file, which needs to build the
     // identical prevScript when SIGNING (not just verifying) a
     // transaction, from its own WalletTxBuilder class.
-    static byte[] buildP2PKHScript(byte[] hash20) {
+    public static byte[] buildP2PKHScript(byte[] hash20) {
         byte[] script = new byte[25];
         script[0] = (byte) OP_DUP;
         script[1] = (byte) OP_BLAKE160;
@@ -110,6 +128,17 @@ public class TxVerify {
     static byte[] computeSignatureHash(TxParser.ParsedTx tx, int index,
                                        byte[] prevScript, long value, int type) {
         TxParser.Input input = tx.inputs.get(index);
+        // SIGHASH_NOINPUT (hsd): this input's own outpoint and sequence are replaced by a
+        // blank input (null outpoint, max sequence); the shared prevouts/sequences hashes
+        // below still use the real inputs, exactly as hsd does.
+        byte[] inPrevHash = input.prevHash;
+        int inPrevIndex = input.prevIndex;
+        int inSequence = input.sequence;
+        if ((type & SIGHASH_NOINPUT) != 0) {
+            inPrevHash = new byte[32];
+            inPrevIndex = 0xFFFFFFFF;
+            inSequence = 0xFFFFFFFF;
+        }
         byte[] prevouts  = new byte[32];
         byte[] sequences = new byte[32];
         byte[] outputsHash = new byte[32];
@@ -162,23 +191,25 @@ public class TxVerify {
             }
         }
 
-        byte[] preimage = new byte[4 + 32 + 32 + 32 + 4 + (1 + prevScript.length) + 8 + 4 + 32 + 4 + 4];
+        byte[] preimage = new byte[4 + 32 + 32 + 32 + 4 + (9 + prevScript.length) + 8 + 4 + 32 + 4 + 4];
         int pos = 0;
         pos = writeLE32(preimage, pos, tx.version);
         System.arraycopy(prevouts, 0, preimage, pos, 32); pos += 32;
         System.arraycopy(sequences, 0, preimage, pos, 32); pos += 32;
-        System.arraycopy(input.prevHash, 0, preimage, pos, 32); pos += 32;
-        pos = writeLE32(preimage, pos, input.prevIndex);
-        // varBytes: single-byte length prefix is sufficient (25-byte P2PKH script)
-        preimage[pos++] = (byte) prevScript.length;
+        System.arraycopy(inPrevHash, 0, preimage, pos, 32); pos += 32;
+        pos = writeLE32(preimage, pos, inPrevIndex);
+        // varBytes length prefix (scripts can be up to 10,000 bytes)
+        int sl = prevScript.length;
+        if (sl < 0xfd) { preimage[pos++] = (byte) sl; }
+        else { preimage[pos++] = (byte) 0xfd; preimage[pos++] = (byte) sl; preimage[pos++] = (byte) (sl >>> 8); }
         System.arraycopy(prevScript, 0, preimage, pos, prevScript.length); pos += prevScript.length;
         pos = writeLE64(preimage, pos, value);
-        pos = writeLE32(preimage, pos, input.sequence);
+        pos = writeLE32(preimage, pos, inSequence);
         System.arraycopy(outputsHash, 0, preimage, pos, 32); pos += 32;
         pos = writeLE32(preimage, pos, tx.locktime);
         writeLE32(preimage, pos, type);
 
-        return Blake2b.hash256(preimage);
+        return Blake2b.hash256(java.util.Arrays.copyOf(preimage, pos + 4));
     }
 
     /** Re-serializes a parsed Output back to its raw wire bytes (value +
@@ -188,24 +219,26 @@ public class TxVerify {
      *  constructed one for createrawtransaction (not just a re-encoding
      *  of an already-parsed one). */
     public static byte[] encodeOutput(TxParser.Output out) {
-        int covSize = 1 + 1; // type + item count varint (assumes <0xFD items)
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+        byte[] v = new byte[8];
+        writeLE64(v, 0, out.value);
+        o.write(v, 0, 8);
+        o.write(out.addrVersion);
+        o.write(out.addrHash.length);
+        o.write(out.addrHash, 0, out.addrHash.length);
+        o.write(out.covenant.type);
+        writeVarint(o, out.covenant.items.size());
         for (TxParser.CovenantItem item : out.covenant.items) {
-            covSize += 1 + item.data.length; // assumes <0xFD length
+            writeVarint(o, item.data.length);
+            o.write(item.data, 0, item.data.length);
         }
-        byte[] buf = new byte[8 + 1 + 1 + out.addrHash.length + covSize];
-        int pos = 0;
-        pos = writeLE64(buf, pos, out.value);
-        buf[pos++] = (byte) out.addrVersion;
-        buf[pos++] = (byte) out.addrHash.length;
-        System.arraycopy(out.addrHash, 0, buf, pos, out.addrHash.length); pos += out.addrHash.length;
-        buf[pos++] = (byte) out.covenant.type;
-        buf[pos++] = (byte) out.covenant.items.size();
-        for (TxParser.CovenantItem item : out.covenant.items) {
-            buf[pos++] = (byte) item.data.length;
-            System.arraycopy(item.data, 0, buf, pos, item.data.length);
-            pos += item.data.length;
-        }
-        return buf;
+        return o.toByteArray();
+    }
+
+    private static void writeVarint(java.io.ByteArrayOutputStream o, long n) {
+        if (n < 0xfd) { o.write((int) n); }
+        else if (n <= 0xffff) { o.write(0xfd); o.write((int) (n & 0xff)); o.write((int) ((n >>> 8) & 0xff)); }
+        else { o.write(0xfe); for (int i = 0; i < 4; i++) o.write((int) ((n >>> (8 * i)) & 0xff)); }
     }
 
     private static int writeLE32(byte[] buf, int pos, int v) {

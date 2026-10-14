@@ -1,5 +1,7 @@
 package handshake.node.urkeltree;
 
+import handshake.node.storage.KVStore;
+import handshake.node.storage.DiskBackedHashKeySet;
 import handshake.node.storage.DiskBackedOrphanQueue;
 import handshake.node.storage.PersistentLog;
 
@@ -736,7 +738,7 @@ public class UrkelNameTree {
      *  simply the calling thread draining chunk after chunk itself,
      *  nothing else could ever be running concurrently to wait for. */
     private void blockUntilBacklogDrains(boolean deepCatchUp, UrkelNode rootToPrune, int height,
-                                          String dataDir) {
+                                         String dataDir) {
         long resumeThreshold = HARD_BACKPRESSURE_CAP / 2;
         long startSize = accumulatedOrphanCandidates.size();
         // FIX: a backpressure episode is exactly the kind of rare,
@@ -1056,7 +1058,10 @@ public class UrkelNameTree {
         // PruneInterruptedException handling), so closing it any
         // earlier would risk that re-queue writing to an already-closed
         // store.
+        long t0 = System.nanoTime();
         accumulatedOrphanCandidates.close();
+        System.out.printf("[UrkelNameTree] shutdown: orphan queue closed in %.1f s%n", (System.nanoTime() - t0) / 1e9);
+        t0 = System.nanoTime();
 
         // FIX: same leak shape as accumulatedOrphanCandidates just above
         // -- persistentReachable (see UrkelTree's own field comment) is
@@ -1067,6 +1072,7 @@ public class UrkelNameTree {
         // Safe to call even if it was never built at all (e.g. a node
         // that never made it out of deep catch-up before this shutdown).
         tree.closePersistentReachableCache();
+        System.out.printf("[UrkelNameTree] shutdown: reachable-set cache closed in %.1f s%n", (System.nanoTime() - t0) / 1e9);
     }
 
     /** Looks up a name's current state directly (bypassing the

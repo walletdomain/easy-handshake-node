@@ -114,6 +114,10 @@ public class Main {
                 db.getUtxoCountEstimate(), db.getNameCountEstimate());
         db.backfillHashIndexIfNeeded();
         db.backfillChainworkIfNeeded();
+        db.setAddressIndexEnabled(config.indexAddress());
+
+        // Repairs a small tx/address-index gap left by a crash or an earlier indexing failure (no-op normally).
+        handshake.node.chain.BlockIndexer.catchUp(db);
 
         // ── 3b. Resilience: verify consistency after an unclean shutdown ───────
         // NEW: see ChainDB.commit()'s own comment for the real, plausible
@@ -127,7 +131,7 @@ public class Main {
         // own placement guarantees only happens after a crash, power
         // loss, or kill -9, never a normal exit.
         boolean previousShutdownWasClean = db.checkAndClearCleanShutdownMarker();
-        if (!previousShutdownWasClean) {
+        if (!previousShutdownWasClean && db.getBlockTip() >= 0) {
             System.out.println("[Main] Previous run did not exit cleanly -- verifying on-disk "
                     + "consistency before starting sync.");
             int currentTip = db.getBlockTip();
@@ -412,11 +416,28 @@ public class Main {
      *  including steps (like ConfigDB's own commit/close) with no
      *  relation to whatever failed first. */
     private static void safeShutdownStep(String label, ShutdownStep step) {
+        final Thread worker = Thread.currentThread();
+        final long start = System.nanoTime();
+        System.out.println("[Main] Shutdown step '" + label + "' starting...");
+        // Heartbeat: a step that takes long reports, every 20 s, that it is still running and where it is stuck
+        // (the top of this thread's stack), so a long shutdown is no longer a silent wait.
+        java.util.concurrent.ScheduledExecutorService hb = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "shutdown-heartbeat"); t.setDaemon(true); return t; });
+        hb.scheduleAtFixedRate(() -> {
+            StringBuilder sb = new StringBuilder();
+            StackTraceElement[] st = worker.getStackTrace();
+            for (int i = 0; i < Math.min(6, st.length); i++) sb.append("\n      at ").append(st[i]);
+            System.out.println("[Main] Shutdown step '" + label + "' still running after "
+                    + (System.nanoTime() - start) / 1_000_000_000L + " s; currently in:" + sb);
+        }, 20, 20, java.util.concurrent.TimeUnit.SECONDS);
         try {
             step.run();
         } catch (Throwable t) {
             System.err.println("[Main] Shutdown step '" + label + "' failed (continuing "
                     + "with remaining shutdown steps regardless): " + t);
+        } finally {
+            hb.shutdownNow();
+            System.out.printf("[Main] Shutdown step '%s' finished in %.1f s%n", label, (System.nanoTime() - start) / 1e9);
         }
     }
 

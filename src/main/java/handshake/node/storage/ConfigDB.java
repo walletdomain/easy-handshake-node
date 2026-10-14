@@ -50,7 +50,7 @@ public final class ConfigDB {
         File parent = new File(path).getParentFile();
         if (parent != null) parent.mkdirs();
 
-        this.store = new RocksDBKVStore(path);
+        this.store = new RocksDBKVStore(path, false, 16L * 1024 * 1024);   // tiny settings DB: no need for the big chain cache
         this.settings = store.openStringStringMap("settings");
         this.seeds = store.openStringStringMap("seeds");
         this.peerScores = store.openStringStringMap("peerScores");

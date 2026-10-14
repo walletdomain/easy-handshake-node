@@ -31,7 +31,7 @@ public class TxParser {
 
     public static class Input {
         public byte[] prevHash;    // raw wire-order bytes (32), needed for sighash
-        public String prevTxid;    // display format (reversed bytes)
+        public String prevTxid;    // hex of the 32 wire bytes as-is = the parent txid exactly as computeTxid() prints it (Handshake does not reverse txids)
         public int    prevIndex;
         public int    sequence;
         public List<byte[]> witness = new ArrayList<>(); // stack items, e.g. [sig, pubkey]
@@ -149,8 +149,10 @@ public class TxParser {
                 Input in = new Input();
                 byte[] prevHash = p.readBytes(32);
                 in.prevHash  = prevHash;
-                // Store as display format (reversed)
-                in.prevTxid  = hexReversed(prevHash);
+                // Handshake txids are the hash bytes as-is (hsd tx.txid() == hash().toString('hex')),
+                // so this equals computeTxid() of the parent and the key its UTXOs are stored under.
+                // (It used to be byte-reversed, Bitcoin-style, which never matched.)
+                in.prevTxid  = hex(prevHash);
                 in.prevIndex = (int) p.readLE32();
                 in.sequence  = (int) p.readLE32();
                 tx.inputs.add(in);

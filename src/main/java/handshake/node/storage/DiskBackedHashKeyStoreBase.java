@@ -52,8 +52,8 @@ abstract class DiskBackedHashKeyStoreBase
             throw new RuntimeException("Could not create a scratch directory for " + tempDirPrefix, e);
         }
         this.store = (blockCacheBytesOverride != null)
-                ? new RocksDBKVStore(scratchDir.toString(), false, blockCacheBytesOverride)
-                : new RocksDBKVStore(scratchDir.toString());
+                ? new RocksDBKVStore(scratchDir.toString(), false, blockCacheBytesOverride, true)
+                : new RocksDBKVStore(scratchDir.toString(), false, -1L, true);
         this.map = store.openStringBytesMap(mapName);
     }
 
@@ -79,8 +79,14 @@ abstract class DiskBackedHashKeyStoreBase
 
     @Override
     public void close() {
+        long t0 = System.nanoTime();
         store.close();
+        long t1 = System.nanoTime();
         deleteRecursive(scratchDir.toFile());
+        long t2 = System.nanoTime();
+        if (t2 - t0 > 2_000_000_000L)       // only worth a line when it is slow (a big scratch store on a slow disk)
+            System.out.printf("[%s] closing scratch store: database %.1f s, deleting its files %.1f s%n",
+                    getClass().getSimpleName(), (t1 - t0) / 1e9, (t2 - t1) / 1e9);
     }
 
     protected static void deleteRecursive(java.io.File dir) {

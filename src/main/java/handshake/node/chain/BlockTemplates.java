@@ -10,8 +10,10 @@ import java.math.BigInteger;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -26,10 +28,10 @@ import java.util.Set;
  * same merkle and witness roots, same retarget results.
  * <p>
  * Scope, stated plainly:
- *  - Templates contain ONLY the coinbase transaction (no mempool
- *    transactions). Empty blocks are fully valid; adding fee-paying
- *    transactions needs per-transaction fee/finality/name-limit accounting
- *    that this node does not have yet.
+ *  - Templates carry mempool transactions: selected by fee rate with in-mempool parents first, within the
+ *    size/weight limits, then the whole candidate block is run through BlockValidator and any transaction it
+ *    rejects (with its descendants) is dropped, so a template never contains a transaction the node's own
+ *    validation would refuse. If nothing survives the template is coinbase-only.
  *  - submitblock accepts blocks whose non-coinbase transactions are all in
  *    OUR mempool (already validated on entry), and no coinbase claims or
  *    airdrop proofs.
@@ -240,21 +242,40 @@ public final class BlockTemplates {
 
     // ── Template ──────────────────────────────────────────────────────────────
 
+    /** One non-coinbase transaction chosen for a template. */
+    public static final class Included {
+        public final byte[] raw, txid, wtxid;
+        public final long fee;
+        public final int weight;
+        /** 1-based positions (coinbase = 0) of earlier template transactions this one spends from. */
+        public final List<Integer> depends;
+        Included(byte[] raw, byte[] txid, byte[] wtxid, long fee, int weight, List<Integer> depends) {
+            this.raw = raw; this.txid = txid; this.wtxid = wtxid; this.fee = fee; this.weight = weight;
+            this.depends = depends;
+        }
+    }
+
     public static final class Template {
         public final int height;
         public final byte[] prevHash, treeRoot, reservedRoot, merkleRoot, witnessRoot;
         public final int version, bits;
+        /** Subsidy plus the fees of {@link #txs}. */
         public final long coinbaseValue, curTime, minTime, maxTime;
         public final Coinbase coinbase;
+        public final List<Included> txs;
+        public final long fees;
+        public final int weight;
 
         Template(int height, byte[] prevHash, byte[] treeRoot, byte[] reservedRoot,
                  byte[] merkleRoot, byte[] witnessRoot, int version, int bits,
-                 long coinbaseValue, long curTime, long minTime, long maxTime, Coinbase coinbase) {
+                 long coinbaseValue, long curTime, long minTime, long maxTime, Coinbase coinbase,
+                 List<Included> txs, long fees, int weight) {
             this.height = height; this.prevHash = prevHash; this.treeRoot = treeRoot;
             this.reservedRoot = reservedRoot; this.merkleRoot = merkleRoot;
             this.witnessRoot = witnessRoot; this.version = version; this.bits = bits;
             this.coinbaseValue = coinbaseValue; this.curTime = curTime; this.minTime = minTime;
             this.maxTime = maxTime; this.coinbase = coinbase;
+            this.txs = txs; this.fees = fees; this.weight = weight;
         }
 
         /** The 236-byte header for the given miner-controlled fields. */
@@ -276,23 +297,32 @@ public final class BlockTemplates {
             return h;
         }
 
-        /** The full serialized block (header + tx count + coinbase). */
+        /** The full serialized block (header + tx count + coinbase + template transactions). */
         public byte[] block(long nonce, long time, byte[] extraNonce24, byte[] mask32) {
             byte[] h = header(nonce, time, extraNonce24, mask32);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             out.writeBytes(h);
-            writeVarint(out, 1);
+            writeVarint(out, 1 + txs.size());
             out.writeBytes(coinbase.raw);
+            for (Included t : txs) out.writeBytes(t.raw);
             return out.toByteArray();
         }
     }
 
-    /**
-     * Builds a coinbase-only template on top of the current block tip.
-     * Preconditions (the caller reports them as RPC errors): the node's block
-     * tip equals its header tip.
-     */
+    /** Room kept for the header, the transaction count and the coinbase when filling a block. */
+    private static final int RESERVED_BASE_BYTES = 1_500;
+
+    /** Builds a coinbase-only template on top of the current block tip (see {@link #build(ChainDB, Mempool, int, byte[], byte[], long, Params)}). */
     public static Template build(ChainDB db, int addrVersion, byte[] addrHash,
+                                 byte[] coinbaseFlags, long nowSec, Params p) {
+        return build(db, null, addrVersion, addrHash, coinbaseFlags, nowSec, p);
+    }
+
+    /**
+     * Builds a template on top of the current block tip, filled with mempool transactions when a mempool is given.
+     * Preconditions (the caller reports them as RPC errors): the node's block tip equals its header tip.
+     */
+    public static Template build(ChainDB db, Mempool mempool, int addrVersion, byte[] addrHash,
                                  byte[] coinbaseFlags, long nowSec, Params p) {
         int tipH = db.getBlockTip();
         byte[] tipHeader = headerAt((java.util.function.IntFunction<byte[]>) db::getHeader, tipH);
@@ -300,16 +330,123 @@ public final class BlockTemplates {
         long mtp = medianTimePast(db, tipH);
         long minTime = mtp + 1;
         long curTime = Math.max(nowSec, minTime);
-        long reward = subsidy(height, p.halvingInterval());   // coinbase-only: no fees
+        long subsidy = subsidy(height, p.halvingInterval());
 
-        Coinbase cb = buildCoinbase(height, reward, addrVersion, addrHash, coinbaseFlags);
-        byte[] merkle = MerkleUtil.buildRoot(List.of(cb.txid));
-        byte[] witness = MerkleUtil.buildRoot(List.of(cb.witnessHash));
+        List<Included> chosen = mempool == null ? new ArrayList<>() : selectTransactions(mempool, height, mtp);
+        long fees = 0;
+        if (!chosen.isEmpty()) {
+            // Validate the candidate block exactly as a peer would; drop what it refuses.
+            for (int round = 0; round < 50 && !chosen.isEmpty(); round++) {
+                Coinbase probe = buildCoinbase(height, subsidy, addrVersion, addrHash, coinbaseFlags);
+                List<TxParser.ParsedTx> parsed = new ArrayList<>();
+                List<byte[]> ids = new ArrayList<>();
+                parsed.add(TxParser.parse(probe.raw)); ids.add(probe.txid);
+                for (Included t : chosen) { parsed.add(TxParser.parse(t.raw)); ids.add(t.txid); }
+                BlockValidator.Result vr = BlockValidator.validate(BlockValidator.dbContext(db), consensusFor(p),
+                        parsed, ids, height, mtp, HsScript.MANDATORY_VERIFY_FLAGS, true,
+                        BlockProcessor.nameFlagsAt(height));
+                if (vr.ok() && !vr.coinbaseProofs) { fees = vr.fees; break; }
+                if (vr.failedTx > 0 && vr.failedTx <= chosen.size()) {
+                    System.out.printf("[Mining] Template: dropping mempool tx %s (%s)%n",
+                            HexUtil.encode(chosen.get(vr.failedTx - 1).txid), vr);
+                    chosen = dropWithDescendants(chosen, vr.failedTx - 1);
+                } else {
+                    System.out.printf("[Mining] Template: candidate block refused (%s); using a coinbase-only template%n", vr);
+                    chosen = new ArrayList<>();
+                }
+            }
+            if (chosen.isEmpty()) fees = 0;
+        }
+
+        Coinbase cb = buildCoinbase(height, subsidy + fees, addrVersion, addrHash, coinbaseFlags);
+        List<byte[]> txids = new ArrayList<>(); txids.add(cb.txid);
+        List<byte[]> wtxids = new ArrayList<>(); wtxids.add(cb.witnessHash);
+        int weight = 0;
+        for (Included t : chosen) { txids.add(t.txid); wtxids.add(t.wtxid); weight += t.weight; }
+        byte[] merkle = MerkleUtil.buildRoot(txids);
+        byte[] witness = MerkleUtil.buildRoot(wtxids);
         byte[] treeRoot = db.getNameTree().committedRoot();
 
         return new Template(height, HeaderUtil.hash(tipHeader), treeRoot, new byte[32],
                 merkle, witness, 0, expectedBits(db, tipH, p),
-                reward, curTime, minTime, nowSec + MAX_FUTURE_SECONDS, cb);
+                subsidy + fees, curTime, minTime, nowSec + MAX_FUTURE_SECONDS, cb, chosen, fees, weight);
+    }
+
+    private static List<Included> dropWithDescendants(List<Included> list, int index) {
+        Set<String> dead = new HashSet<>();
+        dead.add(HexUtil.encode(list.get(index).txid));
+        List<Included> out = new ArrayList<>();
+        for (int i = 0; i < list.size(); i++) {
+            if (i == index) continue;
+            Included t = list.get(i);
+            TxParser.ParsedTx pt = TxParser.parse(t.raw);
+            boolean child = false;
+            for (TxParser.Input in : pt.inputs) if (dead.contains(in.prevTxid)) { child = true; break; }
+            if (child) dead.add(HexUtil.encode(t.txid)); else out.add(t);
+        }
+        return out;
+    }
+
+    /**
+     * Greedy selection by fee rate (fee per virtual byte), keeping parents before children and staying inside
+     * the block size and weight limits. Only picks transactions that are final at {@code height}/{@code mtp}.
+     * The result is NOT yet validated; {@link #build} does that.
+     */
+    static List<Included> selectTransactions(Mempool mempool, int height, long mtp) {
+        class Cand {
+            Mempool.MempoolEntry e; TxParser.ParsedTx tx; byte[] txid, wtxid; int weight;
+        }
+        Map<String, Cand> cands = new HashMap<>();
+        for (Mempool.MempoolEntry e : mempool.getAll()) {
+            TxParser.ParsedTx pt = TxParser.parse(e.raw);
+            if (pt == null || !isFinal(pt, height, mtp)) continue;
+            Cand c = new Cand();
+            c.e = e; c.tx = pt;
+            c.txid = Blake2b.hash256(Arrays.copyOf(pt.raw, pt.baseSize));
+            byte[] wd = Blake2b.hash256(Arrays.copyOfRange(pt.raw, pt.baseSize, pt.totalSize));
+            c.wtxid = Blake2b.hash256(concat(c.txid, wd));
+            c.weight = pt.baseSize * 3 + pt.totalSize;
+            cands.put(e.txid, c);
+        }
+        List<Cand> order = new ArrayList<>(cands.values());
+        order.sort((a, b) -> {
+            int c = Long.compare(b.e.fee * 1000L / Math.max(1, b.e.size), a.e.fee * 1000L / Math.max(1, a.e.size));
+            return c != 0 ? c : Long.compare(a.e.addedAt, b.e.addedAt);
+        });
+
+        List<Included> out = new ArrayList<>();
+        Map<String, Integer> position = new HashMap<>(); // txid hex -> 1-based position
+        long base = RESERVED_BASE_BYTES, weight = RESERVED_BASE_BYTES * 4L;
+        boolean progress = true;
+        Set<String> done = new HashSet<>();
+        while (progress) {
+            progress = false;
+            for (Cand c : order) {
+                if (done.contains(c.e.txid)) continue;
+                boolean ready = true;
+                List<Integer> deps = new ArrayList<>();
+                for (TxParser.Input in : c.tx.inputs) {
+                    if (cands.containsKey(in.prevTxid)) {
+                        Integer pos = position.get(in.prevTxid);
+                        if (pos == null) { ready = false; break; }
+                        if (!deps.contains(pos)) deps.add(pos);
+                    } else if (mempool.contains(in.prevTxid)) {
+                        ready = false; break; // parent is in the mempool but not final/usable now
+                    }
+                }
+                if (!ready) continue;
+                if (base + c.tx.baseSize > MAX_BLOCK_SIZE || weight + c.weight > MAX_BLOCK_WEIGHT) {
+                    done.add(c.e.txid); // does not fit; skip for good
+                    continue;
+                }
+                base += c.tx.baseSize; weight += c.weight;
+                out.add(new Included(c.e.raw, c.txid, c.wtxid, c.e.fee, c.weight, deps));
+                position.put(c.e.txid, out.size());
+                done.add(c.e.txid);
+                progress = true;
+            }
+        }
+        return out;
     }
 
     // ── submitblock validation ────────────────────────────────────────────────
@@ -320,6 +457,11 @@ public final class BlockTemplates {
      * Does not modify any state.
      */
     public static String checkBlock(ChainDB db, Mempool mempool, byte[] raw, long nowSec, Params p) {
+        return checkBlock(db, mempool, raw, nowSec, p, true);
+    }
+
+    /** @param checkPow false for getblocktemplate proposals, which are judged on everything except proof of work */
+    public static String checkBlock(ChainDB db, Mempool mempool, byte[] raw, long nowSec, Params p, boolean checkPow) {
         if (raw == null || raw.length < HeaderUtil.HEADER_SIZE + 1 || raw.length > MAX_RAW_BLOCK_SIZE)
             return "bad-blk-length";
 
@@ -341,7 +483,7 @@ public final class BlockTemplates {
         }
         int height = tipH + 1;
 
-        if (!HeaderUtil.checkPOW(header)) return "high-hash";
+        if (checkPow && !HeaderUtil.checkPOW(header)) return "high-hash";
         if (HeaderUtil.bits(header) != expectedBits(db, tipH, p)) return "bad-diffbits";
 
         long mtp = medianTimePast(db, tipH);
@@ -401,21 +543,19 @@ public final class BlockTemplates {
         }
         if (cb.outputs.isEmpty()) return "bad-txns-vout-empty";
 
-        long fees = 0;
-        Set<String> seen = new HashSet<>();
-        seen.add(HexUtil.encode(txids.get(0)));
-        for (int i = 1; i < txs.size(); i++) {
-            TxParser.ParsedTx t = txs.get(i);
-            if (!t.inputs.isEmpty() && t.inputs.get(0).isCoinbase()) return "bad-cb-multiple";
-            String id = HexUtil.encode(txids.get(i));
-            if (!seen.add(id)) return "bad-txns-duplicate";
-            Mempool.MempoolEntry e = mempool != null ? mempool.getEntry(id) : null;
-            if (e == null) return "unvalidated-tx"; // only transactions our mempool already accepted
-            if (!isFinal(t, height, mtp)) return "bad-txns-nonfinal";
-            fees += e.fee;
-        }
-        if (claimed > subsidy(height, p.halvingInterval()) + fees) return "bad-cb-amount";
+        // Full contextual validation (hsd chain.verifyInputs): inputs exist and are unspent and
+        // mature, values/fees/reward, sequence locks, sigops, covenant links, name-state rules and
+        // every input's script. Nothing is written; the block is applied afterwards by the caller.
+        BlockValidator.Result vr = BlockValidator.validate(BlockValidator.dbContext(db), consensusFor(p), txs, txids,
+                height, mtp, HsScript.MANDATORY_VERIFY_FLAGS, true, BlockProcessor.nameFlagsAt(height));
+        if (!vr.ok()) return vr.fail.reason();
+        if (vr.coinbaseProofs) return "unsupported-coinbase-proofs";
         return null;
+    }
+
+    /** Consensus constants matching a PoW parameter set (mainnet in production; tests use a short-chain set). */
+    static ConsensusParams consensusFor(Params p) {
+        return p.halvingInterval() == 170000 ? ConsensusParams.MAINNET : ConsensusParams.REGTEST;
     }
 
     /** primitives/tx.js isFinal(height, time) */
@@ -456,7 +596,7 @@ public final class BlockTemplates {
         return 9;
     }
 
-    static void writeVarint(ByteArrayOutputStream o, long n) {
+    public static void writeVarint(ByteArrayOutputStream o, long n) {
         if (n < 0xFD) { o.write((int) n); }
         else if (n <= 0xFFFF) { o.write(0xFD); o.write((int) (n & 0xFF)); o.write((int) ((n >> 8) & 0xFF)); }
         else { o.write(0xFE); writeLE32(o, (int) n); }

@@ -207,6 +207,8 @@ public class BlockProcessor {
     private static long sigVerifyNanos = 0;
     private static long utxoBookkeepingNanos = 0;
     private static long covenantProcessingNanos = 0;
+    private static long indexNanos = 0;       // writing this block's tx/address index entries
+    private static int timingLogsSinceIndexStats = 0;
     // Split into its two constituent phases -- see
     // ChainDB.PersistTiming's own comment for why this distinction
     // matters: persist was consistently the dominant cost even in
@@ -224,10 +226,19 @@ public class BlockProcessor {
         if (blocksSinceTimingLog < BLOCKS_PER_TIMING_LOG) return;
         System.out.printf("[BlockProcessor] Timing over last %d blocks (ending height %d): "
                         + "sigVerify=%.1fs utxoBookkeeping=%.1fs covenantProcessing=%.1fs "
-                        + "persistBlock=%.1fs maybeCommit=%.1fs heap=%s%n",
+                        + "persistBlock=%.1fs maybeCommit=%.1fs index=%.1fs heap=%s%n",
                 blocksSinceTimingLog, height,
                 sigVerifyNanos / 1e9, utxoBookkeepingNanos / 1e9, covenantProcessingNanos / 1e9,
-                persistBlockNanos / 1e9, maybeCommitNanos / 1e9, UrkelNameTree.heapSnapshot());
+                persistBlockNanos / 1e9, maybeCommitNanos / 1e9, indexNanos / 1e9, UrkelNameTree.heapSnapshot());
+        indexNanos = 0;
+        if (++timingLogsSinceIndexStats >= 5) {
+            timingLogsSinceIndexStats = 0;
+            try {
+                ChainDB cdb = ChainDB.get();
+                System.out.println("[Storage] " + cdb.storageStats());
+                if (cdb.index() != null) System.out.println("[Index] at height " + cdb.getIndexHeight() + ": " + cdb.index().stats());
+            } catch (RuntimeException ignore) { }
+        }
         sigVerifyNanos = 0;
         utxoBookkeepingNanos = 0;
         covenantProcessingNanos = 0;
@@ -269,6 +280,9 @@ public class BlockProcessor {
         try {
             return processInternal(rawBlock, height, db, mempool, bestKnownPeerHeight)
                     ? finishUndo(db, Result.VALID) : finishUndo(db, Result.REJECTED);
+        } catch (BlockValidationException e) {
+            db.abortUndo();
+            return Result.INTERNAL_ERROR;
         } catch (UrkelTreeMismatchException e) {
             db.abortUndo();
             // FIX: this exact exception was being caught by the
@@ -303,6 +317,67 @@ public class BlockProcessor {
                     + "whichever peer happened to send it%n", height, e.getMessage());
             return Result.INTERNAL_ERROR;
         }
+    }
+
+    /** Master switch for full contextual block validation (default on). Set
+     *  -Dhns.fullvalidation=false to fall back to the previous behaviour. */
+    /** Overridable for tests (regtest). */
+    public static ConsensusParams params = ConsensusParams.MAINNET;
+
+    static final boolean FULL_VALIDATION =
+            !"false".equalsIgnoreCase(System.getProperty("hns.fullvalidation", "true"));
+
+    /** A block with valid proof-of-work buried under at least this many further
+     *  headers is accepted even if our validator disagrees: the rest of the
+     *  network evidently accepted it, so the disagreement is far more likely a
+     *  bug here than an invalid block. It is logged loudly. */
+    static final int BURIED_OVERRIDE_DEPTH = 6;
+
+    /** Thrown when our validator rejects a block that is not (yet) buried. The
+     *  caller treats it like an internal error: do not advance, do not blame the peer. */
+    static final class BlockValidationException extends RuntimeException {
+        BlockValidationException(String msg) { super(msg); }
+    }
+
+    static int nameFlagsAt(int height) {
+        return height >= ReservedNames.ICANNLOCKUP_HEIGHT ? NameRules.FLAG_LOCKUP : 0;
+    }
+
+    private static void verifyBlockContextually(ChainDB db, List<TxParser.ParsedTx> txs,
+                                                List<byte[]> txidBytes, int height) {
+        // A block that was already (partially) applied before a crash/restart is being
+        // re-processed: its own outputs exist and its inputs are gone, so validating
+        // would report false double spends. Re-applying is idempotent -- skip.
+        TxParser.ParsedTx cb = txs.get(0);
+        String cbTxid = hex(txidBytes.get(0));
+        for (int o = 0; o < cb.outputs.size(); o++) {
+            TxParser.Output out = cb.outputs.get(o);
+            if (BlockValidator.unspendable(out.addrVersion, out.covenant.type)) continue;
+            if (db.getUtxo(cbTxid, o) != null) {
+                System.out.printf("[BlockProcessor] Height %d already (partially) applied -- "
+                        + "re-applying without re-validating%n", height);
+                return;
+            }
+            break;
+        }
+        long mtp = BlockTemplates.medianTimePast(db, height - 1);
+        BlockValidator.Result r = BlockValidator.validate(BlockValidator.dbContext(db),
+                params, txs, txidBytes, height, mtp,
+                HsScript.MANDATORY_VERIFY_FLAGS, true, nameFlagsAt(height));
+        if (r.ok()) return;
+        String msg = String.format("block at height %d failed validation: %s", height, r);
+        int headerTip = db.getHeaderTip();
+        if (headerTip - height >= BURIED_OVERRIDE_DEPTH) {
+            System.err.println("[BlockProcessor] *** VALIDATOR DISAGREEMENT *** " + msg
+                    + " -- but the block is buried under " + (headerTip - height)
+                    + " proof-of-work headers, so it is accepted. This most likely means a bug in "
+                    + "this node's validator; please report it.");
+            PersistentLog.logError(db.getDataDir(), "Validator disagreement (accepted, buried): " + msg);
+            return;
+        }
+        System.err.println("[BlockProcessor] " + msg + " -- NOT applied (will be retried; the peer is not blamed)");
+        PersistentLog.logError(db.getDataDir(), "Block rejected by validator: " + msg);
+        throw new BlockValidationException(msg);
     }
 
     private static boolean processInternal(byte[] rawBlock, int height,
@@ -405,6 +480,38 @@ public class BlockProcessor {
             throw new UrkelTreeMismatchException(height, claimedTreeRoot, ourCommittedRoot, firstRisky);
         }
 
+        // ── Full contextual validation (hsd chain.verifyInputs / verifyCovenants) ──
+        // Every non-coinbase input must spend an existing, unspent, mature coin;
+        // values, sequence locks, sigops, covenant links and name-state rules
+        // must hold; and every input's script (P2PKH, P2SH, multisig, timelocks,
+        // ...) must verify under the consensus flags. The check runs on an
+        // in-memory overlay BEFORE anything is written, so a failure leaves the
+        // database untouched. Blocks more than SIGNATURE_VERIFICATION_DEPTH
+        // behind the best peer height are trusted (see that constant's comment).
+        boolean tooFarBehind = bestKnownPeerHeight > 0
+                && (bestKnownPeerHeight - height) > SIGNATURE_VERIFICATION_DEPTH;
+        if (tooFarBehind) {
+            if (!wasSkippingSignatures) {
+                System.out.printf("[BlockProcessor] Height %d is more than %d blocks behind "
+                                + "the best known peer height (%d) -- skipping transaction/script "
+                                + "verification for this and subsequent blocks until caught up%n",
+                        height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
+                wasSkippingSignatures = true;
+            }
+        } else {
+            if (wasSkippingSignatures) {
+                System.out.printf("[BlockProcessor] Height %d is now within %d blocks of the "
+                                + "best known peer height (%d) -- resuming full verification%n",
+                        height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
+                wasSkippingSignatures = false;
+            }
+            if (FULL_VALIDATION) {
+                long sigStart = System.nanoTime();
+                verifyBlockContextually(db, txs, txidBytes, height);
+                sigVerifyNanos += System.nanoTime() - sigStart;
+            }
+        }
+
         // Reorg support: record exactly what this block changes so it can be
         // reversed later. Only needed within UNDO_RETENTION blocks of the tip
         // (deep history can never be reorganized), so skipped during bulk sync.
@@ -412,8 +519,10 @@ public class BlockProcessor {
             db.beginUndo(height);
         }
 
+        BlockIndexer.Live live = BlockIndexer.begin(db, height);
         for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
             TxParser.ParsedTx tx = txs.get(txIndex);
+            if (live != null) live.tx(txIndex, txidBytes.get(txIndex));
             // FIX: txid was previously recomputed here via
             // TxParser.computeTxid(tx.raw), which both re-parses the raw
             // transaction bytes from scratch (tx was already parsed once,
@@ -425,67 +534,6 @@ public class BlockProcessor {
             // block.
             String txid = hex(txidBytes.get(txIndex));
             confirmedTxids.add(txid);
-
-            // Signature verification happens OUTSIDE the per-transaction
-            // try/catch below, deliberately: a covenant-parsing bug in
-            // OUR OWN code isolating to one transaction is a very
-            // different thing from a transaction whose signature we
-            // actually checked and found invalid -- the latter is a real
-            // consensus violation and must reject the entire block, not
-            // just be logged and skipped like the former. Only a
-            // definite, checked failure rejects; a UTXO we can't find or
-            // an address type TxVerify doesn't yet support (e.g.
-            // 32-byte scripthash/multisig, which are legitimate and
-            // exist on real mainnet) is left unverified rather than
-            // treated as invalid -- rejecting those would break sync on
-            // perfectly valid, real blocks that every other real hsd
-            // validator accepts.
-            if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
-                // FIX: skip signature verification entirely for blocks
-                // deep enough behind the best known peer height -- see
-                // SIGNATURE_VERIFICATION_DEPTH's own comment for the
-                // full reasoning. bestKnownPeerHeight <= 0 means "not
-                // yet known" (e.g. before any peer connection has been
-                // established) -- deliberately defaults to full
-                // verification in that case, not skipping, since
-                // treating an unknown height as "definitely far enough
-                // behind" would be a real, dangerous bug (skipping
-                // verification on the very blocks at the tip, which is
-                // exactly the opposite of the intent here).
-                boolean tooFarBehindToSkip =
-                        bestKnownPeerHeight > 0 && (bestKnownPeerHeight - height) > SIGNATURE_VERIFICATION_DEPTH;
-                if (tooFarBehindToSkip) {
-                    if (!wasSkippingSignatures) {
-                        System.out.printf("[BlockProcessor] Height %d is more than %d blocks behind "
-                                        + "the best known peer height (%d) -- skipping signature verification "
-                                        + "for this and subsequent blocks until caught up%n",
-                                height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
-                        wasSkippingSignatures = true;
-                    }
-                } else {
-                    if (wasSkippingSignatures) {
-                        System.out.printf("[BlockProcessor] Height %d is now within %d blocks of the "
-                                        + "best known peer height (%d) -- resuming full signature verification%n",
-                                height, SIGNATURE_VERIFICATION_DEPTH, bestKnownPeerHeight);
-                        wasSkippingSignatures = false;
-                    }
-                    long sigStart = System.nanoTime();
-                    for (int i = 0; i < tx.inputs.size(); i++) {
-                        TxParser.Input input = tx.inputs.get(i);
-                        ChainDB.UtxoEntry spentUtxo = db.getUtxo(input.prevTxid, input.prevIndex);
-                        if (spentUtxo == null || spentUtxo.addrHash().length != 20) {
-                            continue; // unverifiable -- not a failure, just not checked
-                        }
-                        if (!TxVerify.verifyInput(tx, i, spentUtxo.addrHash(), spentUtxo.value())) {
-                            System.err.printf("[BlockProcessor] Signature verification failed for "
-                                    + "tx %s input %d at height %d -- rejecting block, no UTXO/name "
-                                    + "changes applied%n", txid, i, height);
-                            return false;
-                        }
-                    }
-                    sigVerifyNanos += System.nanoTime() - sigStart;
-                }
-            }
 
             // Isolated per-transaction: previously an exception in ANY
             // single transaction's covenant processing would propagate
@@ -499,7 +547,8 @@ public class BlockProcessor {
                 // Step 1: Remove spent UTXOs
                 if (!tx.inputs.isEmpty() && !tx.inputs.get(0).isCoinbase()) {
                     for (TxParser.Input input : tx.inputs) {
-                        db.removeUtxo(input.prevTxid, input.prevIndex);
+                        ChainDB.UtxoEntry spentCoin = db.spendUtxo(input.prevTxid, input.prevIndex);
+                        if (live != null) live.spent(txIndex, txidBytes.get(txIndex), input, spentCoin);
                     }
                 }
 
@@ -508,7 +557,7 @@ public class BlockProcessor {
                     TxParser.Output out = tx.outputs.get(i);
 
                     // Add UTXO
-                    byte[] covData = serializeCovenant(out.covenant);
+                    byte[] covData = ConsensusRules.encodeCovenantItems(out.covenant);
                     ChainDB.UtxoEntry utxo = new ChainDB.UtxoEntry(
                             out.value,
                             out.addrVersion,
@@ -518,7 +567,12 @@ public class BlockProcessor {
                             tx.inputs.isEmpty() || tx.inputs.get(0).isCoinbase(),
                             height
                     );
-                    db.saveUtxo(txid, i, utxo);
+                    // hsd never adds nulldata (version 31) or REVOKE outputs to the coin set.
+                    boolean spendableOut = !BlockValidator.unspendable(out.addrVersion, out.covenant != null ? out.covenant.type : 0);
+                    if (spendableOut) {
+                        db.saveUtxo(txid, i, utxo);
+                    }
+                    if (live != null) live.output(txIndex, txidBytes.get(txIndex), i, out, spendableOut);
                     utxoBookkeepingNanos += System.nanoTime() - utxoStart;
 
                     // Step 3: Update name state for covenant outputs --
@@ -545,6 +599,8 @@ public class BlockProcessor {
                         + "(rest of block still processed)%n", txid, height, e.getMessage());
             }
         }
+
+        if (live != null) { long ix0 = System.nanoTime(); live.finish(); indexNanos += System.nanoTime() - ix0; }
 
         // Step 3a: Flush this block's buffered name writes as a single
         // batched operation -- see ChainDB.saveName()/flushPendingNames()'s
@@ -842,7 +898,7 @@ public class BlockProcessor {
                     || (claimState == 3 && !entry.registered);
             if (!validClaimState) {
                 System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d "
-                        + "(state=%d, registered=%s) -- skipping, not applying%n",
+                                + "(state=%d, registered=%s) -- skipping, not applying%n",
                         entry.name, height, claimState, entry.registered);
                 return;
             }
@@ -850,8 +906,8 @@ public class BlockProcessor {
             int claimedHeight = extractU32(items, 5);
             if (claimedHeight <= entry.claimed) {
                 System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                        + "claimed height %d does not exceed existing %d (also implicitly rejects "
-                        + "the genesis block) -- skipping, not applying%n",
+                                + "claimed height %d does not exceed existing %d (also implicitly rejects "
+                                + "the genesis block) -- skipping, not applying%n",
                         entry.name, height, claimedHeight, entry.claimed);
                 return;
             }
@@ -860,14 +916,14 @@ public class BlockProcessor {
                 boolean hasOwner = entry.ownerTxid != null && !entry.ownerTxid.isEmpty();
                 if (!hasOwner && claimedHeight != 1) {
                     System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                            + "initial claim must commit to height 1, got %d -- skipping, not applying%n",
+                                    + "initial claim must commit to height 1, got %d -- skipping, not applying%n",
                             entry.name, height, claimedHeight);
                     return;
                 }
                 if (hasOwner && height < entry.height + CLAIM_FREQUENCY) {
                     System.err.printf("[BlockProcessor] Invalid CLAIM for name '%s' at height %d -- "
-                            + "re-claim before CLAIM_FREQUENCY (%d) has elapsed since %d -- "
-                            + "skipping, not applying%n",
+                                    + "re-claim before CLAIM_FREQUENCY (%d) has elapsed since %d -- "
+                                    + "skipping, not applying%n",
                             entry.name, height, CLAIM_FREQUENCY, entry.height);
                     return;
                 }
@@ -914,7 +970,7 @@ public class BlockProcessor {
                 // this check.
                 if (state != 0 || entry.height != height) {
                     System.err.printf("[BlockProcessor] Invalid OPEN for name '%s' at height %d "
-                            + "(state=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, entry.height);
                     return;
                 }
@@ -929,7 +985,7 @@ public class BlockProcessor {
             case COV_BID -> {
                 if (state != 1 || start != entry.height) {
                     System.err.printf("[BlockProcessor] Invalid BID for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -937,7 +993,7 @@ public class BlockProcessor {
             case COV_REVEAL -> {
                 if (start != entry.height || state != 2) {
                     System.err.printf("[BlockProcessor] Invalid REVEAL for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -968,7 +1024,7 @@ public class BlockProcessor {
                         && spentInput.prevIndex == entry.ownerIndex;
                 if (start != entry.height || (state != 3 && state != 4) || spentIsWinner) {
                     System.err.printf("[BlockProcessor] Invalid REDEEM for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d, spentIsWinner=%s) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d, spentIsWinner=%s) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, spentIsWinner);
                     return;
                 }
@@ -976,7 +1032,7 @@ public class BlockProcessor {
             case COV_REGISTER -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid REGISTER for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -984,7 +1040,7 @@ public class BlockProcessor {
             case COV_UPDATE -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid UPDATE for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -1000,7 +1056,7 @@ public class BlockProcessor {
                 if (start != entry.height || state != 3
                         || height < entry.renewal + TREE_INTERVAL_CONST) {
                     System.err.printf("[BlockProcessor] Invalid RENEW for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d, entry.renewal=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d, entry.renewal=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, entry.renewal);
                     return;
                 }
@@ -1008,7 +1064,7 @@ public class BlockProcessor {
             case COV_TRANSFER -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid TRANSFER for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }
@@ -1021,7 +1077,7 @@ public class BlockProcessor {
                 if (start != entry.height || state != 3
                         || height < entry.transfer + TRANSFER_LOCKUP) {
                     System.err.printf("[BlockProcessor] Invalid FINALIZE for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d, entry.transfer=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d, entry.transfer=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height, entry.transfer);
                     return;
                 }
@@ -1029,7 +1085,7 @@ public class BlockProcessor {
             case COV_REVOKE -> {
                 if (start != entry.height || state != 3) {
                     System.err.printf("[BlockProcessor] Invalid REVOKE for name '%s' at height %d "
-                            + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
+                                    + "(state=%d, start=%d, entry.height=%d) -- skipping, not applying%n",
                             entry.name, height, state, start, entry.height);
                     return;
                 }

@@ -90,6 +90,11 @@ public final class WebAdminServerContent {
                                     RPC host
                                     <input type="text" name="rpc.host">
                                 </label>
+                                <label>
+                                    Mining reward address (hs1...)
+                                    <input type="text" name="miner.address" placeholder="Leave empty to disable mining" spellcheck="false">
+                                </label>
+                                <p class="hint">Miners that connect to this node (getwork) are paid to this address. Applies immediately; no restart needed.</p>
                                 <button type="submit">Save</button>
                             </form>
                             <p id="config-message"></p>
@@ -359,6 +364,86 @@ public final class WebAdminServerContent {
                 {name:"command (add/remove/onetry)", type:"string", required:true}
               ]},
               "clearbanned": { params: [] },
+              "compacttree": { params: [] },
+              "reconstructtree": { params: [] },
+              "resetrootcache": { params: [] },
+              "decoderesource": { params: [
+                {name:"hex", type:"string", required:true}
+              ]},
+              "validateresource": { params: [
+                {name:"resource", type:"json", required:true}
+              ]},
+              "estimatepriority": { params: [
+                {name:"nblocks", type:"number", required:true}
+              ]},
+              "estimatesmartpriority": { params: [
+                {name:"nblocks", type:"number", required:true}
+              ]},
+              "generate": { params: [
+                {name:"numblocks", type:"number", required:true},
+                {name:"maxtries", type:"number", required:false}
+              ]},
+              "generatetoaddress": { params: [
+                {name:"numblocks", type:"number", required:true},
+                {name:"address", type:"string", required:true},
+                {name:"maxtries", type:"number", required:false}
+              ]},
+              "getdnssecproof": { params: [
+                {name:"name", type:"string", required:true},
+                {name:"estimate", type:"boolean", required:false},
+                {name:"verbose", type:"boolean", required:false}
+              ]},
+              "getgenerate": { params: [] },
+              "getmininginfo": { params: [] },
+              "getmineraddress": { params: [] },
+              "setmineraddress": { params: [
+                {name:"address", type:"string", required:true}
+              ]},
+              "getnetworkhashps": { params: [
+                {name:"blocks", type:"number", required:false},
+                {name:"height", type:"number", required:false}
+              ]},
+              "getwork": { params: [] },
+              "getworklp": { params: [] },
+              "grindname": { params: [
+                {name:"size", type:"number", required:false}
+              ]},
+              "invalidateblock": { params: [
+                {name:"hash", type:"string", required:true}
+              ]},
+              "reconsiderblock": { params: [
+                {name:"hash", type:"string", required:true}
+              ]},
+              "sendrawairdrop": { params: [
+                {name:"base64-string", type:"string", required:true}
+              ]},
+              "sendrawclaim": { params: [
+                {name:"base64-string", type:"string", required:true}
+              ]},
+              "setgenerate": { params: [
+                {name:"mine", type:"boolean", required:true},
+                {name:"proclimit", type:"number", required:false}
+              ]},
+              "setloglevel": { params: [
+                {name:"level", type:"string", required:true}
+              ]},
+              "setmocktime": { params: [
+                {name:"timestamp", type:"number", required:true}
+              ]},
+              "signrawtransaction": { params: [
+                {name:"hexstring", type:"string", required:true},
+                {name:"prevtxs", type:"json", required:false},
+                {name:"privkeys", type:"json", required:false},
+                {name:"sighashtype", type:"string", required:false}
+              ]},
+              "submitwork": { params: [
+                {name:"data", type:"string", required:true},
+                {name:"mask", type:"string", required:false}
+              ]},
+              "verifychain": { params: [
+                {name:"checklevel", type:"number", required:true},
+                {name:"numblocks", type:"number", required:true}
+              ]},
               "createmultisig": { params: [
                 {name:"nrequired", type:"number", required:true},
                 {name:"pubkeys", type:"json", required:true}
@@ -405,7 +490,7 @@ public final class WebAdminServerContent {
               "getchaintips": { params: [] },
               "getconnectioncount": { params: [] },
               "getblocktemplate": { params: [
-                {name:"address", type:"string", required:true}
+                {name:"request (mode/address/data/longpollid)", type:"json", required:false}
               ]},
               "getdifficulty": { params: [] },
               "getinfo": { params: [] },
@@ -834,6 +919,7 @@ public final class WebAdminServerContent {
                     const res = await fetch("/api/config");
                     const data = await res.json();
                     form.elements["rpc.host"].value = data["rpc.host"];
+                    form.elements["miner.address"].value = data["miner.address"] || "";
                 } catch (e) {
                     document.getElementById("config-message").textContent = "Failed to load current configuration.";
                     document.getElementById("config-message").className = "error";
@@ -848,7 +934,8 @@ public final class WebAdminServerContent {
                 message.className = "";
 
                 const payload = {
-                    "rpc.host": form.elements["rpc.host"].value
+                    "rpc.host": form.elements["rpc.host"].value,
+                    "miner.address": form.elements["miner.address"].value
                 };
 
                 try {

@@ -1,6 +1,7 @@
 package handshake.node.server;
 
 import handshake.node.util.HexUtil;
+import handshake.node.util.NodeClock;
 import handshake.node.util.JsonUtil;
 
 import handshake.node.crypto.Blake2b;
@@ -11,6 +12,9 @@ import handshake.node.crypto.Secp256k1;
 import handshake.node.crypto.MerkleUtil;
 
 import handshake.node.storage.ChainDB;
+import handshake.node.storage.IndexStore;
+import handshake.node.chain.HandshakeCovenantRules;
+import handshake.node.chain.ReservedNames;
 
 import handshake.node.urkeltree.UrkelNameHash;
 import handshake.node.urkeltree.UrkelProof;
@@ -23,6 +27,7 @@ import handshake.node.chain.ChainSync;
 import handshake.node.chain.BlockTemplates;
 import handshake.node.chain.HeaderUtil;
 import handshake.node.chain.Mempool;
+import handshake.node.chain.P2pMessages;
 import handshake.node.NodeConfig;
 import handshake.node.chain.TxParser;
 import handshake.node.chain.TxVerify;
@@ -149,10 +154,17 @@ public class RpcServer {
 
             String method = ex.getRequestMethod();
 
-            if ("POST".equals(method)) {
+            String path = ex.getRequestURI().getPath();
+            if ("POST".equals(method) && !RestApi.isRestPath(method, path)) {
                 handleRpc(ex);
+            } else if ("GET".equals(method) || "POST".equals(method)) {
+                handleRest(ex, method, path);
+            } else if ("OPTIONS".equals(method)) {
+                ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+                ex.sendResponseHeaders(204, -1);
             } else {
-                respond(ex, 404, "{\"error\":\"Not found\"}");
+                respond(ex, 404, "");
             }
         } catch (Exception e) {
             System.err.println("[RPC] Handler error: " + e.getMessage());
@@ -160,6 +172,29 @@ public class RpcServer {
         } finally {
             ex.close();
         }
+    }
+
+    private volatile RestApi rest;
+
+    private RestApi rest() {
+        RestApi r = rest;
+        if (r == null) {
+            synchronized (this) {
+                if (rest == null) rest = new RestApi(db, mempool, chainSync, config);
+                r = rest;
+            }
+        }
+        return r;
+    }
+
+    private void handleRest(HttpExchange ex, String method, String path) throws IOException {
+        requestCount.incrementAndGet();
+        String body = "POST".equals(method)
+                ? new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8) : "";
+        RestApi.Response r;
+        if ("POST".equals(method) && path.equals("/reset")) r = restReset(body);
+        else r = rest().handle(method, path, ex.getRequestURI().getRawQuery(), body);
+        respond(ex, r.status(), r.body());
     }
 
     private void handleRpc(HttpExchange ex) throws IOException {
@@ -262,7 +297,15 @@ public class RpcServer {
             "getconnectioncount",
             "getdifficulty",
             "getinfo",
+            "generate",
+            "generatetoaddress",
+            "getgenerate",
             "getmemoryinfo",
+            "getmininginfo",
+            "getmineraddress",
+            "getnetworkhashps",
+            "getwork",
+            "getworklp",
             "getmempoolancestors",
             "getmempooldescendants",
             "getmempoolentry",
@@ -287,9 +330,29 @@ public class RpcServer {
             "pruneblockchain",
             "sendrawtransaction",
             "setban",
+            "setmocktime",
+            "compacttree",
+            "decoderesource",
+            "estimatepriority",
+            "estimatesmartpriority",
+            "getdnssecproof",
+            "grindname",
+            "invalidateblock",
+            "reconsiderblock",
+            "reconstructtree",
+            "resetrootcache",
+            "sendrawairdrop",
+            "sendrawclaim",
+            "setloglevel",
+            "setmineraddress",
+            "signrawtransaction",
+            "validateresource",
+            "verifychain",
+            "setgenerate",
             "signmessagewithprivkey",
             "stop",
             "submitblock",
+            "submitwork",
             "validateaddress",
             "verifyblock",
             "verifymessage",
@@ -314,6 +377,36 @@ public class RpcServer {
             case "getdifficulty"      -> getDifficulty();
             case "getchaintips"       -> getChainTips();
             case "verifyblock"        -> verifyBlock(params);
+
+            // Mining
+            case "getwork"            -> mining().getWork();
+            case "getworklp"          -> mining().getWorkLongpoll();
+            case "submitwork"         -> submitWork(params);
+            case "getmininginfo"      -> mining().getMiningInfo(this);
+            case "getnetworkhashps"   -> getNetworkHashPS(params);
+            case "setmocktime"        -> setMockTime(params);
+            case "compacttree"        -> noArgsNull(params, "compacttree");
+            case "reconstructtree"    -> noArgsNull(params, "reconstructtree");
+            case "resetrootcache"     -> noArgsNull(params, "resetrootcache");
+            case "verifychain"        -> verifyChain(params);
+            case "estimatepriority"   -> estimatePriority(params, false);
+            case "estimatesmartpriority" -> estimatePriority(params, true);
+            case "invalidateblock"    -> invalidateBlock(params, true);
+            case "reconsiderblock"    -> invalidateBlock(params, false);
+            case "decoderesource"     -> decodeResource(params);
+            case "validateresource"   -> validateResource(params);
+            case "getdnssecproof"     -> throw new RpcException(-1, "DNSSEC proofs need a recursive resolver, which this node does not include.");
+            case "sendrawclaim"       -> throw new RpcException(-1, "This node keeps no claim pool; claims are not supported.");
+            case "sendrawairdrop"     -> throw new RpcException(-1, "This node keeps no airdrop pool; airdrop proofs are not supported.");
+            case "grindname"          -> grindName(params);
+            case "setloglevel"        -> setLogLevel(params);
+            case "getmineraddress"    -> jsonString(config.getMinerAddress());
+            case "setmineraddress"    -> setMinerAddress(params);
+            case "signrawtransaction" -> signRawTransaction(params);
+            case "getgenerate"        -> String.valueOf(mining().isGenerating());
+            case "setgenerate"        -> setGenerate(params);
+            case "generate"           -> generate(params);
+            case "generatetoaddress"  -> generateToAddress(params);
 
             // Transactions
             case "getrawtransaction"    -> getRawTransaction(params);
@@ -371,6 +464,76 @@ public class RpcServer {
         };
     }
 
+    // ── Mining RPCs (see MiningService) ───────────────────────────────────────
+
+    private MiningService miningService;
+
+    private synchronized MiningService mining() throws RpcException {
+        if (chainSync == null) throw new RpcException(-1, "Node not ready");
+        if (miningService == null) {
+            miningService = new MiningService(config, db, chainSync, mempool);
+            addBlockListener(miningService);
+        }
+        return miningService;
+    }
+
+    private String submitWork(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.isEmpty() || pl.size() > 2) throw new RpcException(-1, "submitwork ( \"data\" \"mask\" )");
+        byte[] data, mask = new byte[32];
+        try { data = fromHex(pl.get(0).trim()); } catch (Exception e) { throw new RpcException(-3, "Invalid work data."); }
+        if (pl.size() == 2) {
+            try { mask = fromHex(pl.get(1).trim()); } catch (Exception e) { throw new RpcException(-3, "Invalid mask."); }
+            if (mask.length != 32) throw new RpcException(-3, "Invalid mask.");
+        }
+        return mining().submitWork(data, mask);
+    }
+
+    private String getNetworkHashPS(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() > 2) throw new RpcException(-1, "getnetworkhashps ( blocks height )");
+        int lookup = pl.size() > 0 ? parseIntParam(params, 0) : 120;
+        int height = pl.size() > 1 ? parseIntParam(params, 1) : -1;
+        if (lookup < 0 || (pl.size() > 1 && height < 0)) throw new RpcException(-8, "Invalid parameter.");
+        return number(mining().getHashRate(lookup, height));
+    }
+
+    private String setMockTime(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() != 1) throw new RpcException(-1, "setmocktime timestamp");
+        long ts;
+        try { ts = Long.parseLong(parseStringParam(params, 0).trim()); } catch (Exception e) { throw new RpcException(-3, "Invalid timestamp."); }
+        if (ts < 0 || ts > 0xFFFFFFFFL) throw new RpcException(-3, "Invalid timestamp.");
+        NodeClock.setMockTime(ts);
+        return "null";
+    }
+
+    private String setGenerate(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.isEmpty() || pl.size() > 2) throw new RpcException(-1, "setgenerate mine ( proclimit )");
+        int limit = pl.size() > 1 ? parseIntParam(params, 1) : 0;
+        return mining().setGenerate(parseBoolParam(params, 0, false), Math.max(limit, 0));
+    }
+
+    private String generate(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.isEmpty() || pl.size() > 2) throw new RpcException(-1, "generate numblocks ( maxtries )");
+        int blocks = parseIntParam(params, 0);
+        long tries = pl.size() > 1 ? parseIntParam(params, 1) : 0;
+        if (blocks < 0) throw new RpcException(-8, "Invalid number of blocks.");
+        return mining().generate(blocks, null, tries);
+    }
+
+    private String generateToAddress(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() < 2 || pl.size() > 3) throw new RpcException(-1, "generatetoaddress numblocks address ( maxtries )");
+        int blocks = parseIntParam(params, 0);
+        String addr = parseStringParam(params, 1);
+        long tries = pl.size() > 2 ? parseIntParam(params, 2) : 0;
+        if (blocks < 0) throw new RpcException(-8, "Invalid number of blocks.");
+        return mining().generate(blocks, addr, tries);
+    }
+
     // ── RPC method implementations ────────────────────────────────────────────
 
     private String getBlockCount() {
@@ -386,9 +549,8 @@ public class RpcServer {
 
     private String getBlockHash(String params) throws RpcException {
         int height = parseIntParam(params, 0);
-        byte[] header = db.getHeader(height);
-        if (header == null) throw new RpcException(-5,
-                "Block not found at height " + height);
+        byte[] header = height < 0 || height > db.getBlockTip() ? null : db.getHeader(height);
+        if (header == null) throw new RpcException(-8, "Block height out of range.");
         return "\"" + hex(HeaderUtil.hash(header)) + "\"";
     }
 
@@ -404,42 +566,70 @@ public class RpcServer {
 
     private String getBlock(String params) throws RpcException {
         String hashOrHeight = parseStringParam(params, 0);
-        int height = resolveHeight(hashOrHeight);
+        if (hashOrHeight == null || !(hashOrHeight.matches("[0-9a-fA-F]{64}") || hashOrHeight.matches("\\d{1,9}")))
+            throw new RpcException(-3, "Param #0 must be a hash.");
+        int height;
+        try { height = resolveHeight(hashOrHeight); }
+        catch (RpcException e) { throw new RpcException(-1, "Block not found."); }
+        if (height > db.getBlockTip()) throw new RpcException(-1, "Block not found.");
         byte[] rawBlock = db.getBlock(height);
         if (rawBlock == null) throw new RpcException(-5,
                 "Block not found: " + hashOrHeight);
         boolean verbose = parseBoolParam(params, 1, true);
         if (!verbose) return "\"" + hex(rawBlock) + "\"";
-        return blockToJson(rawBlock, height);
+        return blockToJson(rawBlock, height, parseBoolParam(params, 2, false));
     }
 
     private String getRawTransaction(String params) throws RpcException {
         String txid = parseStringParam(params, 0);
+        if (txid == null || !txid.matches("[0-9a-fA-F]{64}")) throw new RpcException(-3, "Param #0 must be a hash.");
         boolean verbose = parseBoolParam(params, 1, false);
         byte[] raw = null;
-        // Search mempool first
+        String blockHash = null;
+        long blockTime = 0, mtime = 0;
+        int height = -1;
         if (mempool != null) {
             raw = mempool.getRaw(txid);
+            Mempool.MempoolEntry me = raw == null ? null : mempool.getEntry(txid);
+            if (me != null) mtime = me.addedAt / 1000;
         }
         if (raw == null) {
-            if (!config.indexTx()) throw new RpcException(-5,
-                    "No tx index — enable index.tx in validator.conf");
-            throw new RpcException(-5, "Transaction not found: " + txid);
+            try {
+                ChainJson cj = new ChainJson(db, mempool);
+                byte[] id = fromHex(txid);
+                IndexStore.TxLoc loc = cj.locate(id);
+                TxParser.ParsedTx t = loc == null ? null : cj.txAt(loc, id);
+                if (t != null && loc.height() <= db.getBlockTip()) {
+                    raw = t.raw;
+                    height = loc.height();
+                    byte[] hd = db.getHeader(height);
+                    blockHash = hex(HeaderUtil.hash(hd));
+                    blockTime = HeaderUtil.time(hd);
+                    mtime = blockTime;
+                }
+            } catch (RuntimeException ignored) { }
+        }
+        if (raw == null) {
+            if (db.index() == null) throw new RpcException(-5, "No tx index is available.");
+            throw new RpcException(-5, "Transaction not found.");
         }
         if (!verbose) return "\"" + hex(raw) + "\"";
         TxParser.ParsedTx tx = TxParser.parse(raw);
         if (tx == null) throw new RpcException(-22, "Failed to parse transaction");
-        return txToJson(tx, raw);
+        String j = rpcTx(tx, blockHash, blockTime, height);
+        // hsd: time = when the node first saw it, blocktime = the block's; hex appended last
+        if (blockHash != null || mtime != 0) j = j.replaceFirst("\"time\":\\d+,", "\"time\":" + mtime + ",");
+        return j.substring(0, j.length() - 1) + ",\"hex\":\"" + hex(raw) + "\"}";
     }
 
     private String decodeRawTransaction(String params) throws RpcException {
         String hexTx = parseStringParam(params, 0);
-        if (hexTx == null || hexTx.isEmpty())
-            throw new RpcException(-22, "Missing raw transaction");
-        byte[] raw = fromHex(hexTx);
+        byte[] raw;
+        try { raw = fromHex(hexTx == null ? "" : hexTx); } catch (RuntimeException e) { throw new RpcException(-3, "Param #0 must be a hex string."); }
+        if (raw.length == 0) throw new RpcException(-3, "Param #0 must be a hex string.");
         TxParser.ParsedTx tx = TxParser.parse(raw);
         if (tx == null) throw new RpcException(-22, "TX decode failed");
-        return txToJson(tx, raw);
+        return rpcTx(tx, null, 0, -1);
     }
 
     /** Shared by getrawtransaction (verbose) and decoderawtransaction. */
@@ -523,17 +713,48 @@ public class RpcServer {
             throw new RpcException(-22, "Missing raw transaction");
         byte[] raw = fromHex(hexTx);
         if (mempool == null) throw new RpcException(-1, "Mempool not ready");
-        String txid = mempool.submit(raw);
-        if (txid == null) throw new RpcException(-26, "Transaction rejected");
-        return "\"" + txid + "\"";
+        try {
+            return "\"" + mempool.submitOrThrow(raw) + "\"";
+        } catch (Mempool.VerifyException e) {
+            throw new RpcException(-26, e.reason);
+        } catch (RuntimeException e) {
+            throw new RpcException(-22, "TX decode failed");
+        }
     }
 
     private String getTxOut(String params) throws RpcException {
-        String txid  = parseStringParam(params, 0);
-        int index    = parseIntParam(params, 1);
+        String txid = parseStringParam(params, 0);
+        if (txid == null || !txid.matches("[0-9a-fA-F]{64}")) throw new RpcException(-3, "Invalid outpoint.");
+        int index;
+        try { index = parseIntParam(params, 1); } catch (RpcException e) { throw new RpcException(-3, "Invalid outpoint."); }
+        if (index < 0) throw new RpcException(-3, "Invalid outpoint.");
+        boolean includeMempool = parseBoolParam(params, 2, true);
+        txid = txid.toLowerCase();
+        byte[] id = fromHex(txid);
+        if (includeMempool && mempool != null) {
+            byte[] mraw = mempool.getRaw(txid);
+            if (mraw != null) {
+                TxParser.ParsedTx t = TxParser.parse(mraw);
+                if (t == null || index >= t.outputs.size()) return "null";
+                for (Mempool.MempoolEntry e : mempool.getAll()) {
+                    TxParser.ParsedTx o = TxParser.parse(e.raw);
+                    if (o == null) continue;
+                    for (TxParser.Input in : o.inputs)
+                        if (in.prevIndex == index && Arrays.equals(in.prevHash, id)) return "null";
+                }
+                TxParser.Output out = t.outputs.get(index);
+                return coinOutJson(out.value, out.addrVersion, out.addrHash, t.version, false, -1);
+            }
+            for (Mempool.MempoolEntry e : mempool.getAll()) {   // a chain coin already spent in the mempool is gone
+                TxParser.ParsedTx o = TxParser.parse(e.raw);
+                if (o == null) continue;
+                for (TxParser.Input in : o.inputs)
+                    if (in.prevIndex == index && Arrays.equals(in.prevHash, id)) return "null";
+            }
+        }
         ChainDB.UtxoEntry utxo = db.getUtxo(txid, index);
         if (utxo == null) return "null";
-        return utxoToJson(utxo);
+        return coinOutJson(utxo.value(), utxo.addrVersion(), utxo.addrHash(), 0, utxo.coinbase(), utxo.height());
     }
 
     private String getRawMempool(String params) throws RpcException {
@@ -806,20 +1027,33 @@ public class RpcServer {
 
     private String getNameByHash(String params) throws RpcException {
         String hashHex = parseStringParam(params, 0);
-        ChainDB.NameEntry entry = db.getNameByHash(hashHex);
-        if (entry == null) throw new RpcException(-5, "Name not found");
+        if (hashHex == null || !hashHex.matches("[0-9a-fA-F]{64}")) throw new RpcException(-3, "Invalid name hash.");
+        ChainDB.NameEntry entry = db.getNameByHash(hashHex.toLowerCase());
+        if (entry == null) return "null";   // hsd answers null for an unknown name
         return "\"" + entry.name + "\"";
     }
 
     private String getInfo() {
         int tip = db.getBlockTip();
+        byte[] th = tip >= 0 ? db.getHeader(tip) : null;
         int peers = chainSync != null ? chainSync.getConnectedPeerCount() : 0;
+        boolean main = "main".equals(BlockProcessor.params.type);
         return "{"
-                + "\"version\":\"1.0.0\","
+                + "\"version\":\"" + NodeConfig.VERSION + "\","
                 + "\"protocolversion\":3,"
+                + "\"walletversion\":0,"
+                + "\"balance\":0,"
                 + "\"blocks\":" + tip + ","
+                + "\"timeoffset\":" + NodeClock.offsetSec() + ","
                 + "\"connections\":" + peers + ","
-                + "\"testnet\":" + !config.isMainnet() + ","
+                + "\"proxy\":\"\","
+                + "\"difficulty\":" + (th != null ? number(toDifficulty(HeaderUtil.bits(th))) : "0") + ","
+                + "\"testnet\":" + !main + ","
+                + "\"keypoololdest\":0,"
+                + "\"keypoolsize\":0,"
+                + "\"unlocked_until\":0,"
+                + "\"paytxfee\":" + (main ? "0.1" : "0.02") + ","
+                + "\"relayfee\":" + coinAmount(mempool != null ? mempool.getMinRelayFee() : 1000) + ","
                 + "\"errors\":\"\""
                 + "}";
     }
@@ -939,31 +1173,47 @@ public class RpcServer {
      * that as "no soft-forks defined" rather than "not tracked".
      */
     private String getBlockchainInfo() {
-        int tip = db.getHeaderTip();
+        int tip = db.getBlockTip();
         byte[] tipHeader = tip >= 0 ? db.getHeader(tip) : null;
         BigInteger work = tip >= 0 ? db.getChainwork(tip) : null;
-        int chainPeerHeight = chainSync != null ? chainSync.getBestKnownPeerHeight() : tip;
-        double progress = chainPeerHeight > 0 ? Math.min(1.0, (double) tip / chainPeerHeight) : 1.0;
+        double progress = 0;
+        byte[] g = db.getHeader(0);
+        if (tipHeader != null && g != null) {
+            double end = NodeClock.nowSec() - HeaderUtil.time(g) - 40 * 60;
+            progress = end <= 0 ? 1 : Math.min(1.0, (HeaderUtil.time(tipHeader) - HeaderUtil.time(g)) / end);
+        }
+        String type = BlockProcessor.params.type;
+        // softforks: this node applies the rule changes by height, it does not track BIP9 deployment state
         return "{"
-                + "\"chain\":\"" + config.getNetwork() + "\","
-                + "\"blocks\":" + db.getBlockTip() + ","
+                + "\"chain\":\"" + ("testnet".equals(type) ? "test" : type) + "\","
+                + "\"blocks\":" + tip + ","
                 + "\"headers\":" + tip + ","
                 + "\"bestblockhash\":\"" + (tipHeader != null ? hex(HeaderUtil.hash(tipHeader)) : "") + "\","
-                + "\"treeRoot\":\"" + (tipHeader != null ? hex(HeaderUtil.treeRoot(tipHeader)) : "") + "\","
-                + "\"difficulty\":" + (tipHeader != null ? toDifficulty(HeaderUtil.bits(tipHeader)) : 0) + ","
+                + "\"treeroot\":\"" + (tipHeader != null ? hex(HeaderUtil.treeRoot(tipHeader)) : "") + "\","
+                + "\"difficulty\":" + (tipHeader != null ? number(toDifficulty(HeaderUtil.bits(tipHeader))) : "0") + ","
                 + "\"mediantime\":" + (tip >= 0 ? computeMedianTime(tip) : 0) + ","
-                + "\"verificationprogress\":" + progress + ","
-                + "\"chainwork\":\"" + (work != null ? work.toString(16) : "00") + "\","
+                + "\"verificationprogress\":" + number(progress) + ","
+                + "\"chainwork\":\"" + chainwork64(work) + "\","
                 + "\"pruned\":false,"
+                + "\"softforks\":{},"
+                + "\"deflationary\":" + (tip >= BlockProcessor.params.deflationHeight) + ","
                 + "\"pruneheight\":null"
                 + "}";
     }
-
 
     private String getDifficulty() {
         int tip = db.getHeaderTip();
         byte[] tipHeader = tip >= 0 ? db.getHeader(tip) : null;
         return String.valueOf(tipHeader != null ? toDifficulty(HeaderUtil.bits(tipHeader)) : 0);
+    }
+
+    static double difficultyOf(int bits) { return toDifficulty(bits); }
+
+    /** JSON number text the way JS prints it: integers without a fraction, no NaN/Infinity. */
+    static String number(double d) {
+        if (Double.isNaN(d) || Double.isInfinite(d)) return "0";
+        if (d == Math.rint(d) && Math.abs(d) < 1e15) return String.valueOf((long) d);
+        return String.valueOf(d);
     }
 
     /** Matches real hsd's toDifficulty() exactly (lib/validator/rpc.js). */
@@ -1004,67 +1254,100 @@ public class RpcServer {
      * header (treeroot, reservedroot, merkleroot, witnessroot, bits, target)
      * and the finished coinbase transaction.
      */
+    /**
+     * getblocktemplate, following hsd's rpc.js: optional request object ({mode, data, capabilities, rules,
+     * maxversion, longpollid}); "proposal" mode judges a block on everything but proof of work; the template is
+     * the shared one getwork uses (reward address from {@code miner.address}). Extensions this node keeps:
+     * a reward {@code address} in the request (builds a private template for that address), and the
+     * coinbase transaction and ready-made 236-byte header are always included.
+     */
     private String getBlockTemplate(String params) throws RpcException {
         if (chainSync == null) throw new RpcException(-1, "Node not ready");
         String addr = null;
-        String flags = "easy-handshake";
+        String flags = null;
+        String mode = "template";
+        String proposalData = null;
+        String longpollId = null;
         List<String> pl = parseParamList(params);
+        if (pl.size() > 1) throw new RpcException(-1, "getblocktemplate ( \"jsonrequestobject\" )");
         if (!pl.isEmpty()) {
             String f = pl.get(0).trim();
             if (f.startsWith("{")) {
                 java.util.LinkedHashMap<String, String> o = parseObjectParam(params, 0);
                 addr = unquote(o.get("address"));
-                String cf = unquote(o.get("coinbaseflags"));
-                if (cf != null) flags = cf;
+                flags = unquote(o.get("coinbaseflags"));
+                if (o.get("mode") != null) mode = unquote(o.get("mode"));
+                proposalData = unquote(o.get("data"));
+                longpollId = unquote(o.get("longpollid"));
             } else {
                 addr = unquote(f);
             }
         }
-        if (addr == null || addr.isEmpty())
-            throw new RpcException(-8, "getblocktemplate {\"address\":\"hs1...\"} -- a reward address is required");
+        if (!mode.equals("template") && !mode.equals("proposal")) throw new RpcException(-8, "Invalid mode.");
 
-        int addrVersion;
-        byte[] addrHash;
-        try {
-            Object[] d = Bech32.decode(addr);
-            if (!"hs".equals(d[0])) throw new RpcException(-5, "Not a mainnet (hs1...) address");
-            addrVersion = (int) d[1];
-            addrHash = (byte[]) d[2];
-            if (addrVersion != 0 || (addrHash.length != 20 && addrHash.length != 32))
-                throw new RpcException(-5, "Unsupported reward address type");
-        } catch (RpcException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new RpcException(-5, "Invalid address");
+        if (mode.equals("proposal")) {
+            if (proposalData == null) throw new RpcException(-3, "Missing data parameter.");
+            byte[] raw;
+            try { raw = fromHex(proposalData); } catch (Exception e) { throw new RpcException(-22, "Block decode failed"); }
+            String r = BlockTemplates.checkBlock(db, mempool, raw, NodeClock.nowSec(),
+                    chainSync.getPowParams(), false);
+            return r == null ? "null" : "\"" + escape(r) + "\"";
         }
-
-        byte[] flagBytes = flags.getBytes(StandardCharsets.UTF_8);
-        if (flagBytes.length > 100) throw new RpcException(-8, "coinbaseflags too long");
 
         int tipH = db.getBlockTip();
         if (tipH < 0 || db.getHeaderTip() != tipH)
             throw new RpcException(-10, "Node is still syncing");
         byte[] tipHeader = db.getHeader(tipH);
         if (tipHeader == null) throw new RpcException(-10, "Node is still syncing");
-        long now = System.currentTimeMillis() / 1000;
+        long now = NodeClock.nowSec();
         if (now - HeaderUtil.time(tipHeader) > 6 * 3600)
             throw new RpcException(-10, "Chain tip is more than 6 hours old -- node is not caught up");
         if (chainSync.getConnectedPeerCount() == 0)
             throw new RpcException(-9, "Node is not connected to any peers");
 
-        BlockTemplates.Template t;
-        try {
-            t = BlockTemplates.build(db, addrVersion, addrHash, flagBytes, now, BlockTemplates.Params.MAINNET);
-        } catch (Exception e) {
-            throw new RpcException(-1, "Could not build template: " + e.getMessage());
+        if (longpollId != null && !longpollId.isEmpty()) {
+            if (longpollId.length() != 72) throw new RpcException(-8, "Invalid longpoll ID.");
+            byte[] watched;
+            try {
+                watched = fromHex(longpollId.substring(0, 64));
+                Long.parseLong(longpollId.substring(64), 16);
+            } catch (Exception e) { throw new RpcException(-8, "Invalid longpoll ID."); }
+            if (Arrays.equals(watched, HeaderUtil.hash(tipHeader))) mining().awaitChange(watched);
+            tipH = db.getBlockTip();
+            tipHeader = db.getHeader(tipH);
+            now = NodeClock.nowSec();
         }
-        byte[] target = new byte[32];
-        byte[] tb = HeaderUtil.targetFromBits(t.bits).toByteArray();
-        for (int i = 0; i < tb.length && i < 32; i++) target[31 - i] = tb[tb.length - 1 - i];
+
+        BlockTemplates.Template t;
+        if (addr != null && !addr.isEmpty()) {
+            Object[] a = MiningService.decodeAddress(addr);
+            byte[] flagBytes = (flags != null ? flags : config.getMinerCoinbaseFlags()).getBytes(StandardCharsets.UTF_8);
+            if (flagBytes.length > 100) throw new RpcException(-8, "coinbaseflags too long");
+            try {
+                t = BlockTemplates.build(db, mempool, (int) a[0], (byte[]) a[1], flagBytes, now, chainSync.getPowParams());
+            } catch (Exception e) {
+                throw new RpcException(-1, "Could not build template: " + e.getMessage());
+            }
+        } else {
+            t = mining().updateWork();
+        }
+        byte[] target = MiningService.targetBytes(t.bits);
+
+        StringBuilder txs = new StringBuilder("[");
+        for (int i = 0; i < t.txs.size(); i++) {
+            BlockTemplates.Included it = t.txs.get(i);
+            if (i > 0) txs.append(',');
+            txs.append("{\"data\":\"").append(hex(it.raw)).append("\",\"txid\":\"").append(hex(it.txid))
+                    .append("\",\"hash\":\"").append(hex(it.wtxid)).append("\",\"depends\":").append(it.depends.toString().replace(" ", ""))
+                    .append(",\"fee\":").append(it.fee).append(",\"sigops\":0,\"weight\":").append(it.weight).append('}');
+        }
+        txs.append(']');
+        String flagsHex = hex((flags != null ? flags : config.getMinerCoinbaseFlags()).getBytes(StandardCharsets.UTF_8));
+        int pooled = mempool == null ? 0 : mempool.size();
 
         return "{"
                 + "\"capabilities\":[\"proposal\"],"
-                + "\"mutable\":[\"time\"],"
+                + "\"mutable\":[\"time\",\"transactions\",\"prevblock\"],"
                 + "\"version\":" + t.version + ","
                 + "\"rules\":[],"
                 + "\"vbavailable\":{},"
@@ -1081,24 +1364,25 @@ public class RpcServer {
                 + "\"noncerange\":\"00000000ffffffff\","
                 + "\"curtime\":" + t.curTime + ","
                 + "\"mintime\":" + t.minTime + ","
-                + "\"maxtime\":" + t.maxTime + ","
-                + "\"expires\":" + (t.curTime + 600) + ","
+                + "\"maxtime\":" + (t.curTime + 7200) + ","
+                + "\"expires\":" + (t.curTime + 7200) + ","
+                + "\"sigoplimit\":80000,"
                 + "\"sizelimit\":" + BlockTemplates.MAX_BLOCK_SIZE + ","
                 + "\"weightlimit\":" + BlockTemplates.MAX_BLOCK_WEIGHT + ","
+                + "\"longpollid\":\"" + hex(t.prevHash) + String.format("%08x", pooled) + "\","
+                + "\"submitold\":false,"
+                + "\"coinbaseaux\":{\"flags\":\"" + flagsHex + "\"},"
                 + "\"coinbasevalue\":" + t.coinbaseValue + ","
                 + "\"coinbasetxn\":{\"data\":\"" + hex(t.coinbase.raw) + "\","
-                + "\"hash\":\"" + hex(t.coinbase.txid) + "\","
-                + "\"witnesshash\":\"" + hex(t.coinbase.witnessHash) + "\"},"
-                + "\"transactions\":[],"
+                + "\"txid\":\"" + hex(t.coinbase.txid) + "\","
+                + "\"hash\":\"" + hex(t.coinbase.witnessHash) + "\","
+                + "\"depends\":[],\"fee\":0,\"sigops\":0,\"weight\":0},"
                 + "\"claims\":[],\"airdrops\":[],"
+                + "\"transactions\":" + txs + ","
                 + "\"header\":\"" + hex(t.header(0, t.curTime, new byte[24], new byte[32])) + "\""
                 + "}";
     }
 
-    /**
-     * submitblock "hexdata". BIP22 result: null when accepted, otherwise a
-     * short reason string ("high-hash", "bad-prevblk", "duplicate", ...).
-     */
     private String submitBlock(String params) throws RpcException {
         if (chainSync == null) throw new RpcException(-1, "Node not ready");
         String hexBlock = parseStringParam(params, 0);
@@ -1561,7 +1845,7 @@ public class RpcServer {
                 throw new RpcException(-22, "Invalid outpoint.");
             String txid = txidRaw.replace("\"", "");
             TxParser.Input in = new TxParser.Input();
-            in.prevHash = reverseHex(txid);
+            in.prevHash = HexUtil.decode(txid); // Handshake txids are not byte-reversed
             in.prevTxid = txid;
             in.prevIndex = Integer.parseInt(voutRaw.trim());
             String seqRaw = fields.get("sequence");
@@ -1730,7 +2014,7 @@ public class RpcServer {
                 "Block not found at height " + height);
         boolean verbose = parseBoolParam(params, 1, true);
         if (!verbose) return "\"" + hex(rawBlock) + "\"";
-        return blockToJson(rawBlock, height);
+        return blockToJson(rawBlock, height, parseBoolParam(params, 2, false));
     }
 
     /**
@@ -1821,8 +2105,8 @@ public class RpcServer {
     }
 
     private int getConfirmations(int height) {
-        int tip = db.getHeaderTip();
-        return tip >= height ? (tip - height + 1) : 0;
+        int tip = db.getBlockTip();
+        return tip >= height ? (tip - height + 1) : -1;
     }
 
     /**
@@ -1833,100 +2117,159 @@ public class RpcServer {
      * uses lowercase and omits them entirely -- a real, confirmed
      * difference, not an oversight on this project's part).
      */
-    private String headerToJson(byte[] header, int height) {
-        if (header == null || header.length < 236) return "null";
-        BigInteger work = db.getChainwork(height);
+    private static String hex32(long v) { return String.format("%08x", v & 0xFFFFFFFFL); }
+
+    private static String chainwork64(BigInteger w) {
+        String h = w == null ? "0" : w.toString(16);
+        return "0".repeat(Math.max(0, 64 - h.length())) + h;
+    }
+
+    /** hsd's Amount.coin(value, true): a plain number in HNS with up to 6 decimals, no trailing zeros. */
+    static String coinAmount(long dollarydoos) {
+        java.math.BigDecimal d = java.math.BigDecimal.valueOf(dollarydoos, 6);
+        return d.signum() == 0 ? "0" : d.stripTrailingZeros().toPlainString();
+    }
+
+    private String addrJson(int version, byte[] hash) {
+        return "{\"version\":" + version + ",\"hash\":\"" + hex(hash) + "\",\"string\":\""
+                + Bech32.encode(ChainJson.hrpFor(BlockProcessor.params.type), version, hash) + "\"}";
+    }
+
+    private String headerFieldsJson(byte[] header, int height, boolean block) {
         int bits = HeaderUtil.bits(header);
-        return "{"
-                + "\"hash\":\"" + hex(HeaderUtil.hash(header)) + "\","
-                + "\"confirmations\":" + getConfirmations(height) + ","
-                + "\"height\":" + height + ","
-                + "\"version\":" + HeaderUtil.version(header) + ","
-                + "\"versionHex\":\"" + String.format("%08x", HeaderUtil.version(header)) + "\","
+        boolean genesis = height == 0;
+        return "\"hash\":\"" + hex(HeaderUtil.hash(header)) + "\","
+                + "\"confirmations\":" + getConfirmations(height) + ",";
+    }
+
+    private String headerTailJson(byte[] header, int height) {
+        int bits = HeaderUtil.bits(header);
+        String prev = height == 0 ? "null" : "\"" + hex(HeaderUtil.prevBlock(header)) + "\"";
+        return "\"time\":" + HeaderUtil.time(header) + ","
+                + "\"mediantime\":" + computeMedianTime(height) + ","
+                + "\"nonce\":" + (HeaderUtil.nonce(header) & 0xFFFFFFFFL) + ","
+                + "\"extranonce\":\"" + hex(HeaderUtil.extraNonce(header)) + "\","
+                + "\"bits\":\"" + hex32(bits) + "\","
+                + "\"difficulty\":" + number(toDifficulty(bits)) + ","
+                + "\"chainwork\":\"" + chainwork64(db.getChainwork(height)) + "\"";
+    }
+
+    private String rootsJson(byte[] header) {
+        return "\"version\":" + (HeaderUtil.version(header) & 0xFFFFFFFFL) + ","
+                + "\"versionHex\":\"" + hex32(HeaderUtil.version(header)) + "\","
                 + "\"merkleroot\":\"" + hex(HeaderUtil.merkleRoot(header)) + "\","
                 + "\"witnessroot\":\"" + hex(HeaderUtil.witnessRoot(header)) + "\","
                 + "\"treeroot\":\"" + hex(HeaderUtil.treeRoot(header)) + "\","
                 + "\"reservedroot\":\"" + hex(HeaderUtil.reservedRoot(header)) + "\","
-                + "\"mask\":\"" + hex(HeaderUtil.mask(header)) + "\","
-                + "\"time\":" + HeaderUtil.time(header) + ","
-                + "\"mediantime\":" + computeMedianTime(height) + ","
-                + "\"bits\":" + bits + ","
-                + "\"difficulty\":" + toDifficulty(bits) + ","
-                + "\"chainwork\":\"" + (work != null ? work.toString(16) : "00") + "\","
-                + "\"previousblockhash\":\"" + hex(HeaderUtil.prevBlock(header)) + "\","
-                + "\"nextblockhash\":" + getNextBlockHashOrNull(height)
-                + "}";
+                + "\"mask\":\"" + hex(HeaderUtil.mask(header)) + "\",";
     }
 
-    /**
-     * Matches real hsd's getblock shape exactly -- a genuinely different
-     * shape from getblockheader (adds strippedsize/weight/coinbase/tx,
-     * also omits nonce/extraNonce), not just getblockheader plus a tx
-     * list as previously assumed.
-     */
-    private String blockToJson(byte[] rawBlock, int height) {
-        byte[] header = Arrays.copyOf(rawBlock, Math.min(236, rawBlock.length));
-        BigInteger work = db.getChainwork(height);
-        int bits = HeaderUtil.bits(header);
+    private String nextHashJson(int height) {
+        return "\"nextblockhash\":" + getNextBlockHashOrNull(height);
+    }
 
+    /** hsd's headerToJSON. */
+    private String headerToJson(byte[] header, int height) {
+        if (header == null || header.length < 236) return "null";
+        return "{" + headerFieldsJson(header, height, false)
+                + "\"height\":" + height + ","
+                + rootsJson(header)
+                + headerTailJson(header, height) + ","
+                + "\"previousblockhash\":" + (height == 0 ? "null" : "\"" + hex(HeaderUtil.prevBlock(header)) + "\"") + ","
+                + nextHashJson(height) + "}";
+    }
+
+    /** hsd's blockToJSON; {@code details} puts full transaction objects in "tx" instead of ids. */
+    private String blockToJson(byte[] rawBlock, int height, boolean details) {
+        byte[] header = Arrays.copyOf(rawBlock, Math.min(236, rawBlock.length));
         List<TxParser.ParsedTx> txs = BlockProcessor.parseBlockTxs(rawBlock);
-        int strippedSize = 236;
+        int count = txs.size();
+        int strippedSize = 236 + (count < 0xFD ? 1 : count <= 0xFFFF ? 3 : 5);
         for (TxParser.ParsedTx tx : txs) strippedSize += tx.baseSize;
-        int weight = strippedSize * 3 + rawBlock.length; // standard SegWit-style weight formula
+        long weight = (long) strippedSize * 3 + rawBlock.length;
+        String bh = hex(HeaderUtil.hash(header));
+        long btime = HeaderUtil.time(header);
 
         StringBuilder sb = new StringBuilder("{");
-        sb.append("\"hash\":\"").append(hex(HeaderUtil.hash(header))).append("\",");
-        sb.append("\"confirmations\":").append(getConfirmations(height)).append(",");
+        sb.append(headerFieldsJson(header, height, true));
         sb.append("\"strippedsize\":").append(strippedSize).append(",");
         sb.append("\"size\":").append(rawBlock.length).append(",");
         sb.append("\"weight\":").append(weight).append(",");
         sb.append("\"height\":").append(height).append(",");
-        sb.append("\"version\":").append(HeaderUtil.version(header)).append(",");
-        sb.append("\"versionHex\":\"").append(String.format("%08x", HeaderUtil.version(header))).append("\",");
-        sb.append("\"merkleroot\":\"").append(hex(HeaderUtil.merkleRoot(header))).append("\",");
-        sb.append("\"witnessroot\":\"").append(hex(HeaderUtil.witnessRoot(header))).append("\",");
-        sb.append("\"treeroot\":\"").append(hex(HeaderUtil.treeRoot(header))).append("\",");
-        sb.append("\"reservedroot\":\"").append(hex(HeaderUtil.reservedRoot(header))).append("\",");
-        sb.append("\"mask\":\"").append(hex(HeaderUtil.mask(header))).append("\",");
-
-        sb.append("\"coinbase\":[");
-        if (!txs.isEmpty() && !txs.get(0).inputs.isEmpty()) {
-            List<byte[]> witness = txs.get(0).inputs.get(0).witness;
-            for (int i = 0; i < witness.size(); i++) {
-                if (i > 0) sb.append(",");
-                sb.append("\"").append(hex(witness.get(i))).append("\"");
+        sb.append(rootsJson(header));
+        if (!details) {
+            sb.append("\"coinbase\":[");
+            if (!txs.isEmpty() && !txs.get(0).inputs.isEmpty()) {
+                List<byte[]> witness = txs.get(0).inputs.get(0).witness;
+                for (int i = 0; i < witness.size(); i++) {
+                    if (i > 0) sb.append(",");
+                    sb.append("\"").append(hex(witness.get(i))).append("\"");
+                }
             }
+            sb.append("],");
         }
-        sb.append("],");
-
         sb.append("\"tx\":[");
-        for (int i = 0; i < txs.size(); i++) {
+        for (int i = 0; i < count; i++) {
             if (i > 0) sb.append(",");
-            sb.append("\"").append(TxParser.computeTxid(txs.get(i).raw)).append("\"");
+            if (details) sb.append(rpcTx(txs.get(i), bh, btime, height));
+            else sb.append("\"").append(TxParser.computeTxid(txs.get(i).raw)).append("\"");
         }
         sb.append("],");
-
-        sb.append("\"time\":").append(HeaderUtil.time(header)).append(",");
-        sb.append("\"mediantime\":").append(computeMedianTime(height)).append(",");
-        sb.append("\"bits\":").append(bits).append(",");
-        sb.append("\"difficulty\":").append(toDifficulty(bits)).append(",");
-        sb.append("\"chainwork\":\"").append(work != null ? work.toString(16) : "00").append("\",");
-        sb.append("\"previousblockhash\":\"").append(hex(HeaderUtil.prevBlock(header))).append("\",");
-        sb.append("\"nextblockhash\":").append(getNextBlockHashOrNull(height));
-        sb.append("}");
+        sb.append(headerTailJson(header, height)).append(",");
+        sb.append("\"nTx\":").append(count).append(",");
+        sb.append("\"previousblockhash\":").append(height == 0 ? "null" : "\"" + hex(HeaderUtil.prevBlock(header)) + "\"").append(",");
+        sb.append(nextHashJson(height)).append("}");
         return sb.toString();
     }
 
-    private String utxoToJson(ChainDB.UtxoEntry utxo) {
-        return "{"
-                + "\"value\":" + (utxo.value() / 1_000_000.0) + ","
-                + "\"address\":{"
-                + "\"version\":" + utxo.addrVersion() + ","
-                + "\"hash\":\"" + hex(utxo.addrHash()) + "\""
-                + "},"
-                + "\"covenant\":{\"type\":" + utxo.covenantType() + "},"
-                + "\"coinbase\":" + utxo.coinbase()
-                + "}";
+    /** hsd's txToJSON (rpc.js). {@code blockHash} null = not in a block. */
+    private String rpcTx(TxParser.ParsedTx tx, String blockHash, long blockTime, int height) {
+        boolean coinbase = !tx.inputs.isEmpty() && tx.inputs.get(0).isCoinbase();
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"txid\":\"").append(hex(ChainJson.txid(tx))).append("\",");
+        sb.append("\"hash\":\"").append(hex(P2pMessages.wtxid(tx))).append("\",");
+        sb.append("\"size\":").append(tx.totalSize).append(",");
+        sb.append("\"vsize\":").append(Mempool.virtualSizeOf(tx)).append(",");
+        sb.append("\"version\":").append(tx.version & 0xFFFFFFFFL).append(",");
+        sb.append("\"locktime\":").append(tx.locktime & 0xFFFFFFFFL).append(",");
+        sb.append("\"vin\":[");
+        for (int i = 0; i < tx.inputs.size(); i++) {
+            TxParser.Input in = tx.inputs.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{\"coinbase\":").append(coinbase)
+                    .append(",\"txid\":\"").append(hex(in.prevHash)).append("\"")
+                    .append(",\"vout\":").append(in.prevIndex & 0xFFFFFFFFL)
+                    .append(",\"txinwitness\":[");
+            for (int w = 0; w < in.witness.size(); w++) {
+                if (w > 0) sb.append(",");
+                sb.append("\"").append(hex(in.witness.get(w))).append("\"");
+            }
+            sb.append("],\"sequence\":").append(in.sequence & 0xFFFFFFFFL).append("}");
+        }
+        sb.append("],\"vout\":[");
+        for (int i = 0; i < tx.outputs.size(); i++) {
+            TxParser.Output o = tx.outputs.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{\"value\":").append(coinAmount(o.value)).append(",\"n\":").append(i)
+                    .append(",\"address\":").append(addrJson(o.addrVersion, o.addrHash))
+                    .append(",\"covenant\":").append(ChainJson.covenantJson(o.covenant)).append("}");
+        }
+        sb.append("],\"blockhash\":").append(blockHash == null ? "null" : "\"" + blockHash + "\"");
+        sb.append(",\"confirmations\":").append(blockHash == null ? 0 : Math.max(0, db.getBlockTip() - height + 1));
+        sb.append(",\"time\":").append(blockHash == null ? 0 : blockTime);
+        sb.append(",\"blocktime\":").append(blockHash == null ? 0 : blockTime);
+        return sb.append("}").toString();
+    }
+
+    /** hsd's gettxout result. */
+    private String coinOutJson(long value, int addrVersion, byte[] addrHash, int version, boolean coinbase, int coinHeight) {
+        int tip = db.getBlockTip();
+        return "{\"bestblock\":\"" + hex(HeaderUtil.hash(db.getHeader(tip))) + "\","
+                + "\"confirmations\":" + (coinHeight < 0 ? 0 : Math.max(0, tip - coinHeight + 1)) + ","
+                + "\"value\":" + coinAmount(value) + ","
+                + "\"address\":" + addrJson(addrVersion, addrHash) + ","
+                + "\"version\":" + version + ","
+                + "\"coinbase\":" + coinbase + "}";
     }
 
     private String nameEntryToJson(ChainDB.NameEntry e, String name) {
@@ -1954,6 +2297,282 @@ public class RpcServer {
     }
 
     // ── Auth ──────────────────────────────────────────────────────────────────
+
+
+    // ── Step 3c: remaining hsd node RPCs ──────────────────────────────────────
+
+    /** compacttree / reconstructtree / resetrootcache: this node keeps its tree consistent by itself. */
+    private String noArgsNull(String params, String name) throws RpcException {
+        if (!parseParamList(params).isEmpty()) throw new RpcException(-1, name);
+        return "null";
+    }
+
+    /** hsd checks only its arguments here (level and numblocks must both be given) and returns null. */
+    private String verifyChain(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() > 2) throw new RpcException(-1, "verifychain ( checklevel numblocks )");
+        if (pl.size() < 2) throw new RpcException(-3, "Missing parameters.");
+        try { Long.parseLong(pl.get(0).trim()); Long.parseLong(pl.get(1).trim()); }
+        catch (NumberFormatException e) { throw new RpcException(-3, "Missing parameters."); }
+        return "null";
+    }
+
+    /** No priority statistics are kept: hsd answers -1 while its estimator has too little data. */
+    private String estimatePriority(String params, boolean smart) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() != 1) throw new RpcException(-1, smart ? "estimatesmartpriority nblocks" : "estimatepriority nblocks");
+        int blocks = parseIntParamOrDefault(params, 0, 1);
+        if (blocks <= 0) blocks = 1;
+        return smart ? "{\"priority\":-1,\"blocks\":" + blocks + "}" : "-1";
+    }
+
+    private String invalidateBlock(String params, boolean invalidate) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() != 1) throw new RpcException(-1, invalidate ? "invalidateblock \"hash\"" : "reconsiderblock \"hash\"");
+        String hs = parseStringParam(params, 0);
+        byte[] hash;
+        try {
+            if (hs == null || hs.length() != 64) throw new IllegalArgumentException();
+            hash = fromHex(hs);
+        } catch (RuntimeException e) {
+            throw new RpcException(-3, "Invalid block hash.");
+        }
+        if (chainSync == null) throw new RpcException(-1, "Node is not ready.");
+        String err = invalidate ? chainSync.invalidateBlock(hash) : chainSync.reconsiderBlock(hash);
+        if (err != null) throw new RpcException(-1, err);
+        return "null";
+    }
+
+    /** POST /reset {height}: hsd's chain.reset. */
+    private RestApi.Response restReset(String body) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"height\"\\s*:\\s*\"?(\\d+)\"?").matcher(body == null ? "" : body);
+        if (!m.find()) return restError("Height is required.");
+        long height = Long.parseLong(m.group(1));
+        if (chainSync == null) return restError("Node is not ready.");
+        if (height > db.getBlockTip()) return restError("Height cannot be greater than chain tip.");
+        String err = chainSync.resetChain((int) height);
+        return err == null ? new RestApi.Response(200, "{\"success\":true}") : restError(err);
+    }
+
+    private static RestApi.Response restError(String msg) {
+        return new RestApi.Response(400, "{\"error\":{\"type\":\"Error\",\"message\":\"" + JsonUtil.escape(msg) + "\"}}");
+    }
+
+    private String decodeResource(String params) throws RpcException {
+        if (parseParamList(params).size() != 1) throw new RpcException(-1, "decoderesource \"hex\"");
+        String hx = parseStringParam(params, 0);
+        byte[] data;
+        try { data = fromHex(hx == null ? "" : hx); } catch (RuntimeException e) { throw new RpcException(-3, "Invalid hex."); }
+        if (data.length == 0) throw new RpcException(-3, "Invalid hex.");
+        return DnsResource.decodeToJson(data);
+    }
+
+    /** Parses {"records":[{"type":"NS",...},...]}, encodes it and returns the normalized JSON, as hsd does. */
+    private String validateResource(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.isEmpty() || pl.size() > 2) throw new RpcException(-1, "validateresource '{\"records\": [{...}]}'");
+        java.util.LinkedHashMap<String, String> top = parseObjectParam(params, 0);
+        String recs = top.get("records");
+        if (recs == null) throw new RpcException(-3, "Invalid resource object.");
+        List<DnsResource.Record> out = new ArrayList<>();
+        List<String> specs = parseStringArrayParam("[" + recs + "]", 0);
+        try {
+            if (specs != null) for (String spec : specs) {
+                java.util.LinkedHashMap<String, String> f = parseObjectParam("[" + spec + "]", 0);
+                String type = unquote(f.get("type"));
+                if (type == null) throw new IllegalArgumentException("Unknown record type.");
+                switch (type) {
+                    case "NS" -> out.add(new DnsResource.NsRecord(req(f, "ns")));
+                    case "GLUE4" -> out.add(new DnsResource.Glue4Record(req(f, "ns"), req(f, "address")));
+                    case "GLUE6" -> out.add(new DnsResource.Glue6Record(req(f, "ns"), req(f, "address")));
+                    case "SYNTH4" -> out.add(new DnsResource.Synth4Record(req(f, "address")));
+                    case "SYNTH6" -> out.add(new DnsResource.Synth6Record(req(f, "address")));
+                    case "TXT" -> {
+                        List<String> items = new ArrayList<>();
+                        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"")
+                                .matcher(f.getOrDefault("txt", "[]"));
+                        while (m.find()) items.add(m.group(1).replace("\\\"", "\"").replace("\\\\", "\\"));
+                        out.add(new DnsResource.TxtRecord(items));
+                    }
+                    case "DS" -> out.add(new DnsResource.DsRecord(
+                            Integer.parseInt(f.get("keyTag").trim()), Integer.parseInt(f.get("algorithm").trim()),
+                            Integer.parseInt(f.get("digestType").trim()), fromHex(req(f, "digest"))));
+                    default -> throw new IllegalArgumentException("Unknown record type: " + type);
+                }
+            }
+            return DnsResource.decodeToJson(DnsResource.encode(out));
+        } catch (RuntimeException e) {
+            throw new RpcException(-32700, String.valueOf(e.getMessage()));
+        }
+    }
+
+    private static String req(java.util.Map<String, String> f, String key) {
+        String v = unquote(f.get(key));
+        if (v == null) throw new IllegalArgumentException("Missing field: " + key);
+        return v;
+    }
+
+    /** hsd's rules.grindName: a random a-z name that is not blacklisted, reserved or still waiting for its rollout week. */
+    private String grindName(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.size() > 1) throw new RpcException(-1, "grindname size");
+        int size = pl.isEmpty() ? 10 : parseIntParamOrDefault(params, 0, -1);
+        if (size < 1 || size > 63) throw new RpcException(-3, "Invalid length.");
+        int height = Math.max(db.getBlockTip() + 1, BlockProcessor.params.auctionStart);
+        java.util.Random rnd = new java.security.SecureRandom();
+        for (int i = 0; i < 500_000; i++) {
+            char[] c = new char[size];
+            for (int j = 0; j < size; j++) c[j] = (char) ('a' + rnd.nextInt(26));
+            String name = new String(c);
+            if (!HandshakeCovenantRules.verifyName(name.getBytes(StandardCharsets.US_ASCII))) continue; // blacklist
+            byte[] hash = UrkelNameHash.hashName(name);
+            if ("main".equals(BlockProcessor.params.type) && !HandshakeCovenantRules.hasRollout(hash, height)) continue; // the rollout schedule is mainnet's
+            if (ReservedNames.get(hash) != null) continue;
+            return "\"" + name + "\"";
+        }
+        throw new RpcException(-1, "Could not find available name.");
+    }
+
+    /** Node extension: stores the address that mining rewards (getwork / setgenerate) are paid to; "" clears it. */
+    private String setMinerAddress(String params) throws RpcException {
+        if (parseParamList(params).size() != 1) throw new RpcException(-1, "setmineraddress \"address\"");
+        String addr = String.valueOf(parseStringParam(params, 0)).trim();
+        if (!addr.isEmpty()) MiningService.decodeAddress(addr);      // throws -5 on a bad address
+        config.setMinerAddress(addr);
+        return "null";
+    }
+
+    private static String jsonString(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    private String setLogLevel(String params) throws RpcException {
+        if (parseParamList(params).size() != 1) throw new RpcException(-1, "setloglevel \"level\"");
+        String level = String.valueOf(parseStringParam(params, 0)).toLowerCase();
+        if (!List.of("none", "error", "warning", "info", "debug", "spam").contains(level))
+            throw new RpcException(-8, "Invalid log level.");
+        config.set("log.level", level);
+        return "null";
+    }
+
+    /**
+     * hsd's signrawtransaction for standard pay-to-pubkey-hash inputs: signs every input it holds a key for.
+     * Coins come from the optional previous-outputs list ({txid, vout, address, amount}) or, failing that,
+     * from the mempool / chain. Returns {hex, complete}.
+     */
+    private String signRawTransaction(String params) throws RpcException {
+        List<String> pl = parseParamList(params);
+        if (pl.isEmpty() || pl.size() > 4)
+            throw new RpcException(-1, "signrawtransaction \"hexstring\" ( [{\"txid\":\"id\",\"vout\":n,\"address\":\"bech32\",\"amount\":n}] [\"privatekey1\",...] sighashtype )");
+        byte[] raw;
+        try { raw = fromHex(String.valueOf(parseStringParam(params, 0))); } catch (RuntimeException e) { throw new RpcException(-3, "Invalid hex string."); }
+        TxParser.ParsedTx tx = TxParser.parse(raw);
+        if (tx == null) throw new RpcException(-22, "TX decode failed");
+
+        // keys, by the hash of their public key
+        java.util.Map<String, byte[]> keys = new java.util.HashMap<>();
+        if (pl.size() > 2) {
+            List<String> secrets = parseStringArrayParam(params, 2);
+            if (secrets != null) for (String sec : secrets) {
+                String w = unquote(sec);
+                if (w == null || w.isEmpty()) continue;
+                try {
+                    byte[] payload = Base58.decodeCheck(w);
+                    if (payload.length < 33) throw new IllegalArgumentException();
+                    byte[] priv = Arrays.copyOfRange(payload, 1, 33);
+                    keys.put(hex(Blake2b.hash(Secp256k1.compressedPublicKey(priv), 20)), priv);
+                } catch (Exception e) {
+                    throw new RpcException(-5, "Invalid private key.");
+                }
+            }
+        }
+
+        int type = TxVerify.SIGHASH_ALL;
+        if (pl.size() > 3) {
+            String sh = unquote(pl.get(3));
+            if (sh != null && !sh.isEmpty() && !sh.equals("null")) {
+                String[] parts = sh.split("\\|");
+                type = switch (parts[0]) {
+                    case "ALL" -> TxVerify.SIGHASH_ALL;
+                    case "NONE" -> TxVerify.SIGHASH_NONE;
+                    case "SINGLE" -> TxVerify.SIGHASH_SINGLE;
+                    case "SINGLEREVERSE" -> TxVerify.SIGHASH_SINGLEREVERSE;
+                    default -> throw new RpcException(-8, "Invalid sighash type.");
+                };
+                if (parts.length == 2) {
+                    if (parts[1].equals("NOINPUT")) type |= TxVerify.SIGHASH_NOINPUT;
+                    else if (parts[1].equals("ANYONECANPAY")) type |= TxVerify.SIGHASH_ANYONECANPAY;
+                    else throw new RpcException(-8, "Invalid sighash type.");
+                } else if (parts.length > 2) throw new RpcException(-8, "Invalid sighash type.");
+            }
+        }
+
+        // coins named by the caller
+        java.util.Map<String, long[]> given = new java.util.HashMap<>();      // outpoint -> {value}
+        java.util.Map<String, byte[]> givenHash = new java.util.HashMap<>();
+        if (pl.size() > 1) {
+            List<String> specs = parseStringArrayParam(params, 1);
+            if (specs != null) for (String spec : specs) {
+                java.util.LinkedHashMap<String, String> f = parseObjectParam("[" + spec + "]", 0);
+                try {
+                    String id = req(f, "txid");
+                    int vout = Integer.parseInt(f.get("vout").trim());
+                    Object[] a = Bech32.decode(req(f, "address"));
+                    long value = Math.round(Double.parseDouble(f.get("amount").trim()) * 1_000_000.0);
+                    if ((int) a[1] == 0) {
+                        given.put(id + ":" + vout, new long[]{value});
+                        givenHash.put(id + ":" + vout, (byte[]) a[2]);
+                    }
+                } catch (RuntimeException e) {
+                    throw new RpcException(-8, "Invalid UTXO.");
+                }
+            }
+        }
+
+        ChainJson cj = new ChainJson(db, mempool);
+        int n = tx.inputs.size();
+        List<List<byte[]>> wit = new ArrayList<>();
+        boolean complete = true;
+        for (int i = 0; i < n; i++) {
+            TxParser.Input in = tx.inputs.get(i);
+            List<byte[]> stack = new ArrayList<>(in.witness);
+            wit.add(stack);
+            if (in.isCoinbase()) continue;
+            String op = hex(in.prevHash) + ":" + in.prevIndex;
+            byte[] ah; long value;
+            if (given.containsKey(op)) { ah = givenHash.get(op); value = given.get(op)[0]; }
+            else {
+                ChainJson.Coin c = cj.resolve(in.prevHash, in.prevIndex);
+                if (c == null || c.out().addrVersion != 0) { complete = false; continue; }
+                ah = c.out().addrHash; value = c.out().value;
+            }
+            byte[] priv = ah.length == 20 ? keys.get(hex(ah)) : null;
+            if (priv != null) {
+                byte[] sig = TxVerify.signInput(tx, i, ah, value, priv, type);
+                stack.clear();
+                stack.add(sig);
+                stack.add(Secp256k1.compressedPublicKey(priv));
+            }
+            // judged on what is now in the witness, not on whether we signed
+            TxParser.ParsedTx probe = withWitness(tx, wit, i);
+            if (probe == null || !TxVerify.verifyInput(probe, i, ah, value)) complete = false;
+        }
+        TxParser.ParsedTx signed = withWitness(tx, wit, n);
+        if (signed == null) throw new RpcException(-22, "TX encode failed");
+        return "{\"hex\":\"" + hex(signed.raw) + "\",\"complete\":" + complete + "}";
+    }
+
+    /** The transaction with the given per-input witness stacks (inputs at or after {@code upTo} keep theirs). */
+    private static TxParser.ParsedTx withWitness(TxParser.ParsedTx tx, List<List<byte[]>> wit, int upTo) {
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+        o.write(tx.raw, 0, tx.baseSize);
+        for (int i = 0; i < tx.inputs.size(); i++) {
+            List<byte[]> st = i < wit.size() ? wit.get(i) : tx.inputs.get(i).witness;
+            BlockTemplates.writeVarint(o, st.size());
+            for (byte[] item : st) { BlockTemplates.writeVarint(o, item.length); o.write(item, 0, item.length); }
+        }
+        return TxParser.parse(o.toByteArray());
+    }
 
     private boolean checkAuth(HttpExchange ex) {
         String auth = ex.getRequestHeaders().getFirst("Authorization");
@@ -2137,18 +2756,14 @@ public class RpcServer {
 
     private byte[] resolveHeader(String hashOrHeight) {
         try {
-            int height = Integer.parseInt(hashOrHeight);
-            return db.getHeader(height);
+            return db.getHeader(Integer.parseInt(hashOrHeight));
         } catch (NumberFormatException e) {
-            // It's a hash — scan for it
             String hash = hashOrHeight.replace("\"", "");
-            int tip = db.getHeaderTip();
-            for (int h = tip; h >= 0; h--) {
-                byte[] header = db.getHeader(h);
-                if (header != null && hex(HeaderUtil.hash(header)).equals(hash))
-                    return header;
-            }
-            return null;
+            if (hash.length() != 64) return null;
+            try {
+                int h = db.getHeightByHash(hash);
+                return h < 0 ? null : db.getHeader(h);
+            } catch (RuntimeException bad) { return null; }
         }
     }
 
@@ -2157,14 +2772,10 @@ public class RpcServer {
         try {
             return Integer.parseInt(hashOrHeight);
         } catch (NumberFormatException e) {
-            // Scan for hash
-            int tip = db.getHeaderTip();
-            for (int h = tip; h >= 0; h--) {
-                byte[] header = db.getHeader(h);
-                if (header != null && hex(HeaderUtil.hash(header)).equals(hashOrHeight))
-                    return h;
-            }
-            throw new RpcException(-5, "Block not found: " + hashOrHeight);
+            int h = -1;
+            try { if (hashOrHeight.length() == 64) h = db.getHeightByHash(hashOrHeight); } catch (RuntimeException ignored) { }
+            if (h < 0) throw new RpcException(-5, "Block not found: " + hashOrHeight);
+            return h;
         }
     }
 
@@ -2188,7 +2799,7 @@ public class RpcServer {
         return HexUtil.decode(s);
     }
 
-    private static String escape(String s) {
+    static String escape(String s) {
         // FIX: used to escape only '\\' and '"', leaving '\n'/'\r'
         // unescaped in RPC error messages -- the same latent bug
         // WebAdminServer's own jsonEscape() had, just rarely exercised

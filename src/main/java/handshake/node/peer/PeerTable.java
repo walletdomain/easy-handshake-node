@@ -90,9 +90,9 @@ public class PeerTable {
 
     // ── Gossip address hygiene ────────────────────────────────────────────────
     /** Ignore an ADDR entry whose own 'last seen' timestamp is older than this. */
-    static final long ADDR_MAX_AGE_MS     = 24 * 3600_000L;
+    static final long ADDR_MAX_AGE_MS     = 30L * 24 * 3600_000L;   // hsd HostList.HORIZON_DAYS = 30
     /** Forget a gossip-learned address nobody has re-announced for this long. */
-    static final long ADDR_EXPIRE_MS      = 48 * 3600_000L;
+    static final long ADDR_EXPIRE_MS      = 30L * 24 * 3600_000L;
     /** Forget a gossip-learned address after this many failed dials with no success ever. */
     static final int  ADDR_MAX_FAILURES   = 5;
     /** Tolerated clock skew for a timestamp in the future (clamped to now beyond it). */
@@ -140,7 +140,7 @@ public class PeerTable {
         public int     validDataCount;     // in-memory only
         public int     invalidDataCount;   // in-memory only
         public double  avgLatencyMs = -1;  // in-memory only; -1 = no data yet
-        public boolean banned;             // in-memory only; permanent until process restart
+        public boolean banned;             // in-memory only; expires after BAN_DURATION_MS (hsd: 24 h), see PeerTable.expireBan
         public String  banReason;          // in-memory only
         public long    banTime;            // in-memory only
         public final java.util.ArrayDeque<String> penalties = new java.util.ArrayDeque<>(); // in-memory: last few score-lowering events
@@ -716,6 +716,7 @@ public class PeerTable {
      *  (weighted). Same two-tier priority PeerDiscovery.getCandidates()
      *  used to provide. */
     public List<ConnectTarget> getCandidates() {
+        peers.values().forEach(this::expireBan);   // lift bans that have run their 24 h before choosing
         List<ConnectTarget> seedCandidates = new ArrayList<>();
         List<ConnectTarget> otherCandidates = new ArrayList<>();
         List<ConnectTarget> plainCandidates = new ArrayList<>();
@@ -907,6 +908,7 @@ public class PeerTable {
     public boolean shouldSkip(String ip) {
         Peer r = peers.get(ip);
         if (r == null) return false;
+        expireBan(r);
         if (pinned.contains(ip)) return r.banned;   // pinned: backoff never applies
         return r.banned || r.isBackedOff();
     }
@@ -914,7 +916,21 @@ public class PeerTable {
     /** True only for an explicit ban (not backoff). Used to gate inbound connections. */
     public boolean isBanned(String ip) {
         Peer r = peers.get(ip);
+        if (r != null) expireBan(r);
         return r != null && r.banned && !pinned.contains(ip);
+    }
+
+    /** hsd common.BAN_TIME: a ban lasts 24 hours, then the peer is eligible again. */
+    public static final long BAN_DURATION_MS = 24L * 60 * 60 * 1000;
+
+    /** Lifts r's ban if it has run its 24 hours. Cheap; called wherever the ban flag is consulted. */
+    private void expireBan(Peer r) {
+        if (r.banned && r.banTime > 0 && System.currentTimeMillis() - r.banTime >= BAN_DURATION_MS) {
+            System.out.printf("[PeerTable] Ban on %s expired (%s)%n", r.ip, r.banReason);
+            r.banned = false;
+            r.banReason = null;
+            persist(r);
+        }
     }
 
     public void banPeer(String ip, String reason) {
@@ -944,6 +960,7 @@ public class PeerTable {
     }
 
     public List<Peer> listBannedPeers() {
+        peers.values().forEach(this::expireBan);
         return peers.values().stream().filter(r -> r.banned).toList();
     }
 

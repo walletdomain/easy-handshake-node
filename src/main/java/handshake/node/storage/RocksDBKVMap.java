@@ -169,6 +169,80 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
         }
     }
 
+    @Override
+    public List<Map.Entry<K, V>> scanRange(K from, K to, int limit, boolean reverse) {
+        byte[] lo = from == null ? new byte[0] : encodeKey.apply(from);
+        byte[] hi = to == null ? null : encodeKey.apply(to);
+        List<Map.Entry<K, V>> out = new ArrayList<>(Math.min(limit, 1024));
+        try (RocksIterator it = db.newIterator(cf)) {
+            if (!reverse) {
+                it.seek(lo);
+                while (it.isValid() && out.size() < limit) {
+                    byte[] k = it.key();
+                    if (hi != null && Arrays.compareUnsigned(k, hi) >= 0) break;
+                    out.add(Map.entry(decodeKey.apply(k), decodeValue.apply(it.value())));
+                    it.next();
+                }
+            } else {
+                if (hi == null) it.seekToLast(); else { it.seekForPrev(hi); }
+                while (it.isValid() && out.size() < limit) {
+                    byte[] k = it.key();
+                    if (hi != null && Arrays.compareUnsigned(k, hi) >= 0) { it.prev(); continue; }
+                    if (Arrays.compareUnsigned(k, lo) < 0) break;
+                    out.add(Map.entry(decodeKey.apply(k), decodeValue.apply(it.value())));
+                    it.prev();
+                }
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public void applyOps(List<Map.Entry<K, V>> ops) {
+        if (ops.isEmpty()) return;
+        try (WriteBatch batch = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
+            for (Map.Entry<K, V> e : ops) {
+                if (e.getValue() == null) batch.delete(cf, encodeKey.apply(e.getKey()));
+                else batch.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
+            }
+            db.write(wOpts, batch);
+        } catch (RocksDBException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public String stats() {
+        String[] props = { "rocksdb.estimate-num-keys", "rocksdb.cur-size-all-mem-tables",
+                "rocksdb.estimate-table-readers-mem", "rocksdb.total-sst-files-size",
+                "rocksdb.num-files-at-level0", "rocksdb.estimate-pending-compaction-bytes" };
+        StringBuilder sb = new StringBuilder();
+        for (String pr : props) {
+            String value;
+            try {
+                // num-files-at-levelN is a string property in RocksDB, so getLongProperty fails on it
+                value = pr.startsWith("rocksdb.num-files") ? db.getProperty(cf, pr) : String.valueOf(db.getLongProperty(cf, pr));
+            } catch (RocksDBException e) { value = "?"; }
+            sb.append(pr.substring(8)).append('=').append(value).append(' ');
+        }
+        return sb.toString().trim();
+    }
+
+    /** One range tombstone instead of tens of millions of point deletes, then a compaction to reclaim the space. */
+    @Override
+    public void clearFast() {
+        try {
+            byte[] hi = new byte[64];
+            Arrays.fill(hi, (byte) 0xFF);
+            db.deleteRange(cf, new byte[0], hi);
+            try (CompactRangeOptions o = new CompactRangeOptions()) {
+                db.compactRange(cf, null, null, o);
+            }
+        } catch (RocksDBException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private void writeDeleteBatch(List<byte[]> keys) {
         try (WriteBatch wb = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
             for (byte[] k : keys) wb.delete(cf, k);

@@ -89,12 +89,12 @@ class RocksDBKVStore implements KVStore {
     // secondary.
     private static long detectSharedBlockCacheBytes() {
         long floor = 256L * 1024 * 1024;
-        long ceiling = 4L * 1024 * 1024 * 1024;
+        long ceiling = 8L * 1024 * 1024 * 1024;
         try {
             var osBean = (com.sun.management.OperatingSystemMXBean)
                     java.lang.management.ManagementFactory.getOperatingSystemMXBean();
             long totalPhysical = osBean.getTotalMemorySize();
-            long tenPercent = totalPhysical / 10;
+            long tenPercent = totalPhysical / 4;     // a quarter of RAM: tree-path and UTXO reads served from memory instead of disk
             return Math.max(floor, Math.min(tenPercent, ceiling));
         } catch (Exception | LinkageError e) {
             System.out.println("[RocksDBKVStore] Could not detect physical memory ("
@@ -104,8 +104,14 @@ class RocksDBKVStore implements KVStore {
     }
 
     private static final long DEFAULT_WRITE_BUFFER_SIZE_BYTES = 16L * 1024 * 1024;  // 16MB per memtable for low-write-volume column families
-    private static final long HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES = 64L * 1024 * 1024; // 64MB for "urkelNodes" specifically -- close to RocksDB's own original default
+    private static final long HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES = 256L * 1024 * 1024; // 64MB for "urkelNodes" specifically -- close to RocksDB's own original default
     private static final String HIGH_VOLUME_COLUMN_FAMILY = "urkelNodes";
+    private static final long INDEX_WRITE_BUFFER_SIZE_BYTES = 32L * 1024 * 1024;  // tx/address index column families: heavy sequential-ish writes during sync
+    /** utxos and names also churn (entries updated and spent again within a few blocks): a bigger memtable lets
+     *  most of that cancel out in memory instead of being written to disk and compacted later. */
+    private static final long CHURN_WRITE_BUFFER_SIZE_BYTES = 128L * 1024 * 1024;
+    private static boolean isChurnFamily(String n) { return n.equals("utxos") || n.equals("names"); }
+    private static boolean isIndexFamily(String n) { return n.equals("txindex") || n.equals("addrtx") || n.equals("addrcoin"); }
     private static final int MAX_WRITE_BUFFER_NUMBER = 2;                      // RocksDB's own default -- kept, not reduced further, since going lower would force more frequent flushes and hurt write throughput for little further memory benefit
 
     private final RocksDB db;
@@ -115,6 +121,13 @@ class RocksDBKVStore implements KVStore {
     private final Map<String, ColumnFamilyHandle> handles = new HashMap<>();
     private final List<ColumnFamilyOptions> openedCfOptions = new ArrayList<>();
     private final Cache sharedBlockCache;
+    private final Statistics statistics;
+    private final boolean countAsScratch;
+    /** Per column family compaction totals, fed by RocksDB's own "compaction finished" callback:
+     *  {jobs, jobsFromLevel0, inputBytes, outputBytes, recordsReplaced, tombstonesSeen, micros}. */
+    private final java.util.concurrent.ConcurrentHashMap<String, long[]> compactionByFamily = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, long[]> compactionReported = new HashMap<>();
+    private final List<AbstractNativeReference> filterPolicies = new ArrayList<>();
 
     public RocksDBKVStore(String path) {
         this(path, false);
@@ -159,6 +172,13 @@ class RocksDBKVStore implements KVStore {
      *  gets no real benefit from a multi-gigabyte block cache sized for
      *  a permanent database -- it just needs to survive one walk. */
     public RocksDBKVStore(String path, boolean readOnly, long blockCacheBytesOverride) {
+        this(path, readOnly, blockCacheBytesOverride, false);
+    }
+
+    /** countAsScratch: this is a short-lived scratch store (orphan pruning); when it closes, the bytes it wrote and
+     *  read are added to the totals reported by {@link #scratchIoStats()}, so that disk activity is not invisible. */
+    public RocksDBKVStore(String path, boolean readOnly, long blockCacheBytesOverride, boolean countAsScratch) {
+        this.countAsScratch = countAsScratch;
         RocksDB.loadLibrary();
         this.path = path;
         this.readOnly = readOnly;
@@ -166,9 +186,14 @@ class RocksDBKVStore implements KVStore {
         this.sharedBlockCache = new LRUCache(
                 blockCacheBytesOverride >= 0 ? blockCacheBytesOverride : detectSharedBlockCacheBytes());
 
+        this.statistics = new Statistics();
         this.dbOptions = new DBOptions()
                 .setCreateIfMissing(!readOnly)
-                .setCreateMissingColumnFamilies(!readOnly);
+                .setCreateMissingColumnFamilies(!readOnly)
+                .setStatistics(statistics)
+                .setListeners(List.of(compactionListener()))
+                // Compaction reads whole files in 2MB sequential chunks instead of many small reads: far fewer disk operations
+                .setCompactionReadaheadSize(2L * 1024 * 1024);
 
         List<byte[]> existingNames;
         try {
@@ -213,17 +238,130 @@ class RocksDBKVStore implements KVStore {
      *  this single place, so there's exactly one spot controlling the
      *  memory/performance tradeoff, not options scattered and
      *  potentially drifting out of sync across call sites. */
+    /** Column families whose reads are mostly point lookups by key, many of them for keys that are not there yet
+     *  (new Urkel nodes, new UTXOs, new names): a bloom filter answers "not in this file" from memory, so those
+     *  lookups no longer read several files from disk. About 10 bits (1.25 bytes) per key, kept inside the block cache. */
+    private static boolean wantsBloomFilter(String n) {
+        return n.equals("urkelNodes") || n.equals("utxos") || n.equals("names") || n.equals("hashIndex");
+    }
+
     private ColumnFamilyOptions newBoundedCfOptions(String cfName) {
         BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
-                .setBlockCache(sharedBlockCache);
+                .setBlockCache(sharedBlockCache)
+                // index and filter blocks live INSIDE the (bounded) block cache, so their memory is capped too
+                .setCacheIndexAndFilterBlocks(true)
+                .setPinL0FilterAndIndexBlocksInCache(true);
+        if (wantsBloomFilter(cfName)) {
+            BloomFilter bloom = new BloomFilter(10, false);
+            filterPolicies.add(bloom);
+            tableConfig.setFilterPolicy(bloom);
+        }
         long writeBufferSize = HIGH_VOLUME_COLUMN_FAMILY.equals(cfName)
                 ? HIGH_VOLUME_WRITE_BUFFER_SIZE_BYTES
-                : DEFAULT_WRITE_BUFFER_SIZE_BYTES;
-        return new ColumnFamilyOptions()
+                : isChurnFamily(cfName) ? CHURN_WRITE_BUFFER_SIZE_BYTES
+                : isIndexFamily(cfName) ? INDEX_WRITE_BUFFER_SIZE_BYTES : DEFAULT_WRITE_BUFFER_SIZE_BYTES;
+        boolean churn = HIGH_VOLUME_COLUMN_FAMILY.equals(cfName) || isChurnFamily(cfName);
+        ColumnFamilyOptions o = new ColumnFamilyOptions()
                 .setTableFormatConfig(tableConfig)
                 .setWriteBufferSize(writeBufferSize)
-                .setMaxWriteBufferNumber(MAX_WRITE_BUFFER_NUMBER);
+                .setMaxWriteBufferNumber(churn ? 3 : MAX_WRITE_BUFFER_NUMBER);
+        if (churn) {
+            // Merge two full memtables before writing one file, so an entry created in one and deleted in the other
+            // never reaches disk; and let 8 level-0 files pile up before compacting (bloom filters keep reads cheap).
+            o.setMinWriteBufferNumberToMerge(2).setLevel0FileNumCompactionTrigger(8);
+        }
+        // Urkel nodes are hashes: incompressible, so compressing them only burns CPU. Everything else uses fast LZ4.
+        o.setCompressionType(HIGH_VOLUME_COLUMN_FAMILY.equals(cfName)
+                ? CompressionType.NO_COMPRESSION : CompressionType.LZ4_COMPRESSION);
+        return o;
     }
+
+    // ── disk I/O counters ─────────────────────────────────────────────────────
+
+    /** Records every finished compaction under its column family, so the log can say WHICH family causes the
+     *  compaction traffic. Runs on RocksDB's background threads: kept tiny and never allowed to throw. */
+    private AbstractEventListener compactionListener() {
+        AbstractEventListener l = new AbstractEventListener(AbstractEventListener.EnabledEventCallback.ON_COMPACTION_COMPLETED) {
+            @Override
+            public void onCompactionCompleted(RocksDB d, CompactionJobInfo info) {
+                try {
+                    String cf = new String(info.columnFamilyName(), StandardCharsets.UTF_8);
+                    CompactionJobStats st = info.stats();
+                    long[] a = compactionByFamily.computeIfAbsent(cf, k -> new long[7]);
+                    synchronized (a) {
+                        a[0]++;
+                        if (info.baseInputLevel() == 0) a[1]++;
+                        a[2] += st.totalInputBytes();
+                        a[3] += st.totalOutputBytes();
+                        a[4] += st.numRecordsReplaced();
+                        a[5] += st.numInputDeletionRecords();
+                        a[6] += st.elapsedMicros();
+                    }
+                } catch (Throwable ignored) { /* statistics must never disturb the database */ }
+            }
+        };
+        filterPolicies.add(l);          // closed together with the other native helpers
+        return l;
+    }
+
+    /** "urkelNodes 12 jobs (4 from L0): read 3.4 GB, wrote 3.1 GB, 1.2M replaced, 0.4M deletes, 35 s | utxos ..." since the previous call. */
+    private String compactionByFamilyText() {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, long[]> e : new TreeMap<>(compactionByFamily).entrySet()) {
+            long[] cur;
+            synchronized (e.getValue()) { cur = e.getValue().clone(); }
+            long[] prev = compactionReported.getOrDefault(e.getKey(), new long[7]);
+            compactionReported.put(e.getKey(), cur);
+            if (cur[0] == prev[0]) continue;
+            if (sb.length() > 0) sb.append("; ");
+            sb.append(String.format("%s %d jobs (%d from L0): read %s, wrote %s, %s replaced, %s deletes, %d s",
+                    e.getKey(), cur[0] - prev[0], cur[1] - prev[1], mb(cur[2] - prev[2]), mb(cur[3] - prev[3]),
+                    count(cur[4] - prev[4]), count(cur[5] - prev[5]), (cur[6] - prev[6]) / 1_000_000));
+        }
+        return sb.length() == 0 ? "none" : sb.toString();
+    }
+
+    private static String count(long n) { return n >= 1_000_000 ? String.format("%.1fM", n / 1e6) : n >= 1000 ? (n / 1000) + "k" : String.valueOf(n); }
+
+    private static final java.util.concurrent.atomic.LongAdder SCRATCH_STORES = new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder SCRATCH_WRITTEN = new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder SCRATCH_READ = new java.util.concurrent.atomic.LongAdder();
+    private static long lastScratchStores, lastScratchWritten, lastScratchRead;
+
+    /** Disk activity of the short-lived scratch stores (orphan pruning) that finished since the previous call. */
+    public static synchronized String scratchIoStats() {
+        long n = SCRATCH_STORES.sum(), w = SCRATCH_WRITTEN.sum(), r = SCRATCH_READ.sum();
+        String out = String.format("scratch stores: %d finished, wrote %s, compaction read %s", n - lastScratchStores,
+                mb(w - lastScratchWritten), mb(r - lastScratchRead));
+        lastScratchStores = n; lastScratchWritten = w; lastScratchRead = r;
+        return out;
+    }
+
+    private long lastFlushW, lastCompR, lastCompW, lastWal, lastHit, lastMiss, lastBloom, lastNanos = System.nanoTime();
+
+    /** Disk activity since the previous call, e.g. for a periodic log line. Bytes are what RocksDB itself wrote
+     *  and read for flushes, compaction and the write-ahead log, plus how well the cache and bloom filters worked. */
+    @Override
+    public synchronized String ioStats() {
+        long flushW = statistics.getTickerCount(TickerType.FLUSH_WRITE_BYTES);
+        long compR = statistics.getTickerCount(TickerType.COMPACT_READ_BYTES);
+        long compW = statistics.getTickerCount(TickerType.COMPACT_WRITE_BYTES);
+        long wal = statistics.getTickerCount(TickerType.WAL_FILE_BYTES);
+        long hit = statistics.getTickerCount(TickerType.BLOCK_CACHE_HIT);
+        long miss = statistics.getTickerCount(TickerType.BLOCK_CACHE_MISS);
+        long bloom = statistics.getTickerCount(TickerType.BLOOM_FILTER_USEFUL);
+        long now = System.nanoTime();
+        double secs = Math.max(0.001, (now - lastNanos) / 1e9);
+        long dFlush = flushW - lastFlushW, dCompR = compR - lastCompR, dCompW = compW - lastCompW, dWal = wal - lastWal;
+        long dHit = hit - lastHit, dMiss = miss - lastMiss, dBloom = bloom - lastBloom;
+        lastFlushW = flushW; lastCompR = compR; lastCompW = compW; lastWal = wal; lastHit = hit; lastMiss = miss; lastBloom = bloom; lastNanos = now;
+        long written = dFlush + dCompW + dWal;
+        return String.format("disk write %s (%s/s: log %s, flush %s, compaction %s) | compaction read %s | cache hit %d%% | bloom skipped %d file reads | compaction by family: %s",
+                mb(written), mb((long) (written / secs)), mb(dWal), mb(dFlush), mb(dCompW), mb(dCompR),
+                dHit + dMiss == 0 ? 100 : (100 * dHit) / (dHit + dMiss), dBloom, compactionByFamilyText());
+    }
+
+    private static String mb(long bytes) { return String.format("%.1f MB", bytes / 1048576.0); }
 
     private synchronized ColumnFamilyHandle getOrCreateHandle(String name) {
         ColumnFamilyHandle existing = handles.get(name);
@@ -393,6 +531,14 @@ class RocksDBKVStore implements KVStore {
         db.close();
         dbOptions.close();
         for (ColumnFamilyOptions o : openedCfOptions) o.close();
+        if (countAsScratch) {
+            SCRATCH_STORES.increment();
+            SCRATCH_WRITTEN.add(statistics.getTickerCount(TickerType.FLUSH_WRITE_BYTES)
+                    + statistics.getTickerCount(TickerType.COMPACT_WRITE_BYTES) + statistics.getTickerCount(TickerType.WAL_FILE_BYTES));
+            SCRATCH_READ.add(statistics.getTickerCount(TickerType.COMPACT_READ_BYTES));
+        }
+        for (AbstractNativeReference r : filterPolicies) r.close();
+        statistics.close();
         sharedBlockCache.close(); // native resource -- must be released explicitly, same as everything else here
     }
 }

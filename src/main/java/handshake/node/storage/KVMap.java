@@ -51,6 +51,29 @@ public interface KVMap<K, V> {
     }
 
     void clear();
+
+    /**
+     * Bounded range read, for maps with byte[] keys ordered lexicographically (unsigned). Returns at most
+     * {@code limit} entries with {@code from <= key < to}; ascending, or descending from the end of the
+     * range when {@code reverse}. {@code from}/{@code to} may be null for "unbounded". Never materializes
+     * more than {@code limit} entries -- callers page through big maps with it.
+     */
+    default java.util.List<java.util.Map.Entry<K, V>> scanRange(K from, K to, int limit, boolean reverse) {
+        throw new UnsupportedOperationException("scanRange");
+    }
+
+    /** Applies puts (non-null value) and deletes (null value) as one atomic write batch. */
+    default void applyOps(java.util.List<java.util.Map.Entry<K, V>> ops) {
+        for (java.util.Map.Entry<K, V> e : ops) {
+            if (e.getValue() == null) remove(e.getKey()); else put(e.getKey(), e.getValue());
+        }
+    }
+
+    /** Human-readable engine statistics (memory, key estimate) for diagnostics. */
+    default String stats() { return "n/a"; }
+
+    /** Like clear(), but may use a range-delete plus compaction; far faster on huge maps. */
+    default void clearFast() { clear(); }
     Iterable<V> values();
     Iterable<java.util.Map.Entry<K, V>> entrySet();
     java.util.Set<K> keySet();

@@ -86,13 +86,24 @@ public final class ReorgExecutor {
         return v != null && v.contains(HexUtil.encode(hash));
     }
 
-    private static void markInvalid(ChainDB db, byte[] hash) {
+    public static void markInvalid(ChainDB db, byte[] hash) {
         String v = db.getMeta(INVALID);
         List<String> l = new ArrayList<>();
         if (v != null && !v.isEmpty()) l.addAll(Arrays.asList(v.split(",")));
         l.add(HexUtil.encode(hash));
         while (l.size() > 50) l.remove(0);
         db.putMeta(INVALID, String.join(",", l));
+    }
+
+    /** Forgets that a block was marked invalid (reconsiderblock). */
+    public static void unmarkInvalid(ChainDB db, byte[] hash) {
+        String v = db.getMeta(INVALID);
+        if (v == null || v.isEmpty()) return;
+        String h = HexUtil.encode(hash);
+        List<String> l = new ArrayList<>();
+        for (String x : v.split(",")) if (!x.equals(h)) l.add(x);
+        if (l.isEmpty()) db.removeMeta(INVALID); else db.putMeta(INVALID, String.join(",", l));
+        db.commit();
     }
 
     // ── eligibility ───────────────────────────────────────────────────────────
