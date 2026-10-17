@@ -1318,6 +1318,25 @@ public class ChainDB {
         return names.sizeEstimate();
     }
 
+    /** True while the current block's name writes are still buffered (not yet in the names table). */
+    public boolean hasPendingNameWrites() { return !pendingNameWrites.isEmpty(); }
+
+    /** Streams every stored name, in key order, to {@code action} one at a
+     *  time (never materializes the whole table: memory stays flat however
+     *  many names exist). Used by the Urkel tree rebuild in UrkelTreeRecovery. */
+    public void forEachNameStreaming(java.util.function.BiConsumer<byte[], NameEntry> action) {
+        // Reads the stored table only; callers that need the in-flight block's
+        // writes too must check hasPendingNameWrites() first (see UrkelTreeRecovery).
+        try (KVMap.KVSnapshot<byte[]> snapshot = names.openSnapshot()) {
+            snapshot.forEachKey(key -> {
+                String raw = names.get(key);
+                if (raw == null) return;
+                NameEntry e = NameEntry.fromStorage(raw);
+                if (e != null) action.accept(key, e);
+            });
+        }
+    }
+
     /** All names currently tracked, for the "getnames" RPC method.
      *  Skips any record that fails to parse (see NameEntry.fromStorage()'s
      *  defensive handling) rather than letting one bad record break the

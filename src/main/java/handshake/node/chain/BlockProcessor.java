@@ -75,25 +75,21 @@ public class BlockProcessor {
      * bytecode is what's actually executing regardless.
      */
     /**
-     * A fingerprint of the ENTIRE compiled handshake.node package --
-     * every single .class file, not a hand-picked list of "the ones
-     * that matter." This exists because of a second, real gap found
-     * in an earlier, narrower version of this method that only
-     * fingerprinted BlockProcessor.class plus one caller-specified
-     * class: UrkelNameTree.java, UrkelTree.java, UrkelNodeStore.java,
-     * ReservedNames.java, HandshakeCovenantRules.java, ChainDB.java,
-     * and others all directly affect what a replay actually computes,
-     * and naming "the relevant classes" one at a time is exactly the
-     * same fragile, remember-to-update-it burden this mechanism exists
-     * to eliminate in the first place -- it would only take one more
-     * change in one more file this list doesn't happen to mention to
-     * silently defeat it again. Hashing every compiled class in the
-     * package needs no such list and cannot miss a file that turns
-     * out to matter, because nothing is excluded to begin with.
+     * A fingerprint of every compiled class that can affect what block
+     * processing computes or how a recovery replay runs (see
+     * affectsTreeLogic() for the exact set): consensus/covenant rules,
+     * the Urkel tree, crypto, and the chain database's name handling. It is
+     * checked before a saved recovery checkpoint is resumed, so progress is
+     * never silently continued under different rules.
      * <p>
-     * Handles both an exploded classes directory (e.g. IntelliJ's own
-     * target/classes) and a packaged jar, since either is a real way
-     * this project might be run.
+     * Earlier versions hashed EVERY class in the package, which meant any
+     * rebuilt jar (even a web-admin text change) discarded hours of replay
+     * progress. Networking, the admin/RPC server, the mempool, indexes,
+     * configuration, storage tuning and diagnostics are now excluded; any
+     * change to a class that remains still invalidates a checkpoint.
+     * <p>
+     * Handles both an exploded classes directory (searched recursively) and
+     * a packaged jar, since either is a real way this project might be run.
      */
     public static String computeCovenantLogicFingerprint() {
         try {
@@ -101,42 +97,35 @@ public class BlockProcessor {
             java.net.URL location = BlockProcessor.class.getProtectionDomain().getCodeSource().getLocation();
             File classpathRoot = new File(location.toURI());
 
+            // (path relative to the classpath root, bytes) for every class under
+            // handshake/node/ that can affect the tree, sorted by path. Works for
+            // an exploded classes directory (searched recursively -- an earlier
+            // version only looked at the top-level folder, missing every
+            // sub-package) and for a packaged jar.
+            java.util.TreeMap<String, byte[]> logic = new java.util.TreeMap<>();
             if (classpathRoot.isDirectory()) {
-                File packageDir = new File(classpathRoot, "handshake/node");
-                File[] classFiles = packageDir.listFiles((dir, name) -> name.endsWith(".class"));
-                if (classFiles == null) {
-                    throw new IllegalStateException(
-                            "Could not list handshake/node class files at " + packageDir);
-                }
-                Arrays.sort(classFiles, Comparator.comparing(File::getName));
-                for (File f : classFiles) {
-                    digest.update(f.getName().getBytes(StandardCharsets.UTF_8));
-                    try (InputStream in = new java.io.FileInputStream(f)) {
-                        byte[] buf = new byte[8192];
-                        int n;
-                        while ((n = in.read(buf)) != -1) digest.update(buf, 0, n);
-                    }
-                }
+                File base = new File(classpathRoot, "handshake/node");
+                collectLogicClasses(classpathRoot.toPath(), base, logic);
             } else {
                 try (java.util.jar.JarFile jar = new java.util.jar.JarFile(classpathRoot)) {
-                    List<java.util.jar.JarEntry> entries = new ArrayList<>();
                     java.util.Enumeration<java.util.jar.JarEntry> e = jar.entries();
                     while (e.hasMoreElements()) {
                         java.util.jar.JarEntry entry = e.nextElement();
-                        if (entry.getName().startsWith("handshake/node/") && entry.getName().endsWith(".class")) {
-                            entries.add(entry);
-                        }
-                    }
-                    entries.sort(Comparator.comparing(java.util.jar.JarEntry::getName));
-                    for (java.util.jar.JarEntry entry : entries) {
-                        digest.update(entry.getName().getBytes(StandardCharsets.UTF_8));
-                        try (InputStream in = jar.getInputStream(entry)) {
-                            byte[] buf = new byte[8192];
-                            int n;
-                            while ((n = in.read(buf)) != -1) digest.update(buf, 0, n);
+                        String name = entry.getName();
+                        if (name.startsWith("handshake/node/") && name.endsWith(".class") && affectsTreeLogic(name)) {
+                            try (InputStream in = jar.getInputStream(entry)) {
+                                logic.put(name, in.readAllBytes());
+                            }
                         }
                     }
                 }
+            }
+            if (logic.isEmpty()) {
+                throw new IllegalStateException("Found no handshake.node class files under " + classpathRoot);
+            }
+            for (java.util.Map.Entry<String, byte[]> en : logic.entrySet()) {
+                digest.update(en.getKey().getBytes(StandardCharsets.UTF_8));
+                digest.update(en.getValue());
             }
 
             byte[] hash = digest.digest();
@@ -146,6 +135,49 @@ public class BlockProcessor {
         } catch (Exception e) {
             throw new RuntimeException("Failed to compute covenant logic fingerprint", e);
         }
+    }
+
+    private static void collectLogicClasses(java.nio.file.Path root, File dir,
+                                            java.util.Map<String, byte[]> out) throws java.io.IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File f : files) {
+            if (f.isDirectory()) {
+                collectLogicClasses(root, f, out);
+            } else if (f.getName().endsWith(".class")) {
+                String rel = root.relativize(f.toPath()).toString().replace(File.separatorChar, '/');
+                if (affectsTreeLogic(rel)) out.put(rel, java.nio.file.Files.readAllBytes(f.toPath()));
+            }
+        }
+    }
+
+    /** Classes whose behaviour can change what block processing computes (tree
+     *  roots, name state) or how a recovery replay runs. Deliberately EXCLUDES
+     *  networking, the web admin/RPC server, the mempool, peer handling,
+     *  indexes, configuration, storage tuning and diagnostics: rebuilding the
+     *  jar for those must not throw away hours of replay progress. A change to
+     *  any class listed here still invalidates it (errs conservative). */
+    private static boolean affectsTreeLogic(String classPath) {
+        String p = classPath.substring("handshake/node/".length());
+        if (p.startsWith("crypto/")) return true;
+        if (p.startsWith("urkeltree/")) {
+            return !(p.contains("UrkelMismatchDiagnostics") || p.contains("CovenantDumpUtil")
+                    || p.contains("InspectCommitWindow"));
+        }
+        if (p.startsWith("chain/")) {
+            String n = p.substring("chain/".length());
+            for (String keep : new String[]{"BlockProcessor", "TxParser", "HeaderUtil", "ReservedNames",
+                    "HandshakeCovenantRules", "CovenantValidator", "NameRules", "ConsensusParams",
+                    "ConsensusRules"}) {
+                if (n.equals(keep + ".class") || n.startsWith(keep + "$")) return true;
+            }
+            return false;
+        }
+        if (p.startsWith("storage/")) {
+            String n = p.substring("storage/".length());
+            return n.startsWith("ChainDB") || n.startsWith("KVMap") || n.startsWith("KVStore");
+        }
+        return false; // peer/, server/, util/, Main, NodeConfig, ...
     }
 
     // Covenant types (matching TxParser constants)
@@ -1337,27 +1369,34 @@ public class BlockProcessor {
         // anything about the name's resolvable state that the tree
         // needs to prove.
         if (type != COV_BID && type != COV_REDEEM) {
-            UrkelNameState ns = new UrkelNameState();
-            ns.name = entry.name != null ? entry.name.getBytes(java.nio.charset.StandardCharsets.US_ASCII) : new byte[0];
-            ns.data = entry.resourceData != null ? entry.resourceData : new byte[0];
-            ns.height = entry.height;
-            ns.renewal = entry.renewal;
-            if (entry.ownerTxid != null && !entry.ownerTxid.isEmpty()) {
-                ns.ownerHash = fromHex(entry.ownerTxid);
-                ns.ownerIndex = entry.ownerIndex;
-            }
-            ns.value = entry.value;
-            ns.highest = entry.highest;
-            ns.transfer = entry.transfer;
-            ns.revoked = entry.revoked;
-            ns.claimed = entry.claimed;
-            ns.renewals = entry.renewals;
-            ns.registered = entry.registered;
-            ns.expired = entry.expired; // FIX: previously hardcoded false regardless of entry state -- see maybeExpire()
-            ns.weak = entry.weak;
-
-            db.getNameTree().applyNameState(nameHashBytes, ns);
+            db.getNameTree().applyNameState(nameHashBytes, toTreeState(entry));
         }
+    }
+
+    /** The Urkel-tree leaf value for a name's stored state. Single source of
+     *  truth for this mapping: used by block processing (above) AND by
+     *  UrkelTreeRecovery's fast rebuild of the tree from the names table, so
+     *  the two can never disagree about what a name's leaf looks like. */
+    public static UrkelNameState toTreeState(ChainDB.NameEntry entry) {
+        UrkelNameState ns = new UrkelNameState();
+        ns.name = entry.name != null ? entry.name.getBytes(java.nio.charset.StandardCharsets.US_ASCII) : new byte[0];
+        ns.data = entry.resourceData != null ? entry.resourceData : new byte[0];
+        ns.height = entry.height;
+        ns.renewal = entry.renewal;
+        if (entry.ownerTxid != null && !entry.ownerTxid.isEmpty()) {
+            ns.ownerHash = fromHex(entry.ownerTxid);
+            ns.ownerIndex = entry.ownerIndex;
+        }
+        ns.value = entry.value;
+        ns.highest = entry.highest;
+        ns.transfer = entry.transfer;
+        ns.revoked = entry.revoked;
+        ns.claimed = entry.claimed;
+        ns.renewals = entry.renewals;
+        ns.registered = entry.registered;
+        ns.expired = entry.expired; // FIX: previously hardcoded false regardless of entry state -- see maybeExpire()
+        ns.weak = entry.weak;
+        return ns;
     }
 
     // ── Block parsing ─────────────────────────────────────────────────────────

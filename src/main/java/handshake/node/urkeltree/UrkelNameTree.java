@@ -474,6 +474,25 @@ public class UrkelNameTree {
         if (rawOrNull == null) tree.remove(nameHash); else tree.insert(nameHash, rawOrNull);
     }
 
+    /** Makes this in-memory tree use roots that were just written to the
+     *  database by a verified repair (UrkelTreeRecovery). The recovery code
+     *  copies the repaired nodes and root hashes into the database, but this
+     *  object was built from the OLD roots when the database was opened and
+     *  would keep using (and re-saving) them. Waits for any in-flight
+     *  background reconciliation, discards every orphan candidate collected
+     *  against the old tree, then points the tree at the new roots. */
+    public void adoptRecoveredRoots(byte[] liveRootHash, byte[] committedRootHash) {
+        waitForReconciliationToSettle();
+        tree.resetOrphanTracking();
+        while (!accumulatedOrphanCandidates.isEmpty()) {
+            accumulatedOrphanCandidates.takeUpTo(DEEP_CATCHUP_DRAIN_CHUNK_SIZE);
+        }
+        boolean emptyLive = liveRootHash == null || java.util.Arrays.equals(liveRootHash, UrkelHash.ZERO);
+        tree.inject(emptyLive ? UrkelNode.Null.NIL : new UrkelNode.Hash(liveRootHash));
+        lastCommittedRoot = (committedRootHash == null) ? UrkelHash.ZERO.clone() : committedRootHash.clone();
+        sweepPending = true; // old tree's nodes are now garbage
+    }
+
     /** Reorg support: rewinds the committed root to its value before a disconnected block. */
     public void restoreCommittedRoot(byte[] root) { lastCommittedRoot = root.clone(); }
 
@@ -560,6 +579,31 @@ public class UrkelNameTree {
         this.pruningDisabled = disabled;
     }
 
+    /** True once deep-catch-up commits (which no longer delete anything) or a
+     *  recovery have left unreclaimed garbage; cleared by runVerifiedSweep(). */
+    private volatile boolean sweepPending = false;
+
+    /** One verified mark-and-sweep from the just-committed root. Failure is
+     *  non-fatal (it only leaves harmless garbage; retried at the next commit). */
+    private void runVerifiedSweep(int height) {
+        long t0 = System.currentTimeMillis();
+        System.out.println("[UrkelNameTree] Leaving catch-up at height " + height
+                + ": running one verified garbage sweep (walk from the committed root, delete "
+                + "everything unreachable). Block processing pauses until it finishes.");
+        try {
+            tree.discardPersistentReachableCache();
+            long[] r = tree.sweepUnreachable(committedRootAsNode());
+            sweepPending = false;
+            System.out.printf("[UrkelNameTree] Garbage sweep done in %.1f s: %d live nodes, %d keys scanned, "
+                            + "%d unreachable nodes removed.%n",
+                    (System.currentTimeMillis() - t0) / 1000.0, r[1], r[2], r[0]);
+        } catch (UrkelTree.PruneInterruptedException e) {
+            System.out.println("[UrkelNameTree] Garbage sweep stopped early: shutdown requested.");
+        } catch (Exception e) {
+            System.err.println("[UrkelNameTree] Garbage sweep failed (non-fatal, will retry): " + e);
+        }
+    }
+
     public boolean maybeCommit(int height, int bestKnownPeerHeight, String dataDir) {
         if (height % TREE_INTERVAL != 0) return false;
         lastCommittedRoot = tree.rootHash().clone();
@@ -585,8 +629,6 @@ public class UrkelNameTree {
         // already happened during insert()/remove(); this just collects
         // it), and means nothing is lost if several commits pass before
         // the next reconciliation actually runs.
-        accumulatedOrphanCandidates.addAll(tree.advanceOrphanGeneration());
-
         // Same threshold, same reasoning, as BlockProcessor's own
         // signature-verification skip -- see
         // BlockProcessor.SIGNATURE_VERIFICATION_DEPTH's own comment for
@@ -594,6 +636,29 @@ public class UrkelNameTree {
         // separately chosen number, matters here.
         boolean deepCatchUp = bestKnownPeerHeight > 0
                 && (bestKnownPeerHeight - height) > BlockProcessor.SIGNATURE_VERIFICATION_DEPTH;
+
+        // SAFETY: nothing is ever deleted during deep catch-up. The
+        // unvalidated "trust the orphan tracker" deletion that used to run
+        // here had a known false-positive rate that could silently delete
+        // nodes still reachable from the tree (a latent corruption that
+        // surfaced hundreds of thousands of blocks later). Candidates are
+        // simply discarded; the garbage this leaves behind is reclaimed by
+        // ONE verified mark-and-sweep (sweepUnreachable) as soon as the
+        // node leaves deep catch-up.
+        if (deepCatchUp) {
+            tree.advanceOrphanGeneration(); // result deliberately discarded
+            sweepPending = true;
+            return true;
+        }
+        java.util.Set<UrkelNodeStore.HashKey> windowOrphans = tree.advanceOrphanGeneration();
+        if (sweepPending) {
+            runVerifiedSweep(height);
+            // Anything orphaned in earlier windows is already gone (it is
+            // unreachable from the committed root), so these candidates
+            // would only be re-checked for nothing.
+            windowOrphans = java.util.Collections.emptySet();
+        }
+        accumulatedOrphanCandidates.addAll(windowOrphans);
 
         // Constructed fresh, right here, right now -- cheap (confirmed:
         // committedRootAsNode() is pure in-memory reference wrapping, no

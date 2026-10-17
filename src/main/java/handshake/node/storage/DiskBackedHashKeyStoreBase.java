@@ -47,7 +47,7 @@ abstract class DiskBackedHashKeyStoreBase
      *      each one's own constructor comment. */
     protected DiskBackedHashKeyStoreBase(String tempDirPrefix, String mapName, Long blockCacheBytesOverride) {
         try {
-            this.scratchDir = java.nio.file.Files.createTempDirectory(tempDirPrefix);
+            this.scratchDir = ScratchSpace.newDirectory(tempDirPrefix); // inside the node data directory, not /tmp
         } catch (java.io.IOException e) {
             throw new RuntimeException("Could not create a scratch directory for " + tempDirPrefix, e);
         }

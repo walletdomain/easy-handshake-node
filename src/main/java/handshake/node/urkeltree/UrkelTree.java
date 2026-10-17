@@ -631,6 +631,45 @@ public class UrkelTree {
         });
     }
 
+    /** Mark-and-sweep: deletes every node in the store that is not reachable
+     *  from {@code root}. Memory-bounded (the reachable set lives in a
+     *  DiskBackedHashKeySet and removal happens in chunks while streaming
+     *  a snapshot of the keys). Safe because the walk and the key snapshot
+     *  both happen under the exclusive-of-compaction lock on the calling
+     *  (block-processing) thread, with nothing else mutating the store, and
+     *  the root passed in is the tree's current, fully persisted root:
+     *  every node the tree can ever need next is reachable from it.
+     *  Replaces trusting incremental orphan tracking during deep catch-up
+     *  (which had a known false-positive rate that could delete live nodes).
+     *  Returns {removed, walkedNodes, keysScanned}. */
+    public long[] sweepUnreachable(UrkelNode root) {
+        if (nodeStore == null) return new long[]{0, 0, 0};
+        return nodeStore.runExclusiveOfCompaction(() -> {
+            DiskBackedHashKeySet reachable = new DiskBackedHashKeySet();
+            try {
+                WalkState ws = new WalkState();
+                collectReachable(root, reachable, ws);
+                long[] removed = {0};
+                long[] scanned = {0};
+                java.util.List<UrkelNodeStore.HashKey> batch = new java.util.ArrayList<>(50_000);
+                try (KVMap.KVSnapshot<UrkelNodeStore.HashKey> snap = nodeStore.openSnapshot()) {
+                    snap.forEachKey(key -> {
+                        scanned[0]++;
+                        if (!reachable.contains(key)) batch.add(key);
+                        if (batch.size() >= 50_000) {
+                            removed[0] += nodeStore.removeKeys(batch);
+                            batch.clear();
+                        }
+                    });
+                }
+                if (!batch.isEmpty()) removed[0] += nodeStore.removeKeys(batch);
+                return new long[]{removed[0], ws.totalVisited, scanned[0]};
+            } finally {
+                reachable.close();
+            }
+        });
+    }
+
     /** RE-ARCHITECTURE: hybrid mechanism -- the actual, primary way
      *  cleanup happens now, replacing pruneUnreachableFrom() above on
      *  the automatic path (that method stays available, unwired, as an
@@ -716,6 +755,21 @@ public class UrkelTree {
      *  yet. The very next reconcileAndRemove() call after this simply
      *  rebuilds it via a fresh full walk, exactly like the first call
      *  ever made on this tree. */
+    /** Forgets every tracked orphan candidate (pending, awaiting-next-commit)
+     *  and the reachable-set cache. Used when the tree's root is replaced
+     *  wholesale by a verified repair (see UrkelNameTree.adoptRecoveredRoots):
+     *  candidates collected against the OLD tree say nothing reliable about
+     *  the new one, and acting on them could delete a node the new tree
+     *  uses. Losing them is always safe -- the nodes simply stay on disk as
+     *  harmless unreferenced garbage. */
+    public void resetOrphanTracking() {
+        synchronized (orphanLock) {
+            pendingOrphans.clear();
+            awaitingNextCommit = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        }
+        discardPersistentReachableCache();
+    }
+
     public void discardPersistentReachableCache() {
         if (persistentReachable != null) {
             persistentReachable.close();

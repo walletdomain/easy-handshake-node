@@ -98,6 +98,13 @@ public class UrkelTreeRecovery {
     public static RecoveryResult attemptRecovery(ChainDB realDb, String dataDir,
                                                  int firstDeepCatchUpDeletionHeight,
                                                  boolean uncleanShutdownDetected) {
+        // FAST PATH FIRST, whatever the cause: the tree is derived data, so
+        // rebuilding it from the names table (verified against the header)
+        // fixes any tree-only damage in minutes and needs no knowledge of how
+        // it got damaged.
+        RecoveryResult fast = tryFastRebuild(realDb, dataDir, realDb.getBlockTip());
+        if (fast != null) return fast;
+
         int safeHeight;
         if (firstDeepCatchUpDeletionHeight != -1) {
             // Known, specific risky height -- roll back to just before
@@ -380,6 +387,9 @@ public class UrkelTreeRecovery {
 
         try {
             swapIn(realDb, scratchDb);
+            realDb.getNameTree().adoptRecoveredRoots(
+                    scratchDb.getNameTree().liveRoot(), scratchDb.getNameTree().committedRoot());
+            realDb.commit();
         } finally {
             scratchDb.close();
             deleteDir(scratchDir);
@@ -389,6 +399,83 @@ public class UrkelTreeRecovery {
                 + "from height " + safeHeight + " forward using the fully-validated path the whole way, "
                 + "confirmed to match every real header up to height " + realTipHeight + ", and folded "
                 + "into the live database.");
+    }
+
+    /** Rebuilds the Urkel tree from the names table alone. The tree is a
+     *  pure function of the set of (nameHash -> state) leaves, so if the names
+     *  table is right the rebuilt root must equal the root committed in the
+     *  next block's header -- that equality is the proof. Returns null (caller
+     *  falls back to the full replay) whenever it cannot apply or the check
+     *  fails; never swaps in anything unverified. */
+    private static RecoveryResult tryFastRebuild(ChainDB realDb, String dataDir, int tip) {
+        if (tip <= 0 || tip % UrkelNameTree.TREE_INTERVAL != 0) {
+            System.out.println("[UrkelTreeRecovery] Fast rebuild not applicable (tip " + tip
+                    + " is not on a " + UrkelNameTree.TREE_INTERVAL + "-block tree boundary) -- using full replay.");
+            return null;
+        }
+        if (realDb.hasPendingNameWrites()) {
+            System.out.println("[UrkelTreeRecovery] Fast rebuild not applicable (unflushed name writes) -- using full replay.");
+            return null;
+        }
+        byte[] nextHeader = realDb.getHeader(tip + 1);
+        if (nextHeader == null) {
+            System.out.println("[UrkelTreeRecovery] Fast rebuild not applicable (no header for height "
+                    + (tip + 1) + " to verify against) -- using full replay.");
+            return null;
+        }
+        byte[] expected = HeaderUtil.treeRoot(nextHeader);
+
+        String scratchDir = dataDir + "-recovery-scratch";
+        deleteDir(scratchDir);
+        ChainDB scratchDb = null;
+        try {
+            System.out.println("[UrkelTreeRecovery] Fast rebuild: rebuilding the tree from the names table "
+                    + "and checking it against the header at height " + (tip + 1) + " (expected root "
+                    + hex(expected) + ").");
+            long t0 = System.currentTimeMillis();
+            scratchDb = ChainDB.openScratch(scratchDir + File.separator + "chain.mv.db");
+            final ChainDB sdb = scratchDb;
+            sdb.getNameTree().setPruningDisabled(true);
+            long[] count = {0};
+            realDb.forEachNameStreaming((nameHash, entry) -> {
+                UrkelNameState st = BlockProcessor.toTreeState(entry);
+                if (st.isNull()) return;
+                sdb.getNameTree().applyNameState(nameHash, st);
+                count[0]++;
+                if (count[0] % 20_000 == 0) sdb.getNameTree().persistBlock();
+                if (count[0] % 200_000 == 0) {
+                    System.out.println("[UrkelTreeRecovery] Fast rebuild: " + count[0] + " names inserted ("
+                            + (System.currentTimeMillis() - t0) / 1000 + " s)");
+                }
+            });
+            sdb.persistNameTreeStateTimed(tip, 0);
+            byte[] rebuilt = sdb.getNameTree().committedRoot();
+            System.out.println("[UrkelTreeRecovery] Fast rebuild: " + count[0] + " names inserted in "
+                    + (System.currentTimeMillis() - t0) / 1000 + " s, rebuilt root " + hex(rebuilt));
+            if (!Arrays.equals(rebuilt, expected)) {
+                System.out.println("[UrkelTreeRecovery] Fast rebuild root does NOT match the header -- the names "
+                        + "table itself differs from the chain's. Discarding it; using full replay.");
+                sdb.close();
+                scratchDb = null;
+                deleteDir(scratchDir);
+                return null;
+            }
+            sdb.commit();
+            swapIn(realDb, sdb);
+            realDb.getNameTree().adoptRecoveredRoots(sdb.getNameTree().liveRoot(), rebuilt);
+            realDb.commit();
+            sdb.close();
+            scratchDb = null;
+            deleteDir(scratchDir);
+            return new RecoveryResult(true, "Recovery succeeded -- the tree was rebuilt from the names table "
+                    + "in " + (System.currentTimeMillis() - t0) / 1000 + " s and its root matches the header at "
+                    + "height " + (tip + 1) + ".");
+        } catch (Exception e) {
+            System.out.println("[UrkelTreeRecovery] Fast rebuild failed (" + e + ") -- using full replay.");
+            if (scratchDb != null) { try { scratchDb.close(); } catch (Exception ignore) {} }
+            deleteDir(scratchDir);
+            return null;
+        }
     }
 
     /** Folds a verified-correct scratch tree into the real database.

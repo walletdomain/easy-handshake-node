@@ -105,6 +105,9 @@ public class Main {
         }
 
         // ── 3. Chain database ─────────────────────────────────────────────────
+        // Scratch databases live inside the data directory (not /tmp, which is
+        // often small or RAM-backed); see ScratchSpace. Must precede ChainDB.open.
+        handshake.node.storage.ScratchSpace.init(Path.of(dataDir, "scratch"));
         String dbPath = dataDir + "/chain.mv.db";
         ChainDB db = ChainDB.open(dbPath);
         System.out.printf("[Main] Chain DB opened: %s (%.1f GB)%n",
