@@ -96,6 +96,7 @@ public class WebAdminServer {
     private final NodeConfig config;
     private final ChainDB db;
     private final long startTimeMillis = System.currentTimeMillis();
+    private final handshake.node.util.SystemMetrics metrics;
     private volatile ChainSync chainSync;
     private volatile Mempool mempool;
     private HttpServer server;
@@ -104,6 +105,7 @@ public class WebAdminServer {
     public WebAdminServer(NodeConfig config, ChainDB db) {
         this.config = config;
         this.db = db;
+        this.metrics = new handshake.node.util.SystemMetrics(config.getDataDir());
     }
 
     public void setChainSync(ChainSync chainSync) { this.chainSync = chainSync; }
@@ -210,7 +212,17 @@ public class WebAdminServer {
                     + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
                     : "null";
 
+            handshake.node.util.SystemMetrics.Snapshot m = metrics.snapshot();
+            String sysField = "{"
+                    + "\"processCpu\":" + pct(m.processCpu()) + ","
+                    + "\"systemCpu\":" + pct(m.systemCpu()) + ","
+                    + "\"heapUsed\":" + m.heapUsed() + ",\"heapMax\":" + m.heapMax() + ","
+                    + "\"physTotal\":" + m.physTotal() + ",\"physFree\":" + m.physFree() + ","
+                    + "\"diskUsable\":" + m.diskUsable() + ",\"diskTotal\":" + m.diskTotal() + ","
+                    + "\"diskLevel\":\"" + m.diskLevel() + "\"}";
+
             String json = "{"
+                    + "\"system\":" + sysField + ","
                     + "\"version\":\"" + jsonEscape(NodeConfig.VERSION) + "\","
                     + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
                     + "\"blockHeight\":" + blockHeight + ","
@@ -223,6 +235,11 @@ public class WebAdminServer {
         } finally {
             ex.close();
         }
+    }
+
+    /** CPU load 0..1 as a percentage with one decimal, or null when the JDK reports it unknown. */
+    private static String pct(double load) {
+        return load < 0 ? "null" : String.format(java.util.Locale.ROOT, "%.1f", load * 100.0);
     }
 
     /** Formats a duration as "Xd Xh Xm Xs", omitting leading zero units

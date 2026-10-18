@@ -24,10 +24,19 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
     private final Function<byte[], K> decodeKey;
     private final Function<V, byte[]> encodeValue;
     private final Function<byte[], V> decodeValue;
+    private final BatchContext batch;
 
     public RocksDBKVMap(RocksDB db, ColumnFamilyHandle cf,
                         Function<K, byte[]> encodeKey, Function<byte[], K> decodeKey,
                         Function<V, byte[]> encodeValue, Function<byte[], V> decodeValue) {
+        this(db, cf, encodeKey, decodeKey, encodeValue, decodeValue, null);
+    }
+
+    public RocksDBKVMap(RocksDB db, ColumnFamilyHandle cf,
+                        Function<K, byte[]> encodeKey, Function<byte[], K> decodeKey,
+                        Function<V, byte[]> encodeValue, Function<byte[], V> decodeValue,
+                        BatchContext batch) {
+        this.batch = batch;
         this.db = db;
         this.cf = cf;
         this.encodeKey = encodeKey;
@@ -39,7 +48,8 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
     @Override
     public V get(K key) {
         try {
-            byte[] raw = db.get(cf, encodeKey.apply(key));
+            byte[] k = encodeKey.apply(key);
+            byte[] raw = (batch != null && batch.active()) ? batch.get(cf, k) : db.get(cf, k);
             return raw == null ? null : decodeValue.apply(raw);
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
@@ -57,7 +67,8 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
         // unnecessary cost on what's actually a hot path (every
         // covenant-touching transaction writes here).
         try {
-            db.put(cf, encodeKey.apply(key), encodeValue.apply(value));
+            if (batch != null && batch.active()) batch.put(cf, encodeKey.apply(key), encodeValue.apply(value));
+            else db.put(cf, encodeKey.apply(key), encodeValue.apply(value));
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
@@ -70,7 +81,8 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
         // return value anywhere in this codebase, so this avoids an
         // unnecessary extra get() before every delete.
         try {
-            db.delete(cf, encodeKey.apply(key));
+            if (batch != null && batch.active()) batch.delete(cf, encodeKey.apply(key));
+            else db.delete(cf, encodeKey.apply(key));
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
@@ -87,7 +99,8 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
             // still correct, just not maximally fast for the
             // definitely-absent case. Not a hot enough path here to
             // warrant the extra complexity.
-            return db.get(cf, encodeKey.apply(key)) != null;
+            byte[] k = encodeKey.apply(key);
+            return ((batch != null && batch.active()) ? batch.get(cf, k) : db.get(cf, k)) != null;
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
@@ -200,12 +213,21 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
     @Override
     public void applyOps(List<Map.Entry<K, V>> ops) {
         if (ops.isEmpty()) return;
-        try (WriteBatch batch = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
+        if (batch != null && batch.active()) {
+            try {
+                for (Map.Entry<K, V> e : ops) {
+                    if (e.getValue() == null) batch.delete(cf, encodeKey.apply(e.getKey()));
+                    else batch.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
+                }
+            } catch (RocksDBException e) { throw new RuntimeException(e); }
+            return;
+        }
+        try (WriteBatch wb = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
             for (Map.Entry<K, V> e : ops) {
-                if (e.getValue() == null) batch.delete(cf, encodeKey.apply(e.getKey()));
-                else batch.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
+                if (e.getValue() == null) wb.delete(cf, encodeKey.apply(e.getKey()));
+                else wb.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
             }
-            db.write(wOpts, batch);
+            db.write(wOpts, wb);
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
@@ -346,11 +368,18 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
      *  in real, high-covenant-volume ranges of the chain. */
     @Override
     public void putAll(Map<K, V> entries) {
-        try (WriteBatch batch = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
+        if (batch != null && batch.active()) {
+            try {
+                for (Map.Entry<K, V> e : entries.entrySet())
+                    batch.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
+            } catch (RocksDBException e) { throw new RuntimeException(e); }
+            return;
+        }
+        try (WriteBatch wb = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
             for (Map.Entry<K, V> e : entries.entrySet()) {
-                batch.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
+                wb.put(cf, encodeKey.apply(e.getKey()), encodeValue.apply(e.getValue()));
             }
-            db.write(wOpts, batch);
+            db.write(wOpts, wb);
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
@@ -365,11 +394,17 @@ class RocksDBKVMap<K, V> implements KVMap<K, V> {
      *  ever being used here. */
     @Override
     public int removeAll(Collection<K> keys) {
-        try (WriteBatch batch = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
+        if (batch != null && batch.active()) {
+            try {
+                for (K key : keys) batch.delete(cf, encodeKey.apply(key));
+            } catch (RocksDBException e) { throw new RuntimeException(e); }
+            return keys.size();
+        }
+        try (WriteBatch wb = new WriteBatch(); WriteOptions wOpts = new WriteOptions()) {
             for (K key : keys) {
-                batch.delete(cf, encodeKey.apply(key));
+                wb.delete(cf, encodeKey.apply(key));
             }
-            db.write(wOpts, batch);
+            db.write(wOpts, wb);
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }

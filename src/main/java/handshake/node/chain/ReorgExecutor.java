@@ -271,12 +271,10 @@ public final class ReorgExecutor {
             byte[] hash = oldHashes.get(h - forkH - 1);
             byte[] raw = db.getSideBlock(hash);
             if (raw == null) throw new IllegalStateException("missing saved block " + h + " while restoring old branch");
-            BlockProcessor.Result r = BlockProcessor.process(raw, h, db, null, 0);
+            BlockProcessor.Result r = BlockProcessor.processAtomically(raw, h, db, null, 0);
             if (r != BlockProcessor.Result.VALID) {
                 throw new IllegalStateException("old block " + h + " no longer applies (" + r + ")");
             }
-            db.saveBlock(raw, h);
-            db.setBlockTip(h);
             db.commit();
         }
         clear(db);

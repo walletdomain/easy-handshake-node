@@ -482,6 +482,18 @@ public class UrkelNameTree {
      *  background reconciliation, discards every orphan candidate collected
      *  against the old tree, then points the tree at the new roots. */
     public void adoptRecoveredRoots(byte[] liveRootHash, byte[] committedRootHash) {
+        resetToRoots(liveRootHash, committedRootHash);
+        sweepPending = true; // old tree's nodes are now garbage
+    }
+
+    /** Points the in-memory tree back at roots that are on disk (used when a block's buffered writes are thrown away,
+     *  so the in-memory tree must not stay ahead of the database). Unlike adoptRecoveredRoots, this leaves no garbage
+     *  behind to sweep. */
+    public void reloadRoots(byte[] liveRootHash, byte[] committedRootHash) {
+        resetToRoots(liveRootHash, committedRootHash);
+    }
+
+    private void resetToRoots(byte[] liveRootHash, byte[] committedRootHash) {
         waitForReconciliationToSettle();
         tree.resetOrphanTracking();
         while (!accumulatedOrphanCandidates.isEmpty()) {
@@ -490,7 +502,6 @@ public class UrkelNameTree {
         boolean emptyLive = liveRootHash == null || java.util.Arrays.equals(liveRootHash, UrkelHash.ZERO);
         tree.inject(emptyLive ? UrkelNode.Null.NIL : new UrkelNode.Hash(liveRootHash));
         lastCommittedRoot = (committedRootHash == null) ? UrkelHash.ZERO.clone() : committedRootHash.clone();
-        sweepPending = true; // old tree's nodes are now garbage
     }
 
     /** Reorg support: rewinds the committed root to its value before a disconnected block. */
@@ -580,20 +591,29 @@ public class UrkelNameTree {
     }
 
     /** True once deep-catch-up commits (which no longer delete anything) or a
-     *  recovery have left unreclaimed garbage; cleared by runVerifiedSweep(). */
+     *  recovery have left unreclaimed garbage; becomes "due" at the first
+     *  near-tip commit and is cleared by runSweepIfDue(). */
     private volatile boolean sweepPending = false;
+    private volatile boolean sweepDue = false;
 
-    /** One verified mark-and-sweep from the just-committed root. Failure is
-     *  non-fatal (it only leaves harmless garbage; retried at the next commit). */
-    private void runVerifiedSweep(int height) {
+    /** Runs the one verified garbage sweep if it is due. MUST be called between blocks (no atomic block batch open):
+     *  it deletes straight from the database, and keeps everything reachable from BOTH the committed root and the
+     *  current live root, so nothing the tree can need next is removed. Failure is non-fatal (only leaves garbage). */
+    public void runSweepIfDue(int height) {
+        if (!sweepDue) return;
         long t0 = System.currentTimeMillis();
         System.out.println("[UrkelNameTree] Leaving catch-up at height " + height
-                + ": running one verified garbage sweep (walk from the committed root, delete "
+                + ": running one verified garbage sweep (walk from the committed and live roots, delete "
                 + "everything unreachable). Block processing pauses until it finishes.");
         try {
             tree.discardPersistentReachableCache();
-            long[] r = tree.sweepUnreachable(committedRootAsNode());
+            java.util.List<UrkelNode> roots = new java.util.ArrayList<>();
+            roots.add(committedRootAsNode());
+            byte[] live = tree.rootHash();
+            roots.add(java.util.Arrays.equals(live, UrkelHash.ZERO) ? UrkelNode.Null.NIL : new UrkelNode.Hash(live));
+            long[] r = tree.sweepUnreachable(roots);
             sweepPending = false;
+            sweepDue = false;
             System.out.printf("[UrkelNameTree] Garbage sweep done in %.1f s: %d live nodes, %d keys scanned, "
                             + "%d unreachable nodes removed.%n",
                     (System.currentTimeMillis() - t0) / 1000.0, r[1], r[2], r[0]);
@@ -652,10 +672,10 @@ public class UrkelNameTree {
         }
         java.util.Set<UrkelNodeStore.HashKey> windowOrphans = tree.advanceOrphanGeneration();
         if (sweepPending) {
-            runVerifiedSweep(height);
-            // Anything orphaned in earlier windows is already gone (it is
-            // unreachable from the committed root), so these candidates
-            // would only be re-checked for nothing.
+            // The sweep itself runs BETWEEN blocks, outside the atomic block batch (see runSweepIfDue); here we only
+            // note that it is due. Anything orphaned in earlier windows is unreachable from the roots and will be
+            // swept, so these candidates would only be re-checked for nothing.
+            sweepDue = true;
             windowOrphans = java.util.Collections.emptySet();
         }
         accumulatedOrphanCandidates.addAll(windowOrphans);

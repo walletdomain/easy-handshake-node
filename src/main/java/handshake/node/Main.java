@@ -109,7 +109,13 @@ public class Main {
         // often small or RAM-backed); see ScratchSpace. Must precede ChainDB.open.
         handshake.node.storage.ScratchSpace.init(Path.of(dataDir, "scratch"));
         String dbPath = dataDir + "/chain.mv.db";
+        String restoreNote = handshake.node.storage.SnapshotManager.restoreIfRequested(dataDir, dbPath);
+        if (restoreNote != null) {
+            System.out.println("[Main] " + restoreNote);
+            PersistentLog.logWarn(dataDir, restoreNote);
+        }
         ChainDB db = ChainDB.open(dbPath);
+        db.enableSnapshots(dataDir);
         System.out.printf("[Main] Chain DB opened: %s (%.1f GB)%n",
                 dbPath, db.getDiskSizeBytes() / 1e9);
         System.out.printf("[Main] Headers: ~%d  Blocks: ~%d  UTXOs: ~%d  Names: ~%d%n",
@@ -140,15 +146,22 @@ public class Main {
             int currentTip = db.getBlockTip();
             byte[] currentHeader = currentTip >= 0 ? db.getHeader(currentTip) : null;
             if (currentHeader != null) {
-                byte[] claimedRoot = HeaderUtil.treeRoot(currentHeader);
-                byte[] computedRoot = db.getNameTree().committedRoot();
-                if (!java.util.Arrays.equals(claimedRoot, computedRoot)) {
+                // Compare against the header AFTER the last tree boundary (see ChainDB.checkCommittedRoot) -- comparing
+                // against the header at the tip is wrong whenever the tip sits exactly on a boundary.
+                ChainDB.RootCheck check = db.checkCommittedRoot();
+                if (check == null) {
+                    System.out.println("[Main] Cannot verify the tree against the headers yet (the header after the "
+                            + "last tree boundary is not stored) -- the check will happen during sync.");
+                } else if (!check.matches()) {
+                    byte[] claimedRoot = check.claimed();
+                    byte[] computedRoot = check.computed();
                     System.err.println("[Main] Inconsistency confirmed at height " + currentTip
-                            + " -- attempting automatic recovery before allowing sync to start.");
+                            + " (tree boundary " + check.boundary() + ") -- attempting automatic recovery before "
+                            + "allowing sync to start.");
                     PersistentLog.logError(dataDir, String.format(
-                            "Startup consistency check found a mismatch at height %d after an unclean "
+                            "Startup consistency check found a mismatch at height %d (boundary %d) after an unclean "
                                     + "shutdown -- header claims %s, we computed %s",
-                            currentTip, hex(claimedRoot), hex(computedRoot)));
+                            currentTip, check.boundary(), hex(claimedRoot), hex(computedRoot)));
                     UrkelTreeRecovery.RecoveryResult result = UrkelTreeRecovery.attemptRecovery(
                             db, dataDir, db.getNameTree().firstDeepCatchUpDeletionHeight(), true);
                     if (!result.success) {
@@ -163,13 +176,20 @@ public class Main {
                                 + "state. This needs direct investigation.");
                         PersistentLog.logError(dataDir,
                                 "Startup recovery FAILED, refusing to start sync: " + result.message);
+                        if (handshake.node.storage.SnapshotManager.requestRestore(dataDir)) {
+                            System.err.println("[Main] A verified snapshot exists. Closing the database; the NEXT start restores it "
+                                    + "automatically (a service manager restarts the node on its own; otherwise start it again).");
+                            PersistentLog.logWarn(dataDir, "Requested snapshot restore on next start.");
+                            try { db.close(); } catch (Throwable ignored) { }
+                            System.exit(5);
+                        }
                         System.exit(1);
                     }
                     PersistentLog.logWarn(dataDir, "Startup recovery succeeded: " + result.message);
                     System.out.println("[Main] Recovery succeeded: " + result.message);
                 } else {
                     System.out.println("[Main] On-disk state verified consistent at height " + currentTip
-                            + " -- no recovery needed.");
+                            + " (tree boundary " + check.boundary() + ") -- no recovery needed.");
                 }
             } else if (currentTip >= 0 && currentTip > db.getHeaderTip()) {
                 // Header tip was rolled back below the block tip (see
@@ -286,6 +306,40 @@ public class Main {
         // to run alongside it has been removed. It duplicated this same
         // responsibility with an older, incompatible message-framing
         // implementation that predated the fixes ChainSync now has.
+
+        // ── Disk-space guard ──────────────────────────────────────────────────
+        // A full disk is the one failure RocksDB cannot always recover from cleanly, so
+        // below DISK_CRITICAL_BYTES we stop on purpose, through the normal graceful
+        // shutdown hook, while there is still room to flush. LOW only warns (log + admin banner).
+        {
+            final handshake.node.util.SystemMetrics diskMetrics = new handshake.node.util.SystemMetrics(dataDir);
+            Thread diskGuard = new Thread(() -> {
+                handshake.node.util.SystemMetrics.DiskLevel last = handshake.node.util.SystemMetrics.DiskLevel.OK;
+                while (true) {
+                    try { Thread.sleep(30_000); } catch (InterruptedException e) { return; }
+                    long free = diskMetrics.diskUsable();
+                    handshake.node.util.SystemMetrics.DiskLevel lvl = handshake.node.util.SystemMetrics.level(free);
+                    if (lvl == handshake.node.util.SystemMetrics.DiskLevel.CRITICAL) {
+                        System.err.printf("[DiskGuard] Only %.2f GB free on the data drive -- shutting down cleanly to protect the database. Free up space and restart.%n", free / 1e9);
+                        System.exit(3);
+                    }
+                    if (lvl != last) {
+                        if (lvl == handshake.node.util.SystemMetrics.DiskLevel.LOW) {
+                            System.err.printf("[DiskGuard] WARNING: %.1f GB free on the data drive (the node stops cleanly below 2 GB).%n", free / 1e9);
+                            handshake.node.storage.SnapshotManager sm = db.snapshots();
+                            if (sm != null && sm.hasSnapshot()) {
+                                sm.deleteAll();
+                                System.err.println("[DiskGuard] Deleted the verified snapshot to free disk space; a new one is taken once space allows.");
+                            }
+                        }
+                        else System.out.println("[DiskGuard] Disk space back to normal.");
+                        last = lvl;
+                    }
+                }
+            }, "disk-guard");
+            diskGuard.setDaemon(true);
+            diskGuard.start();
+        }
 
         // ── Shutdown hook ─────────────────────────────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

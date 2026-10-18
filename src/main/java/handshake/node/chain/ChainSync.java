@@ -904,6 +904,12 @@ public class ChainSync {
                                 + "automatic attempt.");
                         PersistentLog.logError(config.getDataDir(),
                                 "Urkel tree mismatch recovery FAILED: " + result.message);
+                        if (handshake.node.storage.SnapshotManager.requestRestore(config.getDataDir())) {
+                            System.err.println("[ChainSync] A verified snapshot exists -- stopping the node now; the next start "
+                                    + "restores it automatically and sync resumes from there.");
+                            PersistentLog.logWarn(config.getDataDir(), "Requested snapshot restore on next start.");
+                            new Thread(() -> System.exit(5), "snapshot-restore-exit").start();
+                        }
                     }
                     return;
                 } catch (Exception e) {
@@ -2695,7 +2701,7 @@ public class ChainSync {
         // downloaded, or it would never get re-requested (from this peer
         // or, ideally, a different one) and the UTXO/name-state database
         // would be permanently missing this height's changes.
-        BlockProcessor.Result result = BlockProcessor.process(rawBlock, height, db, mempool, getBestKnownPeerHeight());
+        BlockProcessor.Result result = BlockProcessor.processAtomically(rawBlock, height, db, mempool, getBestKnownPeerHeight());
         if (result == BlockProcessor.Result.REJECTED) {
             // A genuine consensus violation (bad merkle root, failed
             // signature) -- this peer actually sent us something
@@ -2728,8 +2734,7 @@ public class ChainSync {
         if (fromIp != null) PeerTable.get().recordValidData(fromIp);
 
         // Store block
-        db.saveBlock(rawBlock, height);
-        db.setBlockTip(height);
+        // (the block itself and the new tip were written atomically with the rest of the block, above)
         ReorgExecutor.onBlockConnected(db, height, reorgHook());
         blocksDownloaded.incrementAndGet();
         lastBlockTime.set(System.currentTimeMillis());

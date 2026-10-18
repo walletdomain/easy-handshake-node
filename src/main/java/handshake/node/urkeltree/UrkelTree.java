@@ -642,13 +642,13 @@ public class UrkelTree {
      *  Replaces trusting incremental orphan tracking during deep catch-up
      *  (which had a known false-positive rate that could delete live nodes).
      *  Returns {removed, walkedNodes, keysScanned}. */
-    public long[] sweepUnreachable(UrkelNode root) {
+    public long[] sweepUnreachable(java.util.List<UrkelNode> roots) {
         if (nodeStore == null) return new long[]{0, 0, 0};
         return nodeStore.runExclusiveOfCompaction(() -> {
             DiskBackedHashKeySet reachable = new DiskBackedHashKeySet();
             try {
                 WalkState ws = new WalkState();
-                collectReachable(root, reachable, ws);
+                for (UrkelNode root : roots) collectReachable(root, reachable, ws);
                 long[] removed = {0};
                 long[] scanned = {0};
                 java.util.List<UrkelNodeStore.HashKey> batch = new java.util.ArrayList<>(50_000);

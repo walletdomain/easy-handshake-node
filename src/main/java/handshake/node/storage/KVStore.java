@@ -60,6 +60,22 @@ public interface KVStore {
      *  caller already calls it expecting "make sure this is safely on
      *  disk," which is the right level of abstraction to preserve even
      *  if what satisfies it differs by engine. */
+    /** Starts an ATOMIC WRITE BATCH owned by the calling thread. Until commitBatch() or discardBatch(): this thread's
+     *  put/remove/putAll/removeAll/applyOps calls are buffered (and this thread's get/containsKey see them); every other
+     *  thread keeps seeing only committed data. commitBatch() then applies everything in ONE atomic write, so a crash
+     *  or power cut leaves either all of it or none of it. Iterators and snapshots always read committed data only.
+     *  Default implementation: no batching (writes go straight through, as before). */
+    default void beginBatch() {}
+    /** Atomically writes everything buffered since beginBatch(). */
+    default void commitBatch() {}
+    /** Throws away everything buffered since beginBatch(); nothing reaches the database. */
+    default void discardBatch() {}
+    /** True if the calling thread currently has an open batch. */
+    default boolean batchOpen() { return false; }
+
+    /** Writes a consistent point-in-time copy (hard links where the engine supports it) into a NEW directory. */
+    default void createCheckpoint(String dir) { throw new UnsupportedOperationException("checkpoints not supported"); }
+
     void commit();
 
     /** Reclaims disk space from old, superseded data -- time-bounded so

@@ -433,6 +433,68 @@ public class ChainDB {
         return dataDir;
     }
 
+    /** Result of {@link #checkCommittedRoot()}. */
+    public record RootCheck(boolean matches, int boundary, byte[] claimed, byte[] computed) {}
+
+    /** Checks the tree's committed root against the chain's own header. The committed root is the tree as of the last
+     *  36-block boundary at or before the block tip; the header that commits to it is the one AFTER that boundary
+     *  (header[boundary+1].treeRoot), NOT the header at the tip (which commits to the previous boundary whenever the tip
+     *  is exactly on a boundary). Returns null if it cannot be checked (nothing applied yet, or that header not yet known). */
+    public RootCheck checkCommittedRoot() {
+        int tip = getBlockTip();
+        if (tip < 0) return null;
+        int boundary = tip - tip % UrkelNameTree.TREE_INTERVAL;
+        byte[] header = getHeader(boundary + 1);
+        if (header == null) return null;
+        byte[] claimed = HeaderUtil.treeRoot(header);
+        byte[] computed = nameTree.committedRoot();
+        return new RootCheck(java.util.Arrays.equals(claimed, computed), boundary, claimed, computed);
+    }
+
+    // ── Atomic block batch ────────────────────────────────────────────────────
+
+    /** Opens an atomic write batch for the block about to be applied (see KVStore.beginBatch). Everything the
+     *  block changes -- coins, names, Urkel nodes and roots, indexes in this database, undo record, the stored block
+     *  and the block tip -- is buffered and then written in ONE atomic RocksDB write by commitBlockBatch(), so a crash
+     *  or power cut can never leave a half-applied block on disk. */
+    public void beginBlockBatch() { store.beginBatch(); }
+
+    /** Atomically writes the whole block (see beginBlockBatch). */
+    public void commitBlockBatch() { store.commitBatch(); }
+
+    /** Throws the block's buffered writes away and puts every in-memory structure that was ahead of the database
+     *  (the name tree, buffered name writes, the undo recording) back to match what is actually on disk. */
+    public void discardBlockBatch() {
+        store.discardBatch();
+        pendingNameWrites.clear();
+        recording = null;
+        nameTree.setUndoSink(null);
+        nameTree.reloadRoots(fromHexOrZero(meta.get(META_URKEL_LIVE_ROOT)),
+                fromHexOrZero(meta.get(META_URKEL_COMMITTED_ROOT)));
+    }
+
+    public boolean blockBatchOpen() { return store.batchOpen(); }
+
+    /** Maintenance that must run between blocks, outside any atomic block batch. */
+    public void runBetweenBlocksMaintenance(int height) {
+        nameTree.runSweepIfDue(height);
+        SnapshotManager sm = snapshots;
+        if (sm != null) sm.maybeSnapshot(this, height);
+    }
+
+    private volatile SnapshotManager snapshots;
+
+    /** Turns on verified snapshots (the live node only; scratch/read-only databases never call this). */
+    public SnapshotManager enableSnapshots(String dataDirPath) {
+        SnapshotManager sm = new SnapshotManager(dataDirPath);
+        this.snapshots = sm;
+        return sm;
+    }
+
+    public SnapshotManager snapshots() { return snapshots; }
+
+    void createCheckpoint(String dir) { store.createCheckpoint(dir); }
+
     public void commit() {
         // FIX: wait for any in-flight background reconciliation to
         // finish before flushing -- otherwise a commit can declare a
@@ -855,6 +917,19 @@ public class ChainDB {
      * one (in which case local state must be treated as damaged).
      */
     public void disconnectBlock(int height) {
+        // All-or-nothing, like connecting: a crash mid-disconnect must not leave a half-undone block.
+        beginBlockBatch();
+        try {
+            disconnectBlockInBatch(height);
+            commitBlockBatch();
+        } catch (Throwable t) {
+            if (blockBatchOpen()) discardBlockBatch();
+            throw t;
+        }
+        commit();
+    }
+
+    private void disconnectBlockInBatch(int height) {
         UndoRecord u = getUndo(height);
         if (u == null) throw new IllegalStateException("no undo record for height " + height);
         if (getBlockTip() != height) {
@@ -891,7 +966,6 @@ public class ChainDB {
         blocks.remove((long) height);
         setBlockTip(height - 1);
         undo.remove((long) height);
-        commit();
     }
 
     public void removeUndo(int height) { if (undo != null) undo.remove((long) height); }
@@ -1324,6 +1398,16 @@ public class ChainDB {
     /** Streams every stored name, in key order, to {@code action} one at a
      *  time (never materializes the whole table: memory stays flat however
      *  many names exist). Used by the Urkel tree rebuild in UrkelTreeRecovery. */
+    /** Streams every UTXO (36-byte key, stored string) from a snapshot; developer/test tools only. */
+    public void forEachUtxoStreaming(java.util.function.BiConsumer<byte[], String> action) {
+        try (KVMap.KVSnapshot<byte[]> snapshot = utxos.openSnapshot()) {
+            snapshot.forEachKey(key -> {
+                String raw = utxos.get(key);
+                if (raw != null) action.accept(key, raw);
+            });
+        }
+    }
+
     public void forEachNameStreaming(java.util.function.BiConsumer<byte[], NameEntry> action) {
         // Reads the stored table only; callers that need the in-flight block's
         // writes too must check hasPendingNameWrites() first (see UrkelTreeRecovery).

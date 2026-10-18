@@ -36,6 +36,10 @@ public final class WebAdminServerContent {
                     Node halted -- Urkel tree root mismatch at height <span id="halt-height"></span>.
                     This needs investigation or recovery before sync can safely resume.
                 </div>
+                <div id="disk-banner" style="display:none; background:#8a5a00; color:#fff; padding:12px 20px; font-weight:bold;">
+                    Low disk space: <span id="disk-banner-free"></span> free on the node's drive.
+                    The node shuts down cleanly below 2 GB free. Free up space or move the data directory.
+                </div>
                 <main>
                     <div class="column">
                         <section class="card">
@@ -44,6 +48,9 @@ public final class WebAdminServerContent {
                             <p>Block Height: <span id="block-height">Loading...</span></p>
                             <p>Sync Progress: <span id="sync-percent">Loading...</span></p>
                             <p>Chain Database: <span id="db-size">Loading...</span></p>
+                            <p>CPU (node / whole machine): <span id="cpu-use">Loading...</span></p>
+                            <p>Memory (node heap / machine): <span id="mem-use">Loading...</span></p>
+                            <p>Disk free (node's drive): <span id="disk-free">Loading...</span></p>
                         </section>
 
                         <section class="card">
@@ -707,6 +714,20 @@ public final class WebAdminServerContent {
                             + data.blockHeight + " of " + data.networkHeight + ")";
                     }
                     document.getElementById("db-size").textContent = data.dbSizeGB + " GB";
+                    if (data.system) {
+                        const s = data.system, gb = b => (b / 1073741824).toFixed(1) + " GB";
+                        const pc = v => v === null ? "n/a" : v + "%";
+                        document.getElementById("cpu-use").textContent = pc(s.processCpu) + " / " + pc(s.systemCpu);
+                        const physUsed = s.physTotal > 0 ? gb(s.physTotal - s.physFree) + " of " + gb(s.physTotal) + " used" : "n/a";
+                        document.getElementById("mem-use").textContent = gb(s.heapUsed) + " of " + gb(s.heapMax) + " max / " + physUsed;
+                        document.getElementById("disk-free").textContent = s.diskUsable >= 0
+                            ? gb(s.diskUsable) + " free of " + gb(s.diskTotal) : "n/a";
+                        const db = document.getElementById("disk-banner");
+                        if (s.diskLevel !== "OK") {
+                            document.getElementById("disk-banner-free").textContent = gb(s.diskUsable);
+                            db.style.display = "block";
+                        } else { db.style.display = "none"; }
+                    }
 
                     // FIX (audit): the backend already tracked and exposed
                     // this halt state (ChainSync.haltedDueToTreeMismatch())

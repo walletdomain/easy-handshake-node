@@ -128,6 +128,7 @@ class RocksDBKVStore implements KVStore {
     private static final int MAX_WRITE_BUFFER_NUMBER = 2;                      // RocksDB's own default -- kept, not reduced further, since going lower would force more frequent flushes and hurt write throughput for little further memory benefit
 
     private final RocksDB db;
+    private final BatchContext batchCtx;
     private final DBOptions dbOptions;
     private final String path;
     private final boolean readOnly;
@@ -211,6 +212,11 @@ class RocksDBKVStore implements KVStore {
                 .setListeners(List.of(compactionListener()))
                 // Compaction reads whole files in 2MB sequential chunks instead of many small reads: far fewer disk operations
                 .setCompactionReadaheadSize(2L * 1024 * 1024);
+        // CRASH CONSISTENCY: with several column families sharing one write-ahead log, flushing one family's memtable
+        // to disk while another's is still only in the log can leave the families at different points in time after a
+        // power cut (e.g. names ahead of the block tip). Atomic flush makes RocksDB flush all families together, so the
+        // recovered database is one consistent point in time. (Not needed for read-only or throwaway scratch stores.)
+        if (!readOnly && !countAsScratch) dbOptions.setAtomicFlush(true);
 
         List<byte[]> existingNames;
         try {
@@ -247,7 +253,15 @@ class RocksDBKVStore implements KVStore {
         for (int i = 0; i < existingNames.size(); i++) {
             handles.put(new String(existingNames.get(i), StandardCharsets.UTF_8), handleList.get(i));
         }
+        this.batchCtx = new BatchContext(db);
     }
+
+    // ── atomic write batch (see KVStore.beginBatch) ───────────────────────────
+
+    @Override public void beginBatch()   { if (!readOnly) batchCtx.begin(); }
+    @Override public void commitBatch()  { if (!readOnly) batchCtx.commit(); }
+    @Override public void discardBatch() { if (!readOnly) batchCtx.discard(); }
+    @Override public boolean batchOpen() { return batchCtx.active(); }
 
     /** Builds a ColumnFamilyOptions bounded to the constants above --
      *  every column family this store ever opens (both the initial
@@ -426,7 +440,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 RocksDBKVStore::longToBytes, RocksDBKVStore::bytesToLong,
-                IDENTITY, IDENTITY);
+                IDENTITY, IDENTITY,
+                batchCtx);
     }
 
     @Override
@@ -434,7 +449,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8),
-                s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8));
+                s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8),
+                batchCtx);
     }
 
     @Override
@@ -442,7 +458,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8),
-                IDENTITY, IDENTITY);
+                IDENTITY, IDENTITY,
+                batchCtx);
     }
 
     @Override
@@ -450,7 +467,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8),
-                RocksDBKVStore::longToBytes, RocksDBKVStore::bytesToLong);
+                RocksDBKVStore::longToBytes, RocksDBKVStore::bytesToLong,
+                batchCtx);
     }
 
     /** RE-ARCHITECTURE: part of the project's byte-keyed-storage change
@@ -466,7 +484,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 IDENTITY, IDENTITY,
-                IDENTITY, IDENTITY);
+                IDENTITY, IDENTITY,
+                batchCtx);
     }
 
     /** Same reasoning as openBytesBytesMap() just above, for the one
@@ -477,7 +496,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 IDENTITY, IDENTITY,
-                RocksDBKVStore::longToBytes, RocksDBKVStore::bytesToLong);
+                RocksDBKVStore::longToBytes, RocksDBKVStore::bytesToLong,
+                batchCtx);
     }
 
     /** Same reasoning as the two methods just above, for the byte[]-keyed,
@@ -489,7 +509,8 @@ class RocksDBKVStore implements KVStore {
         ColumnFamilyHandle cf = getOrCreateHandle(name);
         return new RocksDBKVMap<>(db, cf,
                 IDENTITY, IDENTITY,
-                s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8));
+                s -> s.getBytes(StandardCharsets.UTF_8), b -> new String(b, StandardCharsets.UTF_8),
+                batchCtx);
     }
 
     /** RocksDB durability is governed by WriteOptions/its own WAL
@@ -499,6 +520,15 @@ class RocksDBKVStore implements KVStore {
      *  every existing caller of commit() actually wants ("make sure
      *  this is safely durable"), without changing per-write behavior
      *  elsewhere. */
+    @Override
+    public void createCheckpoint(String dir) {
+        try (org.rocksdb.Checkpoint cp = org.rocksdb.Checkpoint.create(db)) {
+            cp.createCheckpoint(dir);
+        } catch (RocksDBException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     @Override
     public void commit() {
         if (readOnly) return; // nothing to flush -- a read-only handle never writes anything

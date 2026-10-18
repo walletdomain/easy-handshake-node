@@ -307,6 +307,31 @@ public class BlockProcessor {
 
     private static Result finishUndo(ChainDB db, Result r) { db.abortUndo(); return r; }
 
+    /** Applies a block ALL-OR-NOTHING: every change the block makes (coins, names, Urkel tree, undo record, the stored
+     *  block itself and the new block tip) is written in one atomic database write, only if the block is VALID.
+     *  A rejected block, an internal error, an exception (including the Urkel root mismatch halt) or a crash/power cut
+     *  at any point leaves the database exactly as it was before the block -- never half-applied. */
+    public static Result processAtomically(byte[] rawBlock, int height,
+                                           ChainDB db, Mempool mempool, int bestKnownPeerHeight) {
+        db.beginBlockBatch();
+        Result result;
+        try {
+            result = process(rawBlock, height, db, mempool, bestKnownPeerHeight);
+            if (result == Result.VALID) {
+                db.saveBlock(rawBlock, height);
+                db.setBlockTip(height);
+                db.commitBlockBatch();
+            } else {
+                db.discardBlockBatch();
+            }
+        } catch (Throwable t) {
+            if (db.blockBatchOpen()) db.discardBlockBatch();
+            throw t;
+        }
+        if (result == Result.VALID) db.runBetweenBlocksMaintenance(height);
+        return result;
+    }
+
     public static Result process(byte[] rawBlock, int height,
                                  ChainDB db, Mempool mempool, int bestKnownPeerHeight) {
         try {
@@ -873,6 +898,27 @@ public class BlockProcessor {
         // real hsd's getnameproof shows expired=true (field bit 8) at
         // that point, which nothing in this validator was producing.
         maybeExpire(entry, height);
+
+        // REPLAY GUARD: a block can legitimately be applied twice (a crash or
+        // restart after its name writes landed but before the block tip
+        // advanced, or a halted block being retried). REVEAL, RENEW and
+        // FINALIZE are the covenants that are NOT naturally idempotent:
+        // re-applying the winning REVEAL overwrites the second price
+        // (`value`) with the winning bid, and re-applying RENEW/FINALIZE
+        // counts the renewal twice -- either one silently changes the name's
+        // Urkel leaf and the tree root, surfacing much later as a root
+        // mismatch. Each of these covenants leaves a fingerprint when applied
+        // (the name's owner outpoint is this exact output; RENEW/FINALIZE also
+        // stamp renewal=height), so if that fingerprint is already present
+        // this exact covenant has already been applied: leave the name state
+        // alone and just re-assert its tree leaf (harmless if already there).
+        if ((type == COV_REVEAL || type == COV_RENEW || type == COV_FINALIZE)
+                && entry.ownerTxid != null && entry.ownerTxid.equals(txid)
+                && entry.ownerIndex == outputIndex
+                && (type == COV_REVEAL || entry.renewal == height)) {
+            db.getNameTree().applyNameState(nameHashBytes, toTreeState(entry));
+            return;
+        }
 
         // Cannot bid on a name still within its original reservation
         // window -- confirmed directly from chain.js's OPEN branch
