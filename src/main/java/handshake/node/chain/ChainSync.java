@@ -558,6 +558,53 @@ public class ChainSync {
         // most of the time.
         poolScheduler.scheduleWithFixedDelay(
                 () -> PeerTable.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
+        // Background reachability probe of never-verified addresses (see probeUnverifiedPeer()).
+        probeScheduler.scheduleWithFixedDelay(
+                this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
+    }
+
+    /** Seconds between background probes of never-verified addresses (one address per probe). */
+    private static final int PROBE_INTERVAL_SEC = 30;
+    /** An address is not probed again within this time (failures also back the address off). */
+    private static final long PROBE_MIN_GAP_MS = 30 * 60_000L;
+    /** Its own thread: a probe can block for several seconds on a dead address and must never delay the pool top-up. */
+    private final ScheduledExecutorService probeScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "chain-sync-probe");
+                t.setDaemon(true);
+                return t;
+            });
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> probeLastAttempt =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Quickly tests one address we have heard about but never connected to: connect, complete the handshake, then
+     * disconnect at once -- it never joins the outbound pool and never takes part in syncing. A success marks the
+     * address verified (agent and height are recorded); a failure counts like any failed dial (score drop and
+     * backoff, and an address that fails 5 times without ever working is forgotten). Without this, an address is
+     * only ever tried when the pool has a free slot, so most announced addresses stay "unverified" forever.
+     */
+    private void probeUnverifiedPeer() {
+        if (!running) return;
+        PeerTable.ConnectTarget t = null;
+        PeerConnection conn = null;
+        try {
+            Set<String> connected = new HashSet<>();
+            for (PeerInfo p : connectedPeers) connected.add(p.ip());
+            t = PeerTable.get().nextProbeTarget(connected, confirmedSelfIp, probeLastAttempt, PROBE_MIN_GAP_MS);
+            if (t == null) return;
+            probeLastAttempt.put(t.ip(), System.currentTimeMillis());
+            conn = connectPeer(t);
+            System.out.printf("[Prober] %s is reachable (%s, %s, h=%d)%n",
+                    t.ip(), t.plain() ? "cleartext" : "Brontide", conn.agent, conn.peerHeight);
+        } catch (Exception e) {
+            if (t != null) {
+                PeerTable.get().recordFailure(t.ip(), "probe: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                System.out.printf("[Prober] %s not reachable (%s: %s)%n", t.ip(), e.getClass().getSimpleName(), e.getMessage());
+            }
+        } finally {
+            if (conn != null) conn.close();
+        }
     }
 
     /**
@@ -705,6 +752,7 @@ public class ChainSync {
         running = false;
         scheduler.shutdown();
         poolScheduler.shutdown();
+        probeScheduler.shutdownNow();
         try {
             if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.out.println("[ChainSync] Sync cycle did not stop within 30s -- "
@@ -1391,6 +1439,17 @@ public class ChainSync {
         return null;
     }
 
+    /** The peer closed (or reset) the connection straight after our Act 1, without sending Act 2.
+     *  hsd does this when the server key we hold for it is wrong (it rotated, or the entry is stale). */
+    private static final class ActTwoClosedException extends IOException {
+        ActTwoClosedException(String msg) { super(msg); }
+    }
+
+    /** Peers whose Brontide Act 1 was rejected: dialed in cleartext for a while instead of retrying Brontide each time. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> brontideRejected =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long BRONTIDE_REJECT_MS = 6L * 3600_000L;
+
     private PeerConnection connectPeer(PeerTable.ConnectTarget target)
             throws Exception {
         // Keyless targets are cleartext peers (see PeerTable.getCandidates(),
@@ -1398,87 +1457,112 @@ public class ChainSync {
         // on the standard cleartext port).
         if (target.plain()) return connectPlainPeer(target);
 
+        Long rejectedAt = brontideRejected.get(target.ip());
+        boolean skipBrontide = rejectedAt != null && System.currentTimeMillis() - rejectedAt < BRONTIDE_REJECT_MS;
+        if (!skipBrontide) {
+            try {
+                return connectBrontidePeer(target);
+            } catch (ActTwoClosedException e) {
+                brontideRejected.put(target.ip(), System.currentTimeMillis());
+                System.out.printf("[ChainSync] %s closed on our Brontide opening (its stored key is probably stale); "
+                        + "trying cleartext on port %d instead.%n", target.ip(), PeerTable.PLAIN_PORT);
+            }
+        }
+        try {
+            PeerConnection conn = connectPlainPeer(new PeerTable.ConnectTarget(
+                    target.ip(), PeerTable.PLAIN_PORT, null, target.label()));
+            System.out.printf("[ChainSync] Connected to %s via CLEARTEXT fallback (Brontide key rejected).%n", target.ip());
+            return conn;
+        } catch (Exception e) {
+            throw new IOException("Brontide key rejected (peer closed after Act 1); cleartext fallback failed: " + e.getMessage());
+        }
+    }
+
+    private PeerConnection connectBrontidePeer(PeerTable.ConnectTarget target)
+            throws Exception {
         Socket socket = new Socket();
-        socket.connect(new InetSocketAddress(target.ip(), target.port()),
-                CONNECT_TIMEOUT_MS);
-        socket.setSoTimeout(HANDSHAKE_TIMEOUT);
+        try {
+            socket.connect(new InetSocketAddress(target.ip(), target.port()),
+                    CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(HANDSHAKE_TIMEOUT);
 
-        InputStream  in  = socket.getInputStream();
-        OutputStream out = socket.getOutputStream();
+            InputStream  in  = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
 
-        // Brontide handshake (initiator)
-        BrontideState brontide = new BrontideState(
-                identity.getPrivateKey(), target.brontideKey());
+            // Brontide handshake (initiator)
+            BrontideState brontide = new BrontideState(
+                    identity.getPrivateKey(), target.brontideKey());
 
-        // Act 1
-        byte[] act1 = brontide.genActOne();
-        if (VERBOSE_WIRE_LOGGING) {
-            System.out.printf("[Handshake] -> %s Act1 (%d bytes): %s%n",
-                    target.ip(), act1.length, toHex(act1));
-            // FIX (audit): removed a line that printed this node's own
-            // permanent static private key (identity.getPrivateKey())
-            // in plaintext hex, plus a call to
-            // brontide.debugLocalEphemeralPriv(), a method that no
-            // longer exists on BrontideState (a real compile error --
-            // this file did not build as uploaded). Even gated behind
-            // VERBOSE_WIRE_LOGGING (default off), logging the
-            // node's permanent identity key is a real exposure risk if
-            // this flag is ever flipped on for debugging and that
-            // output is captured or shared -- not something to restore
-            // even with a working method reference.
+            // Act 1
+            byte[] act1 = brontide.genActOne();
+            if (VERBOSE_WIRE_LOGGING) {
+                System.out.printf("[Handshake] -> %s Act1 (%d bytes): %s%n",
+                        target.ip(), act1.length, toHex(act1));
+                // FIX (audit): removed a line that printed this node's own
+                // permanent static private key (identity.getPrivateKey())
+                // in plaintext hex, plus a call to
+                // brontide.debugLocalEphemeralPriv(), a method that no
+                // longer exists on BrontideState (a real compile error --
+                // this file did not build as uploaded). Even gated behind
+                // VERBOSE_WIRE_LOGGING (default off), logging the
+                // node's permanent identity key is a real exposure risk if
+                // this flag is ever flipped on for debugging and that
+                // output is captured or shared -- not something to restore
+                // even with a working method reference.
+            }
+            out.write(act1);
+            out.flush();
+
+            // Act 2 -- read whatever comes back, even if incomplete, so we can
+            // see exactly what (if anything) the peer sent before closing.
+            byte[] act2 = readActTwo(in, target.ip());
+            if (VERBOSE_WIRE_LOGGING) {
+                System.out.printf("[Handshake] <- %s Act2 (%d bytes): %s%n",
+                        target.ip(), act2.length, toHex(act2));
+            }
+            brontide.recvActTwo(act2);
+
+            // Act 3
+            byte[] act3 = brontide.genActThree();
+            if (VERBOSE_WIRE_LOGGING) {
+                System.out.printf("[Handshake] -> %s Act3 (%d bytes): %s%n",
+                        target.ip(), act3.length, toHex(act3));
+            }
+            out.write(act3);
+            out.flush();
+
+            socket.setSoTimeout(READ_TIMEOUT_MS);
+
+            // P2P handshake
+            PeerConnection conn = new PeerConnection(socket, in, out, brontide,
+                    target.ip());
+            conn.doVersionHandshake(db.getBlockTip());
+
+            // Request this peer's own peer table. Fire-and-forget rather than
+            // blocking here for a response -- the ADDR reply (whenever it
+            // arrives) gets picked up by handleNonBlockMessage during whatever
+            // read loop runs next (header sync, block download, etc.), same
+            // as any other incidental message.
+            //
+            // (Was temporarily disabled during an A/B test that suspected
+            // GETADDR of interfering with GETHEADERS -- it wasn't the cause;
+            // the real bug was a foundational error in Blake2b affecting
+            // every block/header hash. Restored.)
+            conn.sendMessage(MSG_GETADDR, new byte[0]);
+
+            // Unsolicited self-announce -- see sendSelfAnnounce()'s own
+            // comment for why this, not just the reactive GETADDR-reply
+            // self-entry, turned out to be necessary. No-ops silently if we
+            // don't have a confirmed address yet (very first few connections
+            // of a genuinely fresh install, before 2-peer corroboration lands).
+            sendSelfAnnounce(conn);
+
+            PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, true);
+            return conn;
+        } catch (Exception e) {
+            try { socket.close(); } catch (IOException ignored) { }
+            throw e;
         }
-        out.write(act1);
-        out.flush();
-
-        // Act 2 -- read whatever comes back, even if incomplete, so we can
-        // see exactly what (if anything) the peer sent before closing.
-        byte[] act2 = readPartial(in, BrontideState.ACT_TWO_SIZE, target.ip());
-        if (act2 == null || act2.length != BrontideState.ACT_TWO_SIZE) {
-            throw new IOException("Incomplete Act 2");
-        }
-        if (VERBOSE_WIRE_LOGGING) {
-            System.out.printf("[Handshake] <- %s Act2 (%d bytes): %s%n",
-                    target.ip(), act2.length, toHex(act2));
-        }
-        brontide.recvActTwo(act2);
-
-        // Act 3
-        byte[] act3 = brontide.genActThree();
-        if (VERBOSE_WIRE_LOGGING) {
-            System.out.printf("[Handshake] -> %s Act3 (%d bytes): %s%n",
-                    target.ip(), act3.length, toHex(act3));
-        }
-        out.write(act3);
-        out.flush();
-
-        socket.setSoTimeout(READ_TIMEOUT_MS);
-
-        // P2P handshake
-        PeerConnection conn = new PeerConnection(socket, in, out, brontide,
-                target.ip());
-        conn.doVersionHandshake(db.getBlockTip());
-
-        // Request this peer's own peer table. Fire-and-forget rather than
-        // blocking here for a response -- the ADDR reply (whenever it
-        // arrives) gets picked up by handleNonBlockMessage during whatever
-        // read loop runs next (header sync, block download, etc.), same
-        // as any other incidental message.
-        //
-        // (Was temporarily disabled during an A/B test that suspected
-        // GETADDR of interfering with GETHEADERS -- it wasn't the cause;
-        // the real bug was a foundational error in Blake2b affecting
-        // every block/header hash. Restored.)
-        conn.sendMessage(MSG_GETADDR, new byte[0]);
-
-        // Unsolicited self-announce -- see sendSelfAnnounce()'s own
-        // comment for why this, not just the reactive GETADDR-reply
-        // self-entry, turned out to be necessary. No-ops silently if we
-        // don't have a confirmed address yet (very first few connections
-        // of a genuinely fresh install, before 2-peer corroboration lands).
-        sendSelfAnnounce(conn);
-
-        PeerTable.get().recordSuccess(target.ip(), conn.agent, conn.peerHeight, true);
-        return conn;
     }
 
     /**
@@ -1511,6 +1595,37 @@ public class ChainSync {
      * them -- so a partial or empty response is visible for debugging
      * instead of being collapsed into a generic "Incomplete Act 2".
      */
+    /** Reads the Act 2 reply, throwing an exception whose message says exactly what went wrong
+     *  (silent peer, closed connection, partial reply, reset) so the Peers page can show the real cause. */
+    private static byte[] readActTwo(InputStream in, String ip) throws IOException {
+        final int len = BrontideState.ACT_TWO_SIZE;
+        byte[] buf = new byte[len];
+        int read = 0;
+        try {
+            while (read < len) {
+                int n = in.read(buf, read, len - read);
+                if (n < 0) break; // EOF
+                read += n;
+            }
+        } catch (java.net.SocketTimeoutException e) {
+            System.out.printf("[Handshake] <- %s no Act 2 after %d/%d bytes (timed out)%n", ip, read, len);
+            throw new IOException("Act 2 timed out: peer silent for " + (HANDSHAKE_TIMEOUT / 1000) + " s after Act 1 (" + read + "/" + len + " bytes)");
+        } catch (IOException e) {
+            System.out.printf("[Handshake] <- %s Act 2 read error after %d/%d bytes: %s: %s%n",
+                    ip, read, len, e.getClass().getSimpleName(), e.getMessage());
+            if (read == 0) throw new ActTwoClosedException("Act 2: peer reset the connection right after Act 1 (" + e.getMessage() + ")");
+            throw new IOException("Act 2 read error after " + read + "/" + len + " bytes: " + e.getMessage());
+        }
+        if (read < len) {
+            System.out.printf("[Handshake] <- %s Act 2 only %d/%d bytes before close%n", ip, read, len);
+            if (read == 0) throw new ActTwoClosedException("Act 2: peer closed the connection right after Act 1 (0/" + len
+                    + " bytes; wrong key or peer full)");
+            throw new IOException("Act 2: peer closed the connection right after Act 1 (" + read + "/" + len
+                    + " bytes; wrong key or peer full)");
+        }
+        return buf;
+    }
+
     private static byte[] readPartial(InputStream in, int len, String ip) {
         byte[] buf = new byte[len];
         int read = 0;
@@ -3122,8 +3237,7 @@ public class ChainSync {
             }
         }
         if (!toRequest.isEmpty()) {
-            System.out.printf("[Mempool] %s announced %d new transaction(s); requesting them. (%s)%n",
-                    conn.ip, toRequest.size(), mempool != null ? mempool.peerTxStats() : "n/a");
+            // No per-announcement log line: the mempool reports what it accepted, summarised per peer.
             conn.sendGetData(toRequest, 1); // type 1 = TX
         }
     }
@@ -3989,8 +4103,13 @@ public class ChainSync {
                 }
             } catch (IOException e) {
                 totalBytesRecv.addAndGet(read);
-                System.out.printf("[Handshake] <- %s %s read error after %d/%d bytes: %s: %s%n",
-                        ip, label, read, len, e.getClass().getSimpleName(), e.getMessage());
+                // An idle connection with nothing to say is not an error: stay quiet when no byte of the
+                // frame had arrived yet (the caller handles the null return the same way as before).
+                boolean idle = e instanceof java.net.SocketTimeoutException && read == 0;
+                if (!idle) {
+                    System.out.printf("[Handshake] <- %s %s read error after %d/%d bytes: %s: %s%n",
+                            ip, label, read, len, e.getClass().getSimpleName(), e.getMessage());
+                }
                 return null;
             }
             totalBytesRecv.addAndGet(read);

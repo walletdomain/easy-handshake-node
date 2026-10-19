@@ -930,7 +930,13 @@ public final class WebAdminServerContent {
                 const count = st => peersAll.filter(p => p.state === st).length;
                 const chips = [];
                 chips.push('<span class="chip ok">' + count("connected") + ' connected</span>');
-                if (count("backoff")) chips.push('<span class="chip warn">' + count("backoff") + ' backed off</span>');
+                const failing = peersAll.filter(p => p.state === "backoff" || p.state === "blacklisted");
+                if (failing.length) {
+                    const kinds = {};
+                    failing.forEach(p => { const k = p.failureKind || "no reason recorded yet"; kinds[k] = (kinds[k] || 0) + 1; });
+                    const detail = Object.keys(kinds).sort((a, b) => kinds[b] - kinds[a]).map(k => kinds[k] + " " + k).join(", ");
+                    chips.push('<span class="chip warn" title="' + escapeHtml(detail) + '">' + failing.length + ' not reachable (' + escapeHtml(detail) + ')</span>');
+                }
                 if (count("banned")) chips.push('<span class="chip bad">' + count("banned") + ' banned</span>');
                 $("peers-chips").innerHTML = chips.join("");
                 $("peers-summary").textContent = peersAll.filter(isVerified).length + " verified peers";
@@ -957,7 +963,7 @@ public final class WebAdminServerContent {
 
             function tickBackoffs() {
                 document.querySelectorAll("[data-until]").forEach(el => {
-                    el.textContent = "Backoff " + fmtDur(Math.max(0, Number(el.dataset.until) - Date.now()));
+                    el.textContent = (el.dataset.label || "Backoff") + " " + fmtDur(Math.max(0, Number(el.dataset.until) - Date.now()));
                 });
             }
 
@@ -999,16 +1005,22 @@ public final class WebAdminServerContent {
 
             function scoreClass(n) { return n >= 70 ? "score-high" : (n >= 40 ? "score-mid" : "score-low"); }
 
+            function failSub(p) {
+                return p.failureKind ? ' <span class="sub" title="' + escapeHtml(p.failure || "") + '">' + escapeHtml(p.failureKind) + '</span>' : "";
+            }
+
             function pillFor(p) {
                 switch (p.state) {
                     case "banned": return '<span class="pill banned">Banned</span>';
                     case "connected":
                         return '<span class="pill connected">Connected &middot; ' + escapeHtml(p.direction)
                             + (p.transport === "plain" ? ' &middot; cleartext' : '') + '</span>';
-                    case "blacklisted": return '<span class="pill blacklisted">Blacklisted</span>';
-                    case "backoff":
-                        return '<span class="pill backoff" data-until="' + (p.backoffUntil !== undefined ? p.backoffUntil : Date.now() + p.backoffMs)
-                            + '">Backoff ' + fmtDur(backoffMsOf(p)) + '</span>';
+                    case "blacklisted": return '<span class="pill blacklisted">Blacklisted</span>' + failSub(p);
+                    case "backoff": {
+                        const lbl = isVerified(p) ? "Backoff" : "Unreachable";
+                        return '<span class="pill backoff" data-label="' + lbl + '" data-until="' + (p.backoffUntil !== undefined ? p.backoffUntil : Date.now() + p.backoffMs)
+                            + '">' + lbl + ' ' + fmtDur(backoffMsOf(p)) + '</span>' + failSub(p);
+                    }
                     case "plain": return '<span class="pill plain">Cleartext</span>';
                     default: return '<span class="pill idle" title="Known peer with a key; no open connection right now">Not connected</span>';
                 }
@@ -1023,7 +1035,7 @@ public final class WebAdminServerContent {
                     "successes: " + p.successes + "  failures: " + p.failures,
                     "valid data: " + p.validData + "  invalid data: " + p.invalidData,
                     "avg latency: " + (p.latencyMs >= 0 ? p.latencyMs + " ms" : "n/a"),
-                    "last failure: " + fmtAgo(p.lastFailure)
+                    "last failure: " + fmtAgo(p.lastFailure) + (p.failure ? " -- " + p.failure : "")
                 ];
                 if (p.state === "idle" && p.score < 25) {
                     lines.push("not being dialed normally: score " + p.score + " is under the 25 dial floor (test dial every 10 min if it has worked before)");

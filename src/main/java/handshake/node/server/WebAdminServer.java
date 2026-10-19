@@ -565,6 +565,8 @@ public class WebAdminServer {
                     .append("\"invalidData\":").append(r.invalidDataCount).append(",")
                     .append("\"lastSuccess\":").append(r.lastSuccessTime).append(",")
                     .append("\"lastFailure\":").append(r.lastFailureTime).append(",")
+                    .append("\"failure\":\"").append(jsonEscape(r.lastFailureReason == null ? "" : r.lastFailureReason)).append("\",")
+                    .append("\"failureKind\":\"").append(jsonEscape(PeerTable.failureKind(r.lastFailureReason))).append("\",")
                     .append("\"agent\":\"").append(jsonEscape(r.lastAgent == null ? "" : r.lastAgent)).append("\",")
                     .append("\"height\":").append(r.lastHeight).append(",")
                     .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs)).append(",")

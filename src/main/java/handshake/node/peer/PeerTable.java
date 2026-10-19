@@ -77,11 +77,10 @@ public class PeerTable {
      *  on this port (a gossiped host:port is untrusted input -- never let it make
      *  us connect to an arbitrary port). */
     public static final int PLAIN_PORT = 12038;
-    /** Cleartext (keyless) peers are permanently downgraded: their score can
-     *  never rise above this, so they always rank below every healthy Brontide
-     *  peer (HEALTHY is 70+) and are only used when better peers are not
-     *  available. */
-    private static final int   SCORE_PLAIN_CAP           = 40;
+    /** Cleartext (keyless) peers lose exactly 25 points against a Brontide peer: the only thing wrong with
+     *  them is that they do not encrypt, so a cleartext peer that is otherwise perfect can reach 75 (SCORE_MAX - 25)
+     *  but never the full 100. Cleartext candidates are still dialed after Brontide ones. */
+    private static final int   SCORE_PLAIN_CAP           = 75;
 
     private static final double LATENCY_EMA_ALPHA        = 0.3;
     private static final double SCORE_FAST_THRESHOLD_MS  = 800;
@@ -146,6 +145,7 @@ public class PeerTable {
         public final java.util.ArrayDeque<String> penalties = new java.util.ArrayDeque<>(); // in-memory: last few score-lowering events
         public long    gossipTime;         // ms: newest 'last seen' timestamp any peer announced for this address (0 = unknown)
         public long    lastRecoveryTime;   // in-memory only; when applyDecay last gave this peer another chance
+        public String  lastFailureReason = ""; // why the most recent connection attempt failed (short, no '|')
 
         Peer(String ip) { this.ip = ip; }
 
@@ -175,7 +175,8 @@ public class PeerTable {
             return port + "|" + nz(brontideKey) + "|" + isSeed + "|" + nz(label) + "|" + nz(source) + "|"
                     + discoveredAt + "|" + score + "|" + extra1 + "|" + failureCount + "|" + extra3 + "|"
                     + successCount + "|" + backoffLevel + "|" + lastAttemptTime + "|" + lastSuccessTime + "|"
-                    + lastFailureTime + "|" + lastHeight + "|" + nz(lastAgent) + "|" + backoffUntil + "|" + gossipTime;
+                    + lastFailureTime + "|" + lastHeight + "|" + nz(lastAgent) + "|" + backoffUntil + "|" + gossipTime
+                    + "|" + nz(lastFailureReason).replace('|', '/').replace('\n', ' ');
         }
 
         static Peer fromStorage(String ip, String s) {
@@ -200,6 +201,7 @@ public class PeerTable {
             p.lastAgent       = f.length > 16 ? f[16] : "";
             p.backoffUntil    = parseLongSafe(f, 17, 0);
             p.gossipTime      = parseLongSafe(f, 18, 0);
+            p.lastFailureReason = f.length > 19 ? f[19] : "";
             return p;
         }
 
@@ -227,7 +229,35 @@ public class PeerTable {
     /** Our own confirmed public IP, if known -- never stored, listed or dialed
      *  as a peer (our own self-announce comes back to us through gossip). */
     private volatile String selfIp = null;
-    public void setSelfIp(String ip) { this.selfIp = ip; }
+    public void setSelfIp(String ip) {
+        this.selfIp = ip;
+        if (ip != null) forgetSelf();
+    }
+
+    /** Our own Brontide public key (base32). A peer row carrying this key is this node itself, whatever its IP. */
+    private volatile String selfKey = null;
+    public void setSelfKey(String base32Key) {
+        this.selfKey = (base32Key == null || base32Key.isBlank()) ? null : base32Key;
+        if (this.selfKey != null && peersMap != null) forgetSelf();
+    }
+
+    private boolean isSelf(String ip, String key) {
+        if (ip != null && ip.equals(selfIp)) return true;
+        return selfKey != null && key != null && key.equals(selfKey);
+    }
+
+    /** Removes any stored row that is this node itself (by confirmed IP or by our own key). */
+    private void forgetSelf() {
+        boolean removed = false;
+        for (Peer r : new ArrayList<>(peers.values())) {
+            if (!isSelf(r.ip, r.brontideKey) || pinned.contains(r.ip)) continue;
+            peers.remove(r.ip);
+            if (peersMap != null) peersMap.remove(r.ip);
+            System.out.printf("[PeerTable] Removed %s from the peer table: it is this node itself.%n", r.ip);
+            removed = true;
+        }
+        if (removed && peersMap != null) ConfigDB.get().commit();
+    }
     private KVMap<String, String> peersMap;
 
     // ── Pinned peers ──────────────────────────────────────────────────────────
@@ -318,6 +348,8 @@ public class PeerTable {
             }
             if (!pinned.isEmpty()) System.out.println("[PeerTable] Pinned peers: " + new TreeSet<>(pinned));
         }
+        dropNonPublicRows();
+        forgetSelf();
         System.out.printf("[PeerTable] Loaded %d peers (%d seeds) from the config database.%n",
                 peers.size(), (int) peers.values().stream().filter(p -> p.isSeed).count());
     }
@@ -412,6 +444,12 @@ public class PeerTable {
         int added = 0, promoted = 0, alreadyKnown = 0, tombstoned = 0;
         for (SeedLine line : fromFile) {
             if (isDeleted(line.ip)) { tombstoned++; continue; }
+            if (isSelf(line.ip, line.brontideKey) || isNonPublic(line.ip)) {
+                System.out.printf("[PeerTable] seeds.txt: skipping %s (%s)%n", line.ip,
+                        isSelf(line.ip, line.brontideKey) ? "this node itself" : "not a public address");
+                tombstoned++;
+                continue;
+            }
             Peer existing = peers.get(line.ip);
             if (existing == null) {
                 Peer peer = new Peer(line.ip);
@@ -437,6 +475,23 @@ public class PeerTable {
         if (added > 0 || promoted > 0) ConfigDB.get().commit();
         System.out.printf("[PeerTable] seeds.txt: %d merged in, %d promoted, %d already known, "
                 + "%d tombstoned/skipped.%n", added, promoted, alreadyKnown, tombstoned);
+    }
+
+    /** Deletes stored rows whose address is loopback, private, link-local, CGNAT or multicast. Gossip can never
+     *  create them, so they are leftovers (tests, old versions). A peer the operator pinned is kept: pinning a LAN
+     *  machine is a deliberate choice. */
+    private void dropNonPublicRows() {
+        int dropped = 0;
+        for (Peer r : new ArrayList<>(peers.values())) {
+            if (!isNonPublic(r.ip) || pinned.contains(r.ip)) continue;
+            peers.remove(r.ip);
+            if (peersMap != null) peersMap.remove(r.ip);
+            dropped++;
+        }
+        if (dropped > 0) {
+            ConfigDB.get().commit();
+            System.out.printf("[PeerTable] Dropped %d stored peer(s) with a loopback or private address.%n", dropped);
+        }
     }
 
     private record SeedLine(String brontideKey, String ip, int port, String label) {}
@@ -538,6 +593,7 @@ public class PeerTable {
         if (ip == null || ip.isBlank()) return false;
         if (isDeleted(ip)) return false;
         if (ip.equals(selfIp)) return false;
+        if (selfKey != null && selfKey.equals(brontideKey)) return false;   // our own self-announce coming back
         String key = brontideKey != null ? brontideKey : "";
         Peer existing = peers.get(ip);
         if (existing != null) {
@@ -599,85 +655,105 @@ public class PeerTable {
             System.out.printf("[PeerTable] Received empty ADDR from %s (0 bytes).%n", fromIp);
             return;
         }
-        int entryCount = msg[0] & 0xFF;
-        int newlyAdded = 0;
-        int newPlain = 0;
+        // The entry count is a variable-length integer (hsd writeVarint): one byte up to 252, otherwise a marker
+        // byte (0xFD / 0xFE) followed by 2 or 4 bytes, little-endian. hsd sends up to 1000 entries per message.
+        int pos;
+        long declared;
+        int first = msg[0] & 0xFF;
+        if (first < 0xFD) {
+            declared = first; pos = 1;
+        } else if (first == 0xFD && msg.length >= 3) {
+            declared = (msg[1] & 0xFF) | ((msg[2] & 0xFF) << 8); pos = 3;
+        } else if (first == 0xFE && msg.length >= 5) {
+            declared = (msg[1] & 0xFFL) | ((msg[2] & 0xFFL) << 8) | ((msg[3] & 0xFFL) << 16) | ((msg[4] & 0xFFL) << 24); pos = 5;
+        } else {
+            System.out.printf("[PeerTable] ADDR from %s: unreadable entry count (first byte 0x%02x, %d byte payload).%n",
+                    fromIp, first, msg.length);
+            return;
+        }
+        final int MAX_ADDR_ENTRIES = 1000;
+        int entryCount = (int) Math.min(declared, MAX_ADDR_ENTRIES);
+
+        int newBrontide = 0, knownBrontide = 0, newPlain = 0, knownPlain = 0;
+        int stale = 0, brontideOtherPort = 0, plainOtherPort = 0, badAddress = 0, nonIpv4 = 0;
         boolean tableChanged = false;
-        int skippedWrongPort = 0;
-        int skippedKeyless = 0;
-        int skippedInvalidIp = 0;
-        int skippedAlreadyKnown = 0;
-        int skippedStale = 0;
         long nowMs = System.currentTimeMillis();
-        Integer samplePort = null;
-        String sampleKeyHex = null;
+        int parsed = 0;
         try {
-            int pos = 1;
-            for (int i = 0; i < entryCount && pos + 88 <= msg.length; i++) {
+            for (int i = 0; i < entryCount && pos + 88 <= msg.length; i++, parsed++) {
+                int e = pos;
+                pos += 88;                                   // every entry is exactly 88 bytes
                 long tsSec = 0;
-                for (int b = 7; b >= 0; b--) tsSec = (tsSec << 8) | (msg[pos + b] & 0xFF);
+                for (int b = 7; b >= 0; b--) tsSec = (tsSec << 8) | (msg[e + b] & 0xFF);
                 long seenMs = (tsSec < 0 || tsSec > 100_000_000_000L) ? 0 : tsSec * 1000L;
                 if (seenMs > nowMs + ADDR_FUTURE_SLACK_MS) seenMs = nowMs;   // bad clock: treat as just seen
-                pos += 8 + 4 + 4; // time (read above) + services + hiServices
-                pos += 1;         // skip addrType
-                byte[] ipBytes = new byte[4];
-                System.arraycopy(msg, pos + 12, ipBytes, 0, 4);
-                pos += 16;
-                pos += 20; // skip reserved
-                int port = (msg[pos] & 0xFF) | ((msg[pos + 1] & 0xFF) << 8);
-                pos += 2;
-                byte[] keyBytes = Arrays.copyOfRange(msg, pos, pos + 33);
-                pos += 33;
+                // e+16: address type, e+17..e+32: 16-byte address, e+33..e+52: reserved, e+53: port, e+55: key
+                boolean mappedIpv4 = true;
+                for (int b = 0; b < 10; b++) if (msg[e + 17 + b] != 0) { mappedIpv4 = false; break; }
+                if (!mappedIpv4) { nonIpv4++; continue; }    // IPv6 / onion: this node only dials IPv4
+                String ip = (msg[e + 29] & 0xFF) + "." + (msg[e + 30] & 0xFF)
+                        + "." + (msg[e + 31] & 0xFF) + "." + (msg[e + 32] & 0xFF);
+                if (!isValidIp(ip)) { badAddress++; continue; }
+                if (seenMs == 0 || nowMs - seenMs > ADDR_MAX_AGE_MS) { stale++; continue; }
+                int port = (msg[e + 53] & 0xFF) | ((msg[e + 54] & 0xFF) << 8);
+                byte[] keyBytes = Arrays.copyOfRange(msg, e + 55, e + 88);
 
-                String ip = (ipBytes[0] & 0xFF) + "." + (ipBytes[1] & 0xFF)
-                        + "." + (ipBytes[2] & 0xFF) + "." + (ipBytes[3] & 0xFF);
-                if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
-                if (seenMs == 0 || nowMs - seenMs > ADDR_MAX_AGE_MS) { skippedStale++; continue; }
-
-                boolean keyless = isAllZero(keyBytes);
-                if (keyless) {
-                    // Plain (cleartext, typically port 12038) peer: we can't
-                    // dial it over Brontide without its key, but remember it
-                    // so the table reflects the network we can see, and so a
-                    // key can be attached later if one ever turns up.
-                    skippedKeyless++;
-                    if (port != 44806) skippedWrongPort++;
-                    if (samplePort == null) {
-                        samplePort = port;
-                        sampleKeyHex = toHex(keyBytes);
-                    }
-                    if (addDiscoveredNoCommit("", ip, port, "addr:" + fromIp, seenMs)) {
-                        newPlain++;
-                        tableChanged = true;
-                    }
+                if (isAllZero(keyBytes)) {
+                    // Plain (cleartext) peer. Only the standard cleartext port is ever dialed, so an entry on any
+                    // other port (often an inbound peer's random source port) could never become a real peer.
+                    if (port != PLAIN_PORT) { plainOtherPort++; continue; }
+                    if (addDiscoveredNoCommit("", ip, port, "addr:" + fromIp, seenMs)) { newPlain++; tableChanged = true; }
+                    else knownPlain++;
                     continue;
                 }
-                if (port != 44806) {
-                    skippedWrongPort++;
-                    continue;
-                }
-
+                if (port != 44806) { brontideOtherPort++; continue; }
                 String base32Key = NodeIdentity.base32Encode(keyBytes);
-                if (addDiscoveredNoCommit(base32Key, ip, port, "addr:" + fromIp, seenMs)) {
-                    newlyAdded++;
-                    tableChanged = true;
-                } else {
-                    skippedAlreadyKnown++;
-                }
+                if (addDiscoveredNoCommit(base32Key, ip, port, "addr:" + fromIp, seenMs)) { newBrontide++; tableChanged = true; }
+                else knownBrontide++;
             }
             if (tableChanged) ConfigDB.get().commit();
-            System.out.printf("[PeerTable] ADDR from %s: %d entries (%d new brontide, %d new plain, "
-                            + "%d already known, %d non-44806 port, %d keyless, %d invalid IP, %d stale)%s.%n",
-                    fromIp, entryCount, newlyAdded, newPlain, skippedAlreadyKnown,
-                    skippedWrongPort, skippedKeyless, skippedInvalidIp, skippedStale,
-                    samplePort != null
-                            ? String.format(" -- first rejected entry: port=%d key=%s", samplePort, sampleKeyHex)
-                            : "");
+            System.out.printf("[PeerTable] ADDR from %s: %d entries%s -- usable: %d Brontide (%d new), %d cleartext (%d new); "
+                            + "ignored: %d stale, %d Brontide on another port, %d cleartext on another port, "
+                            + "%d invalid address, %d non-IPv4.%n",
+                    fromIp, parsed, declared != parsed ? " of " + declared + " declared" : "",
+                    newBrontide + knownBrontide, newBrontide, newPlain + knownPlain, newPlain,
+                    stale, brontideOtherPort, plainOtherPort, badAddress, nonIpv4);
         } catch (Exception e) {
             System.out.printf("[PeerTable] ADDR from %s: failed to parse "
                             + "(%d declared entries, %d byte payload): %s%n",
-                    fromIp, entryCount, msg.length, e);
+                    fromIp, declared, msg.length, e);
         }
+    }
+
+    /**
+     * The next never-verified address worth a quick reachability probe, or null. An address qualifies when we have
+     * never connected to it, it is not a seed, banned, backed off or already connected, it is dialable (a Brontide
+     * key on the standard Brontide port, or no key on the cleartext port) and it has not been probed within
+     * {@code minGapMs}. Brontide-capable addresses come first, then the most recently announced.
+     */
+    public ConnectTarget nextProbeTarget(Set<String> connected, String selfIpNow,
+                                         Map<String, Long> lastProbe, long minGapMs) {
+        long now = System.currentTimeMillis();
+        List<Peer> keyed = new ArrayList<>(), plain = new ArrayList<>();
+        for (Peer p : peers.values()) {
+            if (p.isSeed || p.successCount > 0 || pinned.contains(p.ip)) continue;
+            if (p.ip.equals(selfIpNow) || connected.contains(p.ip)) continue;
+            expireBan(p);
+            if (p.banned || p.isBackedOff() || p.isBlacklisted()) continue;
+            Long lp = lastProbe.get(p.ip);
+            if (lp != null && now - lp < minGapMs) continue;
+            if (p.hasBrontideKey()) { if (p.port == 44806) keyed.add(p); }
+            else if (p.port == PLAIN_PORT) plain.add(p);
+        }
+        Comparator<Peer> newestFirst = (x, y) -> Long.compare(y.gossipTime, x.gossipTime);
+        keyed.sort(newestFirst);
+        plain.sort(newestFirst);
+        for (Peer p : keyed) {
+            byte[] kb = NodeIdentity.base32Decode(p.brontideKey);
+            if (kb != null && kb.length == 33) return new ConnectTarget(p.ip, p.port, kb, "probe");
+        }
+        if (!plain.isEmpty()) return new ConnectTarget(plain.get(0).ip, plain.get(0).port, null, "probe");
+        return null;
     }
 
     private static boolean isAllZero(byte[] b) {
@@ -691,10 +767,19 @@ public class PeerTable {
         return sb.toString();
     }
 
+    /** True for a loopback / private / link-local / CGNAT / multicast IPv4 literal, or ::1. Anything that is not an
+     *  IPv4 literal (an IPv6 seed, say) is NOT treated as non-public, so it is left alone. */
+    private static boolean isNonPublic(String ip) {
+        if (ip == null) return false;
+        if (ip.equals("::1")) return true;
+        if (!ip.matches("\\d{1,3}(\\.\\d{1,3}){3}")) return false;
+        return !isValidIp(ip);
+    }
+
     private static boolean isValidIp(String ip) {
         if (ip == null) return false;
         if (ip.startsWith("0.") || ip.startsWith("127.") || ip.startsWith("192.168.")
-                || ip.startsWith("10.")) return false;
+                || ip.startsWith("10.") || ip.startsWith("169.254.")) return false;
         String[] parts = ip.split("\\.");
         if (parts.length != 4) return false;
         try {
@@ -703,7 +788,9 @@ public class PeerTable {
                 v[i] = Integer.parseInt(parts[i]);
                 if (v[i] < 0 || v[i] > 255) return false;
             }
-            if (v[0] == 172 && v[1] >= 16 && v[1] <= 31) return false;
+            if (v[0] == 172 && v[1] >= 16 && v[1] <= 31) return false;   // private
+            if (v[0] == 100 && v[1] >= 64 && v[1] <= 127) return false;  // carrier-grade NAT
+            if (v[0] >= 224) return false;                                // multicast / reserved / broadcast
             return true;
         } catch (NumberFormatException e) {
             return false;
@@ -722,7 +809,7 @@ public class PeerTable {
         List<ConnectTarget> plainCandidates = new ArrayList<>();
         List<ConnectTarget> pinnedCandidates = new ArrayList<>();
         for (Peer p : peers.values()) {
-            if (p.ip.equals(selfIp)) continue;
+            if (isSelf(p.ip, p.brontideKey)) continue;
             if (pinned.contains(p.ip) && !p.banned) {
                 if (p.hasBrontideKey()) {
                     byte[] kb = NodeIdentity.base32Decode(p.brontideKey);
@@ -847,16 +934,40 @@ public class PeerTable {
         }
     }
 
+    /** A short, human category for a connection-failure reason string (what the admin page groups by). */
+    public static String failureKind(String reason) {
+        if (reason == null || reason.isBlank()) return "";
+        String r = reason.toLowerCase(Locale.ROOT);
+        if (r.contains("connect timed out") || r.contains("connection timed out")) return "no response";
+        if (r.contains("refused")) return "port closed";
+        if (r.contains("no route") || r.contains("network is unreachable") || r.contains("unresolved")) return "no route";
+        if (r.contains("handshake timeout") || r.contains("read timed out") || r.contains("timed out")) return "handshake timed out";
+        if (r.contains("reset") || r.contains("eof") || r.contains("closed") || r.contains("broken pipe")
+                || r.contains("zero bytes") || r.contains("only got")) return "closed on connect";
+        if (r.contains("brontide") || r.contains("decrypt") || r.contains("act two") || r.contains("act 2")) return "Brontide handshake failed";
+        return "other";
+    }
+
     public void recordFailure(String ip, String reason) {
         Peer r = getOrCreate(ip);
-        notePenalty(r, SCORE_FAILURE_PENALTY, "failure: " + reason);
-        r.score = Math.max(0, r.score - SCORE_FAILURE_PENALTY);
+        // A gossip-discovered address we have never once connected to is not a "bad peer": it is most often a node
+        // behind NAT, one whose inbound slots are full, or a stale entry. Count the failure and back off (so we do not
+        // hammer it) but do not burn its score, so it can never be blacklisted -- only dropped after repeated failures.
+        boolean neverVerified = !r.isSeed && r.successCount == 0 && !pinned.contains(ip);
         r.failureCount++;
         r.lastFailureTime = System.currentTimeMillis();
-        if (pinned.contains(ip)) {
-            lift(r);   // pinned: never backed off, score floored
-        } else if (r.score < SCORE_BACKOFF_THRESHOLD) {
-            applyBackoff(r);
+        r.lastFailureReason = reason == null ? "" : (reason.length() > 120 ? reason.substring(0, 120) : reason);
+        if (neverVerified) {
+            r.backoffLevel = Math.min(r.backoffLevel + 1, 2);   // 5 min, 30 min, then 2 h
+            r.backoffUntil = System.currentTimeMillis() + BACKOFF_MS[r.backoffLevel];
+        } else {
+            notePenalty(r, SCORE_FAILURE_PENALTY, "failure: " + reason);
+            r.score = Math.max(0, r.score - SCORE_FAILURE_PENALTY);
+            if (pinned.contains(ip)) {
+                lift(r);   // pinned: never backed off, score floored
+            } else if (r.score < SCORE_BACKOFF_THRESHOLD) {
+                applyBackoff(r);
+            }
         }
         persist(r);
         if (r.isBlacklisted()) {
@@ -955,7 +1066,7 @@ public class PeerTable {
     /** Snapshot of every peer record (seeds, discovered, inbound-learned, banned...). */
     public List<Peer> listAllPeers() {
         List<Peer> all = new ArrayList<>(peers.values());
-        all.removeIf(p -> p.ip.equals(selfIp));
+        all.removeIf(p -> isSelf(p.ip, p.brontideKey));
         return all;
     }
 
@@ -1118,6 +1229,9 @@ public class PeerTable {
     // ── Persistence ───────────────────────────────────────────────────────────
 
     private Peer getOrCreate(String ip) {
+        if (!peers.containsKey(ip) && isNonPublic(ip) && !pinned.contains(ip)) {
+            return new Peer(ip);   // throw-away row: loopback/private callers are never stored or persisted
+        }
         return peers.computeIfAbsent(ip, k -> {
             Peer p = new Peer(k);
             p.score = isSeed(k) ? SCORE_INITIAL : SCORE_INITIAL_DISCOVERED;
@@ -1126,7 +1240,7 @@ public class PeerTable {
     }
 
     private void persist(Peer r) {
-        if (peersMap != null) {
+        if (peersMap != null && peers.get(r.ip) == r) {
             peersMap.put(r.ip, r.toStorage());
             ConfigDB.get().commit();
         }

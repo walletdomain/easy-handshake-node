@@ -163,6 +163,38 @@ public class Mempool {
 
     public Mempool(ChainDB db) {
         this.db = db;
+        java.util.concurrent.ScheduledExecutorService flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "mempool-log");
+            t.setDaemon(true);
+            return t;
+        });
+        flusher.scheduleWithFixedDelay(this::flushAcceptedLog, ACCEPT_LOG_FLUSH_MS, ACCEPT_LOG_FLUSH_MS,
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    // ── Compact "accepted" log ──
+    // Accepted transactions arrive in bursts (a peer announces dozens at once). Instead of one line each, they are
+    // counted per source and reported as one line per source every couple of seconds.
+    private static final long ACCEPT_LOG_FLUSH_MS = 2_000;
+    private final Map<String, Integer> acceptedPending = new LinkedHashMap<>();
+
+    private void noteAccepted(String fromIp) {
+        synchronized (acceptedPending) {
+            acceptedPending.merge(fromIp == null || fromIp.isBlank() ? "local" : fromIp, 1, Integer::sum);
+        }
+    }
+
+    private void flushAcceptedLog() {
+        Map<String, Integer> batch;
+        synchronized (acceptedPending) {
+            if (acceptedPending.isEmpty()) return;
+            batch = new LinkedHashMap<>(acceptedPending);
+            acceptedPending.clear();
+        }
+        for (Map.Entry<String, Integer> e : batch.entrySet()) {
+            System.out.printf("[Mempool] Accepted %d new transaction%s from %s%n",
+                    e.getValue(), e.getValue() == 1 ? "" : "s", e.getKey());
+        }
     }
 
     public void setRelayCallback(RelayCallback cb) {
@@ -234,12 +266,13 @@ public class Mempool {
     private final java.util.concurrent.atomic.AtomicInteger peerTxReceived = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger peerTxAccepted = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger peerTxRejected = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger peerTxDuplicate = new java.util.concurrent.atomic.AtomicInteger();
     private volatile long rejectLogWindowStart = 0;
     private int rejectLogsInWindow = 0;
 
     public String peerTxStats() {
         return peerTxReceived.get() + " received from peers, " + peerTxAccepted.get()
-                + " accepted, " + peerTxRejected.get() + " rejected";
+                + " accepted, " + peerTxDuplicate.get() + " duplicate, " + peerTxRejected.get() + " rejected";
     }
 
     /** What happened to a transaction a peer sent us (mirrors hsd Pool._handleTX). */
@@ -279,8 +312,14 @@ public class Mempool {
             }
             return new PeerTxResult(null, null, 0, 0, idBytes, o.missing);
         } catch (VerifyException e) {
-            // hsd: every VerifyError is answered with a REJECT and adds the error's ban score.
             String why = e.reason;
+            // A copy of a transaction we already hold (or that is already confirmed) is not a rejection: it is
+            // counted on its own and the sender gets no REJECT for it (several peers often send the same one).
+            if (why.equals("txn-already-in-mempool") || why.equals("txn-already-known")) {
+                peerTxDuplicate.incrementAndGet();
+                return new PeerTxResult(null, null, 0, 0, idBytes, List.of());
+            }
+            // hsd: every other VerifyError is answered with a REJECT and adds the error's ban score.
             peerTxRejected.incrementAndGet();
             long now = System.currentTimeMillis();
             if (now - rejectLogWindowStart > 60_000) { rejectLogWindowStart = now; rejectLogsInWindow = 0; }
@@ -453,8 +492,7 @@ public class Mempool {
         for (TxParser.Input in : tx.inputs) spentOutpoints.put(in.prevTxid + ":" + in.prevIndex, txid);
         for (String nh : uniqueNameHashes(tx)) nameClaims.put(nh, txid);
 
-        System.out.printf("[Mempool] Accepted %s (fee=%.6f HNS, size=%d)%n",
-                txid.substring(0, 12), fee / 1_000_000.0, entry.size);
+        noteAccepted(fromIp);
 
         // Trim size / expire; the new tx itself may be what gets evicted.
         if (limitSize(txid)) {

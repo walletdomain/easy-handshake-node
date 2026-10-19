@@ -235,6 +235,7 @@ public class Main {
         // Replaces the old separate PeerScorecard/PeerDiscovery/SeedDatabase
         // init calls -- one table now owns all peer state, migrating any
         // existing data from the three old storage locations on first run.
+        PeerTable.get().setSelfKey(NodeIdentity.base32Encode(identity.getPublicKey()));   // never list/dial ourselves
         PeerTable.get().init(ConfigDB.get(), db);
         System.out.printf("[Main] Seeds loaded: %d Brontide (brontide-only)%n",
                 PeerTable.get().getBrontideSeeds().size());
