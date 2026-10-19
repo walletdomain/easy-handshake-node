@@ -63,6 +63,8 @@ public class Main {
     private static FileChannel instanceLockChannel;
 
     static void main(String[] args) throws Exception {
+        // Keep a copy of everything printed, for the live log on the web admin page (the console output is unchanged).
+        handshake.node.util.LogTap.install();
         System.out.println("╔══════════════════════════════════════╗");
         System.out.println("║   Easy Handshake Node  v" + NodeConfig.VERSION + "        ║");
         System.out.println("╚══════════════════════════════════════╝");
@@ -355,12 +357,18 @@ public class Main {
             // step now runs regardless of whether an earlier one
             // failed, and any failure is reported rather than silently
             // swallowed.
-            safeShutdownStep("sync.stop", sync::stop);
-            safeShutdownStep("p2p.stop", p2p::stop);
-            safeShutdownStep("rpc.stop", rpc::stop);
-            safeShutdownStep("webAdmin.stop", webAdmin::stop);
-            safeShutdownStep("socketServer.stop", socketServer::stop);
-            safeShutdownStep("db.commit", db::commit);
+            // The web admin page stays up to the very end: it shows which step is running and, only after the last
+            // real step (the database close) has finished, tells the user it is safe to turn the computer off.
+            safeShutdownStep("webAdmin.shutdownBegin", webAdmin::shutdownBegin);
+            final java.util.function.BiConsumer<String, ShutdownStep> run = (label, step) -> {
+                webAdmin.shutdownStep(label);
+                safeShutdownStep(label, step);
+            };
+            run.accept("sync.stop", sync::stop);
+            run.accept("p2p.stop", p2p::stop);
+            run.accept("rpc.stop", rpc::stop);
+            run.accept("socketServer.stop", socketServer::stop);
+            run.accept("db.commit", db::commit);
             // NEW: resilience support -- only reached if every step
             // above ran without this hook itself having been skipped
             // entirely (a power loss, kill -9, or crash never runs this
@@ -368,11 +376,14 @@ public class Main {
             // marker meaningful). Placed after db.commit() specifically,
             // so this reflects a state where everything else is already
             // known-flushed, not just this one write.
-            safeShutdownStep("db.markCleanShutdown", db::markCleanShutdown);
-            safeShutdownStep("db.close", db::close);
-            safeShutdownStep("ConfigDB.commit", () -> ConfigDB.get().commit());
-            safeShutdownStep("ConfigDB.close", () -> ConfigDB.get().close());
-            System.out.println("[Main] Shutdown complete.");
+            run.accept("db.markCleanShutdown", db::markCleanShutdown);
+            run.accept("db.close", db::close);
+            run.accept("ConfigDB.commit", () -> ConfigDB.get().commit());
+            run.accept("ConfigDB.close", () -> ConfigDB.get().close());
+            // Open admin pages get the "safe to turn off" message first, then the server stops; the console line is last.
+            try { webAdmin.shutdownComplete(); } catch (Throwable t) { System.err.println("[Main] webAdmin.shutdownComplete failed: " + t); }
+            try { webAdmin.stop(); } catch (Throwable t) { System.err.println("[Main] webAdmin.stop failed: " + t); }
+            System.out.println("[Main] Shutdown complete. It is now safe to turn off the computer.");
         }, "shutdown-hook"));
 
         System.out.println("[Main] Node started. Press Ctrl+C to stop.");

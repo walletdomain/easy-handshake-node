@@ -90,6 +90,9 @@ public interface KVStore {
     long getDiskSizeBytes();
     void close();
 
+    /** Live on-disk size of each named map (column family), in bytes; engines that cannot say return an empty map. */
+    default java.util.Map<String, Long> mapSizes() { return java.util.Map.of(); }
+
     /** Disk activity since the previous call (one line); engines that do not track it return "". */
     default String ioStats() { return ""; }
 }

@@ -565,6 +565,11 @@ public class ChainDB {
         return store.getDiskSizeBytes();
     }
 
+    /** Live bytes per table (column family) -- see KVStore.mapSizes(). */
+    public java.util.Map<String, Long> mapSizes() {
+        return store.mapSizes();
+    }
+
     // ── Header operations ─────────────────────────────────────────────────────
 
     /**

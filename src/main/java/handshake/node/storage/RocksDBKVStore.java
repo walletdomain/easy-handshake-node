@@ -554,6 +554,21 @@ class RocksDBKVStore implements KVStore {
         return path;
     }
 
+    /** SST bytes per column family (what each table occupies; the WAL and manifest are not in it). */
+    @Override
+    public synchronized Map<String, Long> mapSizes() {
+        Map<String, Long> out = new java.util.LinkedHashMap<>();
+        if (closed) return out; // reading a property from a closed database would crash the JVM
+        for (Map.Entry<String, ColumnFamilyHandle> e : handles.entrySet()) {
+            try {
+                out.put(e.getKey(), db.getLongProperty(e.getValue(), "rocksdb.total-sst-files-size"));
+            } catch (RocksDBException ex) {
+                out.put(e.getKey(), 0L);
+            }
+        }
+        return out;
+    }
+
     @Override
     public long getDiskSizeBytes() {
         // RocksDB stores its data as a directory of multiple files,
@@ -572,8 +587,11 @@ class RocksDBKVStore implements KVStore {
         return total;
     }
 
+    private volatile boolean closed;
+
     @Override
     public void close() {
+        synchronized (this) { closed = true; } // waits for an in-flight mapSizes() to finish
         for (ColumnFamilyHandle h : handles.values()) h.close();
         db.close();
         dbOptions.close();
@@ -586,6 +604,31 @@ class RocksDBKVStore implements KVStore {
         }
         for (AbstractNativeReference r : filterPolicies) r.close();
         statistics.close();
-        sharedBlockCache.close(); // native resource -- must be released explicitly, same as everything else here
+        if (countAsScratch) {
+            sharedBlockCache.close(); // in-process scratch stores must really give their native memory back
+        } else {
+            releaseBlockCacheBestEffort();
+        }
+    }
+
+    /**
+     * Freeing the native block cache walks every cached entry and was seen taking over two minutes on a large
+     * database (129 s on the PC node), long after all data was already committed and the database closed. Nothing
+     * is left to protect at that point and the operating system reclaims the memory when the process exits, so
+     * the release runs on a daemon thread and the close waits only a few seconds for it.
+     */
+    private void releaseBlockCacheBestEffort() {
+        Thread t = new Thread(sharedBlockCache::close, "rocksdb-cache-release");
+        t.setDaemon(true);
+        t.start();
+        try {
+            t.join(3_000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (t.isAlive()) {
+            System.out.println("[RocksDBKVStore] Releasing the block cache is slow; continuing without waiting "
+                    + "(all data is already safely written, and the memory is freed when the process exits).");
+        }
     }
 }

@@ -100,13 +100,22 @@ public class WebAdminServer {
     private volatile ChainSync chainSync;
     private volatile Mempool mempool;
     private HttpServer server;
-    private final ExecutorService executor = Executors.newFixedThreadPool(2);
+    // Cached (not fixed) pool: each open live-stream page holds one thread for as long as it stays open
+    // (capped by MAX_STREAMS); ordinary requests are short and need only a thread for an instant.
+    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "web-admin");
+        t.setDaemon(true);
+        return t;
+    });
 
     public WebAdminServer(NodeConfig config, ChainDB db) {
         this.config = config;
         this.db = db;
         this.metrics = new handshake.node.util.SystemMetrics(config.getDataDir());
+        this.storage = new handshake.node.storage.StorageBreakdown(db, config.getDataDir());
     }
+
+    private final handshake.node.storage.StorageBreakdown storage;
 
     public void setChainSync(ChainSync chainSync) { this.chainSync = chainSync; }
     public void setMempool(Mempool mempool) { this.mempool = mempool; }
@@ -118,24 +127,221 @@ public class WebAdminServer {
         server.createContext("/", ex -> serveStatic(ex, "text/html; charset=utf-8", WebAdminServerContent.INDEX_HTML));
         server.createContext("/style.css", ex -> serveStatic(ex, "text/css; charset=utf-8", WebAdminServerContent.STYLE_CSS));
         server.createContext("/app.js", ex -> serveStatic(ex, "application/javascript; charset=utf-8", WebAdminServerContent.APP_JS));
-        server.createContext("/api/config", this::handleConfig);
+        server.createContext("/api/config", guarded(this::handleConfig));
         server.createContext("/api/apikey", this::handleApiKey);
         server.createContext("/api/status", this::handleStatus);
-        server.createContext("/api/peers", this::handlePeers);
-        server.createContext("/api/peertable", this::handlePeerTable);
+        server.createContext("/api/peers", guarded(this::handlePeers));
+        server.createContext("/api/peertable", guarded(this::handlePeerTable));
         server.createContext("/api/mempool", this::handleMempool);
-        server.createContext("/api/bans", this::handleBans);
-        server.createContext("/api/bans/unban", this::handleUnban);
-        server.createContext("/api/bans/clear", this::handleClearBans);
+        server.createContext("/api/bans", guarded(this::handleBans));
+        server.createContext("/api/bans/unban", guarded(this::handleUnban));
+        server.createContext("/api/bans/clear", guarded(this::handleClearBans));
         server.createContext("/api/stop", this::handleStop);
-        server.createContext("/api/rpc", this::handleRpcProxy);
+        server.createContext("/api/rpc", guarded(this::handleRpcProxy));
+        server.createContext("/api/events", this::handleEvents);
+        server.createContext("/api/log", this::handleLog);
+        server.createContext("/api/shutdown", this::handleShutdownState);
         server.setExecutor(executor);
         server.start();
+        startPusher();
     }
 
     public void stop() {
+        pusherRunning = false;
         if (server != null) server.stop(1);
         executor.shutdown();
+    }
+
+    // ── Shutdown reporting ───────────────────────────────────────────────────
+    //
+    // The node's shutdown hook keeps this server running to the very end, so a page can show progress and then
+    // "safe to power off" only once everything else (including the database close) has really finished.
+    // From shutdownBegin() on, nothing here touches the databases any more: status and peers are served from
+    // what was built just before, and anything that would need the databases answers 503.
+
+    private volatile String shutdownPhase;          // null = running normally, "running", "complete"
+    private volatile String shutdownStep = "";
+    private volatile long shutdownStartedAt;
+    private volatile String lastStatusJson, lastPeersPushJson;
+
+    /** Call first thing in the shutdown hook, while the databases are still open. */
+    public void shutdownBegin() {
+        try { lastStatusJson = buildStatusJson(); lastPeersPushJson = buildPeerTableJson(true); } catch (RuntimeException ignored) { /* keep older cache */ }
+        shutdownStartedAt = System.currentTimeMillis();
+        shutdownPhase = "running";
+        broadcast("shutdown", shutdownJson());
+    }
+
+    /** Announces the step about to run. */
+    public void shutdownStep(String label) {
+        shutdownStep = label;
+        if (shutdownPhase != null) broadcast("shutdown", shutdownJson());
+    }
+
+    /** Call after the last real step; waits (briefly) until open pages have received the message. */
+    public void shutdownComplete() {
+        shutdownStep = "";
+        shutdownPhase = "complete";
+        broadcast("shutdown", shutdownJson());
+        long deadline = System.currentTimeMillis() + 2500;
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                boolean pending = false;
+                for (LiveClient c : clients) if (!c.closed && !c.queue.isEmpty()) pending = true;
+                if (!pending) break;
+                Thread.sleep(50);
+            }
+            Thread.sleep(300);                      // let the last write reach the browser
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private String shutdownJson() {
+        String ph = shutdownPhase;
+        return "{\"phase\":" + (ph == null ? "null" : "\"" + ph + "\"")
+                + ",\"step\":\"" + jsonEscape(shutdownStep) + "\",\"startedAt\":" + shutdownStartedAt + "}";
+    }
+
+    private void handleShutdownState(HttpExchange ex) throws IOException {
+        try {
+            if (!ex.getRequestMethod().equals("GET")) { ex.sendResponseHeaders(405, -1); return; }
+            respondJson(ex, 200, shutdownJson());
+        } finally {
+            ex.close();
+        }
+    }
+
+    /** Wraps a handler that needs the databases: during shutdown it answers 503 instead. */
+    private com.sun.net.httpserver.HttpHandler guarded(com.sun.net.httpserver.HttpHandler h) {
+        return ex -> {
+            if (shutdownPhase != null) {
+                try { respondJson(ex, 503, "{\"error\":\"The node is shutting down\"}"); } finally { ex.close(); }
+                return;
+            }
+            h.handle(ex);
+        };
+    }
+
+    // ── Live stream (Server-Sent Events) ─────────────────────────────────────
+    //
+    // One long-lived GET /api/events per open page. The node pushes: "status" (height, sync, system
+    // gauges, halt) at most twice a second, "peers" and "mempool" only when their content changed,
+    // and every log line as it is printed ("log"; the buffered backlog comes first as "logs").
+    // Nothing is computed while no page is open.
+
+    private static final int MAX_STREAMS = 6;
+    private final java.util.List<LiveClient> clients = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private volatile boolean pusherRunning;
+    private String lastPeersJson = "", lastMempoolJson = "";
+
+    private static final class LiveClient {
+        final java.util.concurrent.LinkedBlockingQueue<String> queue = new java.util.concurrent.LinkedBlockingQueue<>(2000);
+        volatile boolean closed;
+        /** Drops the event rather than blocking the pusher when a page is too slow to keep up. */
+        void send(String event, String data) { queue.offer("event: " + event + "\ndata: " + data + "\n\n"); }
+    }
+
+    private void broadcast(String event, String data) {
+        for (LiveClient c : clients) c.send(event, data);
+    }
+
+    private void startPusher() {
+        pusherRunning = true;
+        handshake.node.util.LogTap.addListener(line -> {
+            if (!clients.isEmpty()) broadcast("log", line.toJson());
+        });
+        Thread t = new Thread(() -> {
+            int lastHeight = Integer.MIN_VALUE;
+            long lastStatus = 0, lastSlow = 0;
+            while (pusherRunning) {
+                try { Thread.sleep(250); } catch (InterruptedException e) { return; }
+                if (shutdownPhase != null) continue;   // the databases are closing: no more reads from the pusher
+                if (clients.isEmpty()) { lastPeersJson = ""; lastMempoolJson = ""; lastHeight = Integer.MIN_VALUE; continue; }
+                try {
+                    long now = System.currentTimeMillis();
+                    int height = db.getBlockTip();
+                    if ((height != lastHeight && now - lastStatus >= 500) || now - lastStatus >= 1000) {
+                        lastHeight = height;
+                        lastStatus = now;
+                        broadcast("status", buildStatusJson());
+                    }
+                    if (now - lastSlow >= 1000) {
+                        lastSlow = now;
+                        String peers = buildPeerTableJson(true);
+                        if (!peers.equals(lastPeersJson)) { lastPeersJson = peers; broadcast("peers", peers); }
+                        String mp = buildMempoolJson();
+                        if (!mp.equals(lastMempoolJson)) { lastMempoolJson = mp; broadcast("mempool", mp); }
+                    }
+                } catch (Throwable e) {
+                    System.err.println("[WebAdmin] live push failed (will retry): " + e);
+                }
+            }
+        }, "web-admin-pusher");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void handleEvents(HttpExchange ex) throws IOException {
+        if (!ex.getRequestMethod().equals("GET")) { ex.sendResponseHeaders(405, -1); ex.close(); return; }
+        if (clients.size() >= MAX_STREAMS) {
+            respondJson(ex, 503, "{\"error\":\"Too many open admin pages\"}");
+            ex.close();
+            return;
+        }
+        LiveClient c = new LiveClient();
+        ex.getResponseHeaders().add("Content-Type", "text/event-stream; charset=utf-8");
+        ex.getResponseHeaders().add("Cache-Control", "no-cache");
+        ex.sendResponseHeaders(200, 0);                       // 0 = chunked, stays open
+        try (OutputStream os = ex.getResponseBody()) {
+            // Everything the page needs to draw itself, straight away.
+            StringBuilder logs = new StringBuilder("[");
+            boolean first = true;
+            for (handshake.node.util.LogTap.Line l : handshake.node.util.LogTap.snapshot()) {
+                if (!first) logs.append(",");
+                first = false;
+                logs.append(l.toJson());
+            }
+            logs.append("]");
+            c.send("logs", logs.toString());
+            c.send("status", buildStatusJson());
+            c.send("peers", buildPeerTableJson(true));
+            c.send("mempool", buildMempoolJson());
+            if (shutdownPhase != null) c.send("shutdown", shutdownJson());
+            clients.add(c);
+            try {
+                while (!c.closed && pusherRunning) {
+                    String msg = c.queue.poll(15, java.util.concurrent.TimeUnit.SECONDS);
+                    os.write((msg != null ? msg : ": keep-alive\n\n").getBytes(StandardCharsets.UTF_8));
+                    os.flush();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        } catch (IOException pageClosed) {
+            // The page went away; nothing to report.
+        } finally {
+            c.closed = true;
+            clients.remove(c);
+            ex.close();
+        }
+    }
+
+    /** The buffered log lines as JSON, for the fallback when the live stream is down. */
+    private void handleLog(HttpExchange ex) throws IOException {
+        try {
+            if (!ex.getRequestMethod().equals("GET")) { ex.sendResponseHeaders(405, -1); return; }
+            StringBuilder sb = new StringBuilder("[");
+            boolean first = true;
+            for (handshake.node.util.LogTap.Line l : handshake.node.util.LogTap.snapshot()) {
+                if (!first) sb.append(",");
+                first = false;
+                sb.append(l.toJson());
+            }
+            respondJson(ex, 200, sb.append("]").toString());
+        } finally {
+            ex.close();
+        }
     }
 
     /** Serves a fixed string body with the given content type. GET only
@@ -170,71 +376,85 @@ public class WebAdminServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            long uptimeSeconds = (System.currentTimeMillis() - startTimeMillis) / 1000;
-            int blockHeight = db.getBlockTip();
-            double dbSizeGB = db.getDiskSizeBytes() / 1e9;
-
-            // Best-known network height comes from the highest "starting
-            // height" any connected peer has announced (bestKnownPeerHeight,
-            // tracked in ChainSync as peers connect) -- this is the
-            // standard way to gauge "how far behind the real chain am I"
-            // since there's no single authoritative source for it, only
-            // what peers claim. chainSync can be null very early during
-            // startup before it's wired up via setChainSync(), and
-            // bestKnownPeerHeight can legitimately still be 0 if no peer
-            // has connected yet -- both cases report syncPercent as null
-            // rather than a misleading 0% or a divide-by-zero.
-            int networkHeight = (chainSync != null) ? chainSync.getBestKnownPeerHeight() : 0;
-            String syncPercentField;
-            if (networkHeight > 0) {
-                // Capped at 100 -- our own tip can transiently exceed the
-                // currently-best-connected peer's height right after that
-                // peer disconnects and a shorter-tipped one is all that's
-                // left, which shouldn't ever display as "101% synced".
-                double syncPercent = Math.min(100.0, (blockHeight * 100.0) / networkHeight);
-                syncPercentField = String.format(java.util.Locale.ROOT, "%.1f", syncPercent);
-            } else {
-                syncPercentField = "null";
-            }
-
-            // FIX (audit): halted-due-to-tree-mismatch status existed
-            // internally in ChainSync (set/cleared/checked there) but
-            // its public accessor was never called anywhere -- meaning
-            // if the node ever actually halted on a data-integrity
-            // problem, that was visible only in console/log output,
-            // never in this status endpoint. Same null-safety pattern
-            // as networkHeight above: chainSync can be null very early
-            // during startup.
-            UrkelTreeMismatchException halt = (chainSync != null) ? chainSync.haltedDueToTreeMismatch() : null;
-            String haltedField = (halt != null)
-                    ? "{\"height\":" + halt.height
-                    + ",\"claimedRoot\":\"" + jsonEscape(toHex(halt.claimedRoot))
-                    + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
-                    : "null";
-
-            handshake.node.util.SystemMetrics.Snapshot m = metrics.snapshot();
-            String sysField = "{"
-                    + "\"processCpu\":" + pct(m.processCpu()) + ","
-                    + "\"systemCpu\":" + pct(m.systemCpu()) + ","
-                    + "\"heapUsed\":" + m.heapUsed() + ",\"heapMax\":" + m.heapMax() + ","
-                    + "\"physTotal\":" + m.physTotal() + ",\"physFree\":" + m.physFree() + ","
-                    + "\"diskUsable\":" + m.diskUsable() + ",\"diskTotal\":" + m.diskTotal() + ","
-                    + "\"diskLevel\":\"" + m.diskLevel() + "\"}";
-
-            String json = "{"
-                    + "\"system\":" + sysField + ","
-                    + "\"version\":\"" + jsonEscape(NodeConfig.VERSION) + "\","
-                    + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
-                    + "\"blockHeight\":" + blockHeight + ","
-                    + "\"networkHeight\":" + networkHeight + ","
-                    + "\"syncPercent\":" + syncPercentField + ","
-                    + "\"dbSizeGB\":" + String.format(java.util.Locale.ROOT, "%.2f", dbSizeGB) + ","
-                    + "\"halted\":" + haltedField
-                    + "}";
-            respondJson(ex, 200, json);
+            respondJson(ex, 200, buildStatusJson());
         } finally {
             ex.close();
         }
+    }
+
+    /** The /api/status document; also what the live stream pushes. */
+    private String buildStatusJson() {
+        if (shutdownPhase != null && lastStatusJson != null) return lastStatusJson;
+        long uptimeSeconds = (System.currentTimeMillis() - startTimeMillis) / 1000;
+        int blockHeight = db.getBlockTip();
+        double dbSizeGB = db.getDiskSizeBytes() / 1e9;
+
+        // Best-known network height comes from the highest "starting
+        // height" any connected peer has announced (bestKnownPeerHeight,
+        // tracked in ChainSync as peers connect) -- this is the
+        // standard way to gauge "how far behind the real chain am I"
+        // since there's no single authoritative source for it, only
+        // what peers claim. chainSync can be null very early during
+        // startup before it's wired up via setChainSync(), and
+        // bestKnownPeerHeight can legitimately still be 0 if no peer
+        // has connected yet -- both cases report syncPercent as null
+        // rather than a misleading 0% or a divide-by-zero.
+        int networkHeight = (chainSync != null) ? chainSync.getBestKnownPeerHeight() : 0;
+        String syncPercentField;
+        if (networkHeight > 0) {
+            // Capped at 100 -- our own tip can transiently exceed the
+            // currently-best-connected peer's height right after that
+            // peer disconnects and a shorter-tipped one is all that's
+            // left, which shouldn't ever display as "101% synced".
+            double syncPercent = Math.min(100.0, (blockHeight * 100.0) / networkHeight);
+            syncPercentField = String.format(java.util.Locale.ROOT, "%.1f", syncPercent);
+        } else {
+            syncPercentField = "null";
+        }
+
+        // FIX (audit): halted-due-to-tree-mismatch status existed
+        // internally in ChainSync (set/cleared/checked there) but
+        // its public accessor was never called anywhere -- meaning
+        // if the node ever actually halted on a data-integrity
+        // problem, that was visible only in console/log output,
+        // never in this status endpoint. Same null-safety pattern
+        // as networkHeight above: chainSync can be null very early
+        // during startup.
+        UrkelTreeMismatchException halt = (chainSync != null) ? chainSync.haltedDueToTreeMismatch() : null;
+        String haltedField = (halt != null)
+                ? "{\"height\":" + halt.height
+                + ",\"claimedRoot\":\"" + jsonEscape(toHex(halt.claimedRoot))
+                + "\",\"computedRoot\":\"" + jsonEscape(toHex(halt.computedRoot)) + "\"}"
+                : "null";
+
+        handshake.node.util.SystemMetrics.Snapshot m = metrics.snapshot();
+        String sysField = "{"
+                + "\"processCpu\":" + pct(m.processCpu()) + ","
+                + "\"systemCpu\":" + pct(m.systemCpu()) + ","
+                + "\"heapUsed\":" + m.heapUsed() + ",\"heapMax\":" + m.heapMax() + ","
+                + "\"physTotal\":" + m.physTotal() + ",\"physFree\":" + m.physFree() + ","
+                + "\"diskUsable\":" + m.diskUsable() + ",\"diskTotal\":" + m.diskTotal() + ","
+                + "\"diskLevel\":\"" + m.diskLevel() + "\"}";
+
+        String storageField;
+        try {
+            storageField = storage.toJson(m.diskUsable(), m.diskTotal());
+        } catch (RuntimeException e) {
+            storageField = "null";
+        }
+
+        String json = "{"
+                + "\"system\":" + sysField + ","
+                + "\"storage\":" + storageField + ","
+                + "\"version\":\"" + jsonEscape(NodeConfig.VERSION) + "\","
+                + "\"uptime\":\"" + jsonEscape(formatUptime(uptimeSeconds)) + "\","
+                + "\"blockHeight\":" + blockHeight + ","
+                + "\"networkHeight\":" + networkHeight + ","
+                + "\"syncPercent\":" + syncPercentField + ","
+                + "\"dbSizeGB\":" + String.format(java.util.Locale.ROOT, "%.2f", dbSizeGB) + ","
+                + "\"halted\":" + haltedField
+                + "}";
+        return json;
     }
 
     /** CPU load 0..1 as a percentage with one decimal, or null when the JDK reports it unknown. */
@@ -288,61 +508,78 @@ public class WebAdminServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            java.util.Map<String, String> dirs = chainSync != null
-                    ? chainSync.getConnectionDirections() : java.util.Map.of();
-            java.util.Map<String, String> transports = chainSync != null
-                    ? chainSync.getConnectionTransports() : java.util.Map.of();
-            long now = System.currentTimeMillis();
-            StringBuilder sb = new StringBuilder("[");
-            boolean first = true;
-            for (PeerTable.Peer r : PeerTable.get().listAllPeers()) {
-                String dir = dirs.get(r.ip);
-                String state;
-                if (r.banned) state = "banned";
-                else if (dir != null) state = "connected";
-                else if (r.isBlacklisted()) state = "blacklisted";
-                else if (r.isBackedOff()) state = "backoff";
-                else if (!r.hasBrontideKey()) state = "plain";
-                else state = "idle";
-                if (!first) sb.append(",");
-                first = false;
-                sb.append("{")
-                        .append("\"ip\":\"").append(jsonEscape(r.ip)).append("\",")
-                        .append("\"port\":").append(r.port).append(",")
-                        .append("\"label\":\"").append(jsonEscape(r.label == null ? "" : r.label)).append("\",")
-                        .append("\"source\":\"").append(jsonEscape(r.source == null ? "" : r.source)).append("\",")
-                        .append("\"seed\":").append(r.isSeed).append(",")
-                        .append("\"hasKey\":").append(r.hasBrontideKey()).append(",")
-                        .append("\"score\":").append(r.score).append(",")
-                        .append("\"state\":\"").append(state).append("\",")
-                        .append("\"direction\":\"").append(dir == null ? "" : dir).append("\",")
-                        .append("\"transport\":\"").append(transports.getOrDefault(r.ip, "")).append("\",")
-                        .append("\"backoffMs\":").append(Math.max(0L, r.backoffUntil - now)).append(",")
-                        .append("\"banReason\":\"").append(jsonEscape(r.banReason == null ? "" : r.banReason)).append("\",")
-                        .append("\"banTime\":").append(r.banTime).append(",")
-                        .append("\"successes\":").append(r.successCount).append(",")
-                        .append("\"failures\":").append(r.failureCount).append(",")
-                        .append("\"validData\":").append(r.validDataCount).append(",")
-                        .append("\"invalidData\":").append(r.invalidDataCount).append(",")
-                        .append("\"lastSuccess\":").append(r.lastSuccessTime).append(",")
-                        .append("\"lastFailure\":").append(r.lastFailureTime).append(",")
-                        .append("\"agent\":\"").append(jsonEscape(r.lastAgent == null ? "" : r.lastAgent)).append("\",")
-                        .append("\"height\":").append(r.lastHeight).append(",")
-                        .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs)).append(",")
-                        .append("\"penalties\":[");
-                boolean fp = true;
-                for (String pen : PeerTable.get().recentPenalties(r)) {
-                    if (!fp) sb.append(",");
-                    fp = false;
-                    sb.append("\"").append(jsonEscape(pen)).append("\"");
-                }
-                sb.append("]}");
-            }
-            sb.append("]");
-            respondJson(ex, 200, sb.toString());
+            respondJson(ex, 200, buildPeerTableJson(false));
         } finally {
             ex.close();
         }
+    }
+
+    /** pushMode (live stream): leaves out never-contacted gossip addresses (they are only counted) and
+     *  reports backoff as an absolute time, so the document only changes when something really changes. */
+    private String buildPeerTableJson(boolean pushMode) {
+        if (shutdownPhase != null) return pushMode && lastPeersPushJson != null ? lastPeersPushJson : (pushMode ? "{\"gossipOnly\":0,\"peers\":[]}" : "[]");
+        java.util.Map<String, String> dirs = chainSync != null
+                ? chainSync.getConnectionDirections() : java.util.Map.of();
+        java.util.Map<String, String> transports = chainSync != null
+                ? chainSync.getConnectionTransports() : java.util.Map.of();
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        int gossipOnly = 0;
+        for (PeerTable.Peer r : PeerTable.get().listAllPeers()) {
+            String dir = dirs.get(r.ip);
+            String state;
+            if (r.banned) state = "banned";
+            else if (dir != null) state = "connected";
+            else if (r.isBlacklisted()) state = "blacklisted";
+            else if (r.isBackedOff()) state = "backoff";
+            else if (!r.hasBrontideKey()) state = "plain";
+            else state = "idle";
+            if (pushMode) {
+                boolean verified = state.equals("connected") || r.successCount > 0 || r.isSeed;
+                if (!verified && !state.equals("backoff") && !state.equals("banned") && !state.equals("blacklisted")) {
+                    gossipOnly++;
+                    continue;
+                }
+            }
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{")
+                    .append("\"ip\":\"").append(jsonEscape(r.ip)).append("\",")
+                    .append("\"port\":").append(r.port).append(",")
+                    .append("\"label\":\"").append(jsonEscape(r.label == null ? "" : r.label)).append("\",")
+                    .append("\"source\":\"").append(jsonEscape(r.source == null ? "" : r.source)).append("\",")
+                    .append("\"seed\":").append(r.isSeed).append(",")
+                    .append("\"hasKey\":").append(r.hasBrontideKey()).append(",")
+                    .append("\"score\":").append(r.score).append(",")
+                    .append("\"state\":\"").append(state).append("\",")
+                    .append("\"direction\":\"").append(dir == null ? "" : dir).append("\",")
+                    .append("\"transport\":\"").append(transports.getOrDefault(r.ip, "")).append("\",")
+                    .append(pushMode ? "\"backoffUntil\":" : "\"backoffMs\":")
+                    .append(pushMode ? Math.max(0L, r.backoffUntil) : Math.max(0L, r.backoffUntil - now)).append(",")
+                    .append("\"banReason\":\"").append(jsonEscape(r.banReason == null ? "" : r.banReason)).append("\",")
+                    .append("\"banTime\":").append(r.banTime).append(",")
+                    .append("\"successes\":").append(r.successCount).append(",")
+                    .append("\"failures\":").append(r.failureCount).append(",")
+                    .append("\"validData\":").append(r.validDataCount).append(",")
+                    .append("\"invalidData\":").append(r.invalidDataCount).append(",")
+                    .append("\"lastSuccess\":").append(r.lastSuccessTime).append(",")
+                    .append("\"lastFailure\":").append(r.lastFailureTime).append(",")
+                    .append("\"agent\":\"").append(jsonEscape(r.lastAgent == null ? "" : r.lastAgent)).append("\",")
+                    .append("\"height\":").append(r.lastHeight).append(",")
+                    .append("\"latencyMs\":").append(Math.round(r.avgLatencyMs)).append(",")
+                    .append("\"penalties\":[");
+            boolean fp = true;
+            for (String pen : PeerTable.get().recentPenalties(r)) {
+                if (!fp) sb.append(",");
+                fp = false;
+                sb.append("\"").append(jsonEscape(pen)).append("\"");
+            }
+            sb.append("]}");
+        }
+        sb.append("]");
+        if (pushMode) return "{\"gossipOnly\":" + gossipOnly + ",\"peers\":" + sb + "}";
+        return sb.toString();
     }
 
     private void handleMempool(HttpExchange ex) throws IOException {
@@ -351,21 +588,20 @@ public class WebAdminServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            if (mempool == null) {
-                respondJson(ex, 200, "{\"count\":0,\"bytes\":0,\"maxBytes\":0,\"minRelayFeeRate\":0}");
-                return;
-            }
-            int count = mempool.getAll().size();
-            String json = "{"
-                    + "\"count\":" + count + ","
-                    + "\"bytes\":" + mempool.getTotalBytes() + ","
-                    + "\"maxBytes\":" + mempool.getMaxSize() + ","
-                    + "\"minRelayFeeRate\":" + mempool.getMinRelayFee()
-                    + "}";
-            respondJson(ex, 200, json);
+            respondJson(ex, 200, buildMempoolJson());
         } finally {
             ex.close();
         }
+    }
+
+    private String buildMempoolJson() {
+        if (mempool == null) return "{\"count\":0,\"bytes\":0,\"maxBytes\":0,\"minRelayFeeRate\":0}";
+        return "{"
+                + "\"count\":" + mempool.getAll().size() + ","
+                + "\"bytes\":" + mempool.getTotalBytes() + ","
+                + "\"maxBytes\":" + mempool.getMaxSize() + ","
+                + "\"minRelayFeeRate\":" + mempool.getMinRelayFee()
+                + "}";
     }
 
     private void handleBans(HttpExchange ex) throws IOException {
