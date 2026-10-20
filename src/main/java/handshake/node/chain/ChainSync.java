@@ -405,9 +405,9 @@ public class ChainSync {
         if (rtt < c.minRttMs) c.minRttMs = rtt;
         netPongsRecv.incrementAndGet();
         netRttSum.addAndGet(rtt);
-        if (pingLogAll() || (pingLogSlow() && rtt > 5000)) {
+        if (pingLogAll() || (pingLogSlow() && rtt > SLOW_PONG_MS)) {
             System.out.printf("[Ping] <- %s PONG nonce=%s ok, round trip %d ms%s%n", c.ip, toHex(nonce), rtt,
-                    rtt > 5000 ? " (SLOW)" : "");
+                    rtt > SLOW_PONG_MS ? " (SLOW)" : "");
         }
     }
 
@@ -781,7 +781,7 @@ public class ChainSync {
                 () -> PeerTable.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
         // Answers pings (and reads announcements) on pooled connections the sync loop is not using right now.
         keepAliveScheduler.scheduleWithFixedDelay(
-                this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_SEC, KEEPALIVE_INTERVAL_SEC, TimeUnit.SECONDS);
+                this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::flushTxAnnouncements, 1, 1, TimeUnit.SECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
@@ -793,8 +793,11 @@ public class ChainSync {
                 this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
     }
 
-    /** Seconds between keep-alive passes over the idle pooled connections (hsd pings every 30 s). */
-    private static final int KEEPALIVE_INTERVAL_SEC = 5;
+    /** Milliseconds between keep-alive passes over the idle pooled connections. The pass only checks available(), so it is cheap;
+     *  at 5 s it added up to 5 s to every PONG we received and every PONG we sent. */
+    private static final int KEEPALIVE_INTERVAL_MS = 20;
+    /** A PONG slower than this is flagged SLOW in the [Ping] log. */
+    private static final long SLOW_PONG_MS = 1000;
     /** Its own thread, so a slow pool top-up (dials that time out) can never delay a PONG. */
     private final ScheduledExecutorService keepAliveScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -3176,6 +3179,18 @@ public class ChainSync {
         } else if (type == MSG_GETADDR) {
             netGetAddr.incrementAndGet();
             peer.sendMessage(MSG_ADDR, buildAddrMessage());
+        } else if (type == MSG_GETDATA) {
+            // A peer we dialed asking for a tx/block we announced. This was missing here (only the inbound reader
+            // served it), so hsd waited 30 s for a reply that never came and dropped us: "Peer is stalling (tx)".
+            serveGetData(peer, Arrays.copyOfRange(msg, 9, msg.length));
+        } else if (type == MSG_GETHEADERS) {
+            serveGetHeaders(peer, Arrays.copyOfRange(msg, 9, msg.length));
+        } else if (type == MSG_FILTERLOAD) {
+            handleFilterLoad(peer, Arrays.copyOfRange(msg, 9, msg.length));
+        } else if (type == MSG_FILTERADD) {
+            handleFilterAdd(peer, Arrays.copyOfRange(msg, 9, msg.length));
+        } else if (type == MSG_FILTERCLEAR) {
+            peer.bloomFilter = null;
         } else if (type == MSG_INV) {
             handleInv(peer, Arrays.copyOfRange(msg, 9, msg.length));
         } else if (type == MSG_SENDHEADERS) {
@@ -3304,11 +3319,12 @@ public class ChainSync {
             connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), true));
             netInboundNew.incrementAndGet();
             noteInboundAddress(ip);
+            boolean broadcastDone = false;
             if (!inboundReachabilityProven && isPublicIpv4(ip) && !ip.equals(confirmedSelfIp)) {
                 inboundReachabilityProven = true;
                 System.out.printf("[ChainSync] %s connected to us from outside: our port is reachable, so this node now "
                         + "announces its own address.%n", ip);
-                if (confirmedSelfIp != null && selfAnnounceAllowed()) broadcastSelfAnnounceToAll();
+                if (confirmedSelfIp != null && selfAnnounceAllowed()) { broadcastSelfAnnounceToAll(); broadcastDone = true; }   // includes this peer
             }
             PeerTable.get().recordSuccess(ip, conn.agent, conn.peerHeight, brontide != null);
 
@@ -3316,7 +3332,7 @@ public class ChainSync {
             // (connectPeer()) -- an inbound peer is just as real a
             // propagation path as an outbound one, and there's no reason
             // to only tell peers we happened to dial ourselves.
-            sendSelfAnnounce(conn);
+            if (!broadcastDone) sendSelfAnnounce(conn);
 
             // NEW: this is the one case where we learn a peer's real
             // Brontide static key WITHOUT needing to already know it --
