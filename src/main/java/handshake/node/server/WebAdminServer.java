@@ -406,7 +406,10 @@ public class WebAdminServer {
             // currently-best-connected peer's height right after that
             // peer disconnects and a shorter-tipped one is all that's
             // left, which shouldn't ever display as "101% synced".
-            double syncPercent = Math.min(100.0, (blockHeight * 100.0) / networkHeight);
+            // Rounded DOWN, and never 100 while any block is missing: at height 352,000 even 3 blocks behind is
+            // 99.9991%, which "%.1f" would otherwise print as 100.0.
+            double raw = (blockHeight * 100.0) / networkHeight;
+            double syncPercent = blockHeight >= networkHeight ? 100.0 : Math.min(99.9, Math.floor(raw * 10) / 10.0);
             syncPercentField = String.format(java.util.Locale.ROOT, "%.1f", syncPercent);
         } else {
             syncPercentField = "null";

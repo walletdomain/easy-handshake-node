@@ -338,6 +338,119 @@ public class ChainSync {
     private volatile boolean selfHeldBackLogged = false;
     private static final int NETWORK_SUMMARY_MIN = 10;
 
+    // ── Ping / pong diagnostics ───────────────────────────────────────────────────────────────────────────────
+    private final java.util.concurrent.atomic.AtomicLong netPingsSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netPongsRecv = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netRttSum = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netPongOverdue = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netPingBacklog = new java.util.concurrent.atomic.AtomicLong();
+    private static final long PING_INTERVAL_SEC = 30;
+
+    /** "all" logs every ping and pong, "slow" logs only problems, "off" logs nothing. Setting p2p.log.ping. */
+    private boolean pingLogAll() { return "all".equalsIgnoreCase(config.getPingLogMode()); }
+    private boolean pingLogSlow() { return !"off".equalsIgnoreCase(config.getPingLogMode()); }
+
+    private static String dir(PeerConnection c, boolean inbound) { return inbound ? "inbound" : "outbound"; }
+
+    private boolean isInboundConn(PeerConnection c) {
+        for (PeerInfo p : connectedPeers) if (p.conn() == c) return p.inbound();
+        return false;
+    }
+
+    /** Their PING reached us: answer at once, and record what is needed to tell a healthy link from a starved one. */
+    private void onPingReceived(PeerConnection c, byte[] msg) throws Exception {
+        long t0 = System.currentTimeMillis();
+        byte[] nonce = Arrays.copyOfRange(msg, 9, msg.length);
+        long silentBefore = c.prevReadMs == 0 ? -1 : t0 - c.prevReadMs;      // quiet time before this PING was read
+        long sincePrevPing = c.lastPingRecvAt == 0 ? -1 : t0 - c.lastPingRecvAt;
+        c.lastPingRecvAt = t0;
+        c.pingsReceivedTotal++;
+        netPings.incrementAndGet();
+        boolean backlog = sincePrevPing >= 0 && sincePrevPing < 10_000;      // hsd pings every 30 s: two close together
+        boolean starved = silentBefore > 90_000;                              // we had not read this peer for a long time
+        if (backlog) netPingBacklog.incrementAndGet();
+        c.sendMessage(MSG_PONG, nonce);
+        c.pongsSentTotal++;
+        long took = System.currentTimeMillis() - t0;
+        if (pingLogAll() || (pingLogSlow() && (backlog || starved || took > 1000))) {
+            System.out.printf("[Ping] <- %s PING nonce=%s (%s; quiet for %s before it%s%s) -> PONG sent in %d ms%n",
+                    c.ip, toHex(nonce), isInboundConn(c) ? "they connected to us" : "we connected to them",
+                    silentBefore < 0 ? "?" : (silentBefore / 1000) + " s",
+                    backlog ? "; BACKLOG: another PING " + (sincePrevPing / 1000) + " s ago, so we were not reading this connection" : "",
+                    starved ? "; STARVED: we were not reading this connection" : "", took);
+        }
+    }
+
+    /** Their PONG answered one of our PINGs: match the nonce and record the round-trip time. */
+    private void onPongReceived(PeerConnection c, byte[] msg) {
+        long now = System.currentTimeMillis();
+        byte[] nonce = Arrays.copyOfRange(msg, 9, msg.length);
+        byte[] expected = c.pingNonce;
+        c.pongsReceivedTotal++;
+        if (expected == null) {
+            if (pingLogSlow()) System.out.printf("[Ping] <- %s PONG nonce=%s but we have no PING waiting (unsolicited or late)%n",
+                    c.ip, toHex(nonce));
+            return;
+        }
+        if (!Arrays.equals(expected, nonce)) {
+            // hsd answers a zero nonce for a peer that did not understand; anything else is a real mismatch.
+            if (pingLogSlow()) System.out.printf("[Ping] <- %s PONG nonce MISMATCH: expected %s, got %s%n",
+                    c.ip, toHex(expected), toHex(nonce));
+            return;
+        }
+        long rtt = now - c.pingSentAt;
+        c.pingNonce = null;
+        c.pingOverdueLogged = 0;
+        c.lastRttMs = rtt;
+        if (rtt < c.minRttMs) c.minRttMs = rtt;
+        netPongsRecv.incrementAndGet();
+        netRttSum.addAndGet(rtt);
+        if (pingLogAll() || (pingLogSlow() && rtt > 5000)) {
+            System.out.printf("[Ping] <- %s PONG nonce=%s ok, round trip %d ms%s%n", c.ip, toHex(nonce), rtt,
+                    rtt > 5000 ? " (SLOW)" : "");
+        }
+    }
+
+    /** Every PING_INTERVAL_SEC: ping every connected peer (one outstanding PING per peer) and flag any that never answered. */
+    private void pingPeers() {
+        if (!running) return;
+        long now = System.currentTimeMillis();
+        for (PeerInfo p : connectedPeers) {
+            PeerConnection c = p.conn();
+            byte[] outstanding = c.pingNonce;
+            if (outstanding != null) {
+                long waited = now - c.pingSentAt;
+                if ((waited > 60_000 && c.pingOverdueLogged < 1) || (waited > 300_000 && c.pingOverdueLogged < 2)) {
+                    c.pingOverdueLogged = waited > 300_000 ? 2 : 1;
+                    netPongOverdue.incrementAndGet();
+                    if (pingLogSlow()) {
+                        System.out.printf("[Ping] %s has not answered our PING nonce=%s for %d s (%s; last data from them %s s ago) "
+                                        + "-- the connection may be dead%n",
+                                c.ip, toHex(outstanding), waited / 1000, p.inbound() ? "they connected to us" : "we connected to them",
+                                c.lastReadMs == 0 ? "?" : String.valueOf((now - c.lastReadMs) / 1000));
+                    }
+                }
+                continue;
+            }
+            byte[] nonce = new byte[8];
+            new java.security.SecureRandom().nextBytes(nonce);
+            c.pingNonce = nonce;
+            c.pingSentAt = now;
+            c.pingOverdueLogged = 0;
+            try {
+                c.sendMessage(MSG_PING, nonce);
+                c.pingsSentTotal++;
+                netPingsSent.incrementAndGet();
+                if (pingLogAll()) System.out.printf("[Ping] -> %s PING nonce=%s (%s)%n", c.ip, toHex(nonce),
+                        p.inbound() ? "they connected to us" : "we connected to them");
+            } catch (Exception e) {
+                c.pingNonce = null;
+                if (pingLogSlow()) System.out.printf("[Ping] -> %s PING could not be sent (%s: %s)%n",
+                        c.ip, e.getClass().getSimpleName(), e.getMessage());
+            }
+        }
+    }
+
     private void noteInboundAddress(String ip) {
         java.time.LocalDate today = java.time.LocalDate.now();
         if (!today.equals(inboundDistinctDay)) { inboundDistinctDay = today; inboundDistinctToday.clear(); }
@@ -353,12 +466,17 @@ public class ChainSync {
                 : ("false".equalsIgnoreCase(mode) ? "off (setting p2p.announce.self=false)"
                 : "held back (waiting for an outside peer to connect to us)");
         if (confirmedSelfIp == null) selfState = "waiting (public address not confirmed yet)";
+        long pongs = netPongsRecv.getAndSet(0);
+        long rttSum = netRttSum.getAndSet(0);
         System.out.printf("[Network] last %d min: inbound new %d (distinct today %d) | GETADDR received %d, ADDR entries sent %d "
-                        + "(replies with our own address: %d) | self-announce: %s, sent %d | pings answered %d | "
+                        + "(replies with our own address: %d) | self-announce: %s, sent %d | their pings answered %d "
+                        + "(%d backlogged) | our pings sent %d, pongs received %d (avg round trip %s, %d overdue) | "
                         + "tx announced %d in %d batches | blocks announced %d (to %d peers)%n",
                 NETWORK_SUMMARY_MIN, netInboundNew.getAndSet(0), inboundDistinctToday.size(), netGetAddr.getAndSet(0),
                 netAddrEntries.getAndSet(0), netAddrWithSelf.getAndSet(0), selfState, netSelfAnnounces.getAndSet(0),
-                netPings.getAndSet(0), netTxAnnounced.getAndSet(0), netTxBatches.getAndSet(0),
+                netPings.getAndSet(0), netPingBacklog.getAndSet(0), netPingsSent.getAndSet(0), pongs,
+                pongs == 0 ? "n/a" : (rttSum / pongs) + " ms", netPongOverdue.getAndSet(0),
+                netTxAnnounced.getAndSet(0), netTxBatches.getAndSet(0),
                 netBlocksAnnounced.getAndSet(0), netBlockPeers.getAndSet(0));
     }
 
@@ -668,6 +786,8 @@ public class ChainSync {
                 this::flushTxAnnouncements, 1, 1, TimeUnit.SECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::printNetworkSummary, NETWORK_SUMMARY_MIN, NETWORK_SUMMARY_MIN, TimeUnit.MINUTES);
+        keepAliveScheduler.scheduleWithFixedDelay(
+                this::pingPeers, 15, PING_INTERVAL_SEC, TimeUnit.SECONDS);
         // Background reachability probe of never-verified addresses (see probeUnverifiedPeer()).
         probeScheduler.scheduleWithFixedDelay(
                 this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
@@ -3044,9 +3164,9 @@ public class ChainSync {
             throws Exception {
         int type = getMessageType(msg);
         if (type == MSG_PING) {
-            byte[] pingPayload = Arrays.copyOfRange(msg, 9, msg.length);
-            peer.sendMessage(MSG_PONG, pingPayload);
-            netPings.incrementAndGet();
+            onPingReceived(peer, msg);
+        } else if (type == MSG_PONG) {
+            onPongReceived(peer, msg);
         } else if (type == MSG_TX && mempool != null) {
             byte[] raw = Arrays.copyOfRange(msg, 9, msg.length);
             sendTxRejectIfAny(peer, mempool.submitFromPeerChecked(raw, peer.ip));
@@ -3142,6 +3262,12 @@ public class ChainSync {
                     .append("\"bestheight\":").append(conn.peerHeight).append(",")
                     .append("\"conntime\":").append(connSeconds).append(",")
                     .append("\"timeoffset\":0,")
+                    .append("\"pingtime\":").append(conn.lastRttMs < 0 ? "null" : String.format(java.util.Locale.ROOT, "%.3f", conn.lastRttMs / 1000.0)).append(",")
+                    .append("\"minping\":").append(conn.minRttMs == Long.MAX_VALUE ? "null" : String.format(java.util.Locale.ROOT, "%.3f", conn.minRttMs / 1000.0)).append(",")
+                    .append("\"pingsreceived\":").append(conn.pingsReceivedTotal).append(",")
+                    .append("\"pongssent\":").append(conn.pongsSentTotal).append(",")
+                    .append("\"pingssent\":").append(conn.pingsSentTotal).append(",")
+                    .append("\"pongsreceived\":").append(conn.pongsReceivedTotal).append(",")
                     .append("\"version\":").append(conn.protocolVersion)
                     .append("}");
             first = false;
@@ -3235,9 +3361,9 @@ public class ChainSync {
                 int type = getMessageType(msg);
 
                 if (type == MSG_PING) {
-                    byte[] pingPayload = Arrays.copyOfRange(msg, 9, msg.length);
-                    conn.sendMessage(MSG_PONG, pingPayload);
-                    netPings.incrementAndGet();
+                    onPingReceived(conn, msg);
+                } else if (type == MSG_PONG) {
+                    onPongReceived(conn, msg);
                 } else if (type == MSG_TX) {
                     if (mempool != null) {
                         sendTxRejectIfAny(conn, mempool.submitFromPeerChecked(Arrays.copyOfRange(msg, 9, msg.length), conn.ip));
@@ -3884,6 +4010,16 @@ public class ChainSync {
                 if (knownInv.size() > 4096) { var it = knownInv.iterator(); it.next(); it.remove(); }
             }
         }
+        // Ping/pong diagnostics (see onPingReceived / pingPeers / onPongReceived).
+        volatile long   lastReadMs = 0;          // when the last message from this peer finished arriving
+        volatile long   prevReadMs = 0;          // the one before that
+        volatile long   lastPingRecvAt = 0;      // when their last PING reached us
+        volatile byte[] pingNonce = null;        // our PING still waiting for its PONG
+        volatile long   pingSentAt = 0;
+        volatile int    pingOverdueLogged = 0;   // 0 none, 1 logged at 60 s, 2 logged at 5 min
+        volatile long   lastRttMs = -1;
+        volatile long   minRttMs = Long.MAX_VALUE;
+        volatile long   pingsReceivedTotal = 0, pongsSentTotal = 0, pingsSentTotal = 0, pongsReceivedTotal = 0;
         /** Transaction ids waiting to be announced to this peer in one batched INV (see flushTxAnnouncements). */
         private final List<byte[]> pendingTxInv = new ArrayList<>();
         volatile String     agent  = "";
@@ -4220,6 +4356,8 @@ public class ChainSync {
             if (result != null) {
                 bytesRecv += result.length;
                 lastRecvTime = System.currentTimeMillis() / 1000;
+                prevReadMs = lastReadMs;
+                lastReadMs = System.currentTimeMillis();
             }
             return result;
         }

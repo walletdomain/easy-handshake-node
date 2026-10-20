@@ -135,6 +135,9 @@ public class NodeConfig {
      *  us, which proves our port is reachable -- so a home node behind a router never advertises a dead address;
      *  "true" always announces (a server with open ports); "false" never does. */
     public String  getAnnounceSelfMode() { return get("p2p.announce.self", "auto"); }
+    /** Ping/pong logging: "all" prints every PING and PONG in both directions (for diagnosing connections), "slow"
+     *  prints only problems (starved or backlogged connections, slow or missing replies), "off" prints nothing. */
+    public String  getPingLogMode() { return get("p2p.log.ping", "all"); }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
     /** Dedicated port for the Brontide-encrypted WebSocket event/call
      *  server -- separate from RPC's port since Java's built-in HTTP
