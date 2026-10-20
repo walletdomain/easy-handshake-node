@@ -326,7 +326,7 @@ public class PeerTable {
         int loaded = 0;
         for (var e : peersMap.entrySet()) {
             String key = e.getKey();
-            if (key.startsWith("deleted:")) continue; // tombstone, not a peer row
+            if (key.startsWith("deleted:") || key.startsWith("forgotten:")) continue; // tombstones, not peer rows
             peers.put(key, Peer.fromStorage(key, e.getValue()));
             loaded++;
         }
@@ -335,7 +335,6 @@ public class PeerTable {
         }
         mergeFromResourceFile();
         resetAllBackoffs();
-        pruneGossip(true);
         this.settingsMap = configDb.settingsMap();
         String pinnedCsv = settingsMap.get(PINNED_SETTING);
         if (pinnedCsv != null) {
@@ -348,6 +347,7 @@ public class PeerTable {
             }
             if (!pinned.isEmpty()) System.out.println("[PeerTable] Pinned peers: " + new TreeSet<>(pinned));
         }
+        pruneGossip(true);   // after the pinned set is loaded, so a pinned peer is never pruned
         dropNonPublicRows();
         forgetSelf();
         System.out.printf("[PeerTable] Loaded %d peers (%d seeds) from the config database.%n",
@@ -538,6 +538,29 @@ public class PeerTable {
         try { return Integer.parseInt(s); } catch (Exception e) { return 44806; }
     }
 
+    /** How long an address that was dropped for failing 5 dials stays forgotten. Without this the same dead address
+     *  is announced again by other nodes within minutes, re-added as "new", and the cycle never ends. */
+    private static final long FORGET_MS = 7L * 24 * 3600_000L;
+
+    private boolean isForgotten(String ip) {
+        if (peersMap == null) return false;
+        String v = peersMap.get("forgotten:" + ip);
+        if (v == null) return false;
+        try {
+            if (Long.parseLong(v) > System.currentTimeMillis()) return true;
+        } catch (NumberFormatException ignored) { /* treat as expired */ }
+        peersMap.remove("forgotten:" + ip);
+        return false;
+    }
+
+    private void forget(String ip) {
+        peers.remove(ip);
+        if (peersMap != null) {
+            peersMap.remove(ip);
+            peersMap.put("forgotten:" + ip, Long.toString(System.currentTimeMillis() + FORGET_MS));
+        }
+    }
+
     private boolean isDeleted(String ip) {
         return "true".equalsIgnoreCase(peersMap.get("deleted:" + ip));
     }
@@ -592,6 +615,7 @@ public class PeerTable {
     private boolean addDiscoveredNoCommit(String brontideKey, String ip, int port, String source, long seenMs) {
         if (ip == null || ip.isBlank()) return false;
         if (isDeleted(ip)) return false;
+        if (isForgotten(ip)) return false;
         if (ip.equals(selfIp)) return false;
         if (selfKey != null && selfKey.equals(brontideKey)) return false;   // our own self-announce coming back
         String key = brontideKey != null ? brontideKey : "";
@@ -723,6 +747,35 @@ public class PeerTable {
                             + "(%d declared entries, %d byte payload): %s%n",
                     fromIp, declared, msg.length, e);
         }
+    }
+
+    /** A peer we may tell others about: a verified, recently working, dialable address. */
+    public record AnnouncePeer(String ip, int port, byte[] key, long timeSec) { }
+
+    /**
+     * Addresses to share when a peer asks for ours (GETADDR): only peers that have really worked within
+     * {@code maxAgeMs}, are not banned or backed off, and sit on a standard dialable port -- never unverified gossip.
+     * The "last seen" time is the peer's real last success, so receivers can judge freshness. Shuffled, capped.
+     */
+    public List<AnnouncePeer> announceablePeers(long maxAgeMs, int limit) {
+        long now = System.currentTimeMillis();
+        List<AnnouncePeer> out = new ArrayList<>();
+        for (Peer p : peers.values()) {
+            if (p.successCount <= 0 || p.banned || p.isBackedOff() || isSelf(p.ip, p.brontideKey)) continue;
+            if (now - p.lastSuccessTime > maxAgeMs) continue;
+            if (!isValidIp(p.ip)) continue;               // IPv4 public addresses only
+            byte[] kb = null;
+            if (p.hasBrontideKey()) {
+                if (p.port != 44806) continue;
+                kb = NodeIdentity.base32Decode(p.brontideKey);
+                if (kb == null || kb.length != 33) continue;
+            } else if (p.port != PLAIN_PORT) {
+                continue;
+            }
+            out.add(new AnnouncePeer(p.ip, p.port, kb, p.lastSuccessTime / 1000));
+        }
+        Collections.shuffle(out);
+        return out.size() > limit ? new ArrayList<>(out.subList(0, limit)) : out;
     }
 
     /**
@@ -949,7 +1002,10 @@ public class PeerTable {
     }
 
     public void recordFailure(String ip, String reason) {
-        Peer r = getOrCreate(ip);
+        // A failure for an address we do not know (a scanner or a stranger that failed an inbound handshake) must not
+        // create a row: nothing would ever test it, and it would sit in the list as "unverified" forever.
+        Peer r = peers.get(ip);
+        if (r == null) return;
         // A gossip-discovered address we have never once connected to is not a "bad peer": it is most often a node
         // behind NAT, one whose inbound slots are full, or a stale entry. Count the failure and back off (so we do not
         // hammer it) but do not burn its score, so it can never be blacklisted -- only dropped after repeated failures.
@@ -1176,10 +1232,31 @@ public class PeerTable {
      */
     private void pruneGossip(boolean legacyToo) {
         long now = System.currentTimeMillis();
-        int expired = 0, failed = 0, legacy = 0;
+        int expired = 0, failed = 0, legacy = 0, undialable = 0, idle = 0;
         for (Peer r : new ArrayList<>(peers.values())) {
             if (r.isSeed || r.banned || r.successCount > 0 || pinned.contains(r.ip)) continue;
-            if (r.source == null || !r.source.startsWith("addr:")) continue;
+            boolean gossip = r.source != null && r.source.startsWith("addr:");
+            // A never-verified address can only ever be tested on the standard Brontide port (with a key) or the
+            // standard cleartext port (without one). Anything else could never become verified, so it would sit in
+            // the list forever.
+            boolean dialable = r.hasBrontideKey() ? r.port == 44806 : r.port == PLAIN_PORT;
+            if (!dialable) {
+                peers.remove(r.ip);
+                if (peersMap != null) peersMap.remove(r.ip);
+                undialable++;
+                continue;
+            }
+            if (!gossip) {
+                // Created by something other than gossip (an inbound attempt, an old version): drop it once it has
+                // been quiet for a day, since nothing will ever test it.
+                long last = Math.max(Math.max(r.lastAttemptTime, r.lastFailureTime), Math.max(r.gossipTime, r.discoveredAt));
+                if (last == 0 || now - last > 24L * 3600_000L) {
+                    peers.remove(r.ip);
+                    if (peersMap != null) peersMap.remove(r.ip);
+                    idle++;
+                }
+                continue;
+            }
             boolean drop = false;
             if (r.gossipTime == 0) {
                 if (legacyToo) { drop = true; legacy++; }
@@ -1188,16 +1265,20 @@ public class PeerTable {
             }
             if (!drop && r.failureCount >= ADDR_MAX_FAILURES) { drop = true; failed++; }
             if (drop) {
-                peers.remove(r.ip);
-                if (peersMap != null) peersMap.remove(r.ip);
+                if (r.failureCount >= ADDR_MAX_FAILURES) forget(r.ip);   // remember it, so re-gossip cannot bring it back
+                else {
+                    peers.remove(r.ip);
+                    if (peersMap != null) peersMap.remove(r.ip);
+                }
             }
         }
-        int total = expired + failed + legacy;
+        int total = expired + failed + legacy + undialable + idle;
         if (total > 0) {
             if (peersMap != null) ConfigDB.get().commit();
-            System.out.printf("[PeerTable] Forgot %d stale gossip address(es): %d unseen >%dh, "
-                            + "%d failed %d+ dials, %d pre-timestamp.%n",
-                    total, expired, ADDR_EXPIRE_MS / 3600_000L, failed, ADDR_MAX_FAILURES, legacy);
+            System.out.printf("[PeerTable] Forgot %d unverified address(es): %d failed %d+ dials (kept off the list for %d days), "
+                            + "%d unseen >%dh, %d on a non-standard port, %d inactive non-gossip, %d pre-timestamp.%n",
+                    total, failed, ADDR_MAX_FAILURES, FORGET_MS / (24L * 3600_000L),
+                    expired, ADDR_EXPIRE_MS / 3600_000L, undialable, idle, legacy);
         }
     }
 

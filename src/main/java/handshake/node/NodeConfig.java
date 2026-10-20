@@ -131,6 +131,10 @@ public class NodeConfig {
      *  port in the firewall to be reachable by plain hsd peers. */
     public int     getPlainP2pPort() { return getInt("p2p.plain.port", DEFAULT_PLAIN_P2P_PORT); }
     public boolean isPlainP2pEnabled() { return getBool("p2p.plain.enabled", true); }
+    /** Whether this node tells peers its own address: "auto" (default) starts once an outside peer has connected to
+     *  us, which proves our port is reachable -- so a home node behind a router never advertises a dead address;
+     *  "true" always announces (a server with open ports); "false" never does. */
+    public String  getAnnounceSelfMode() { return get("p2p.announce.self", "auto"); }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
     /** Dedicated port for the Brontide-encrypted WebSocket event/call
      *  server -- separate from RPC's port since Java's built-in HTTP

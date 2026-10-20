@@ -103,7 +103,6 @@ public final class WebAdminServerContent {
                         </div>
                         <div class="pane-sub">
                             <span id="peers-summary" class="muted">Loading...</span>
-                            <button id="peers-toggle" class="link" type="button"></button>
                         </div>
                         <div class="peer-scroll">
                             <table id="peertable">
@@ -322,6 +321,9 @@ public final class WebAdminServerContent {
             .chip.ok { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
             .chip.warn { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
             .chip.bad { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); }
+            button.chip { border: 0; font-family: inherit; cursor: pointer; }
+            button.chip:hover { filter: brightness(1.08); }
+            button.chip.sel { outline: 2px solid currentColor; outline-offset: 1px; font-weight: 600; }
 
             table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
             th { text-align: left; font-weight: 600; color: var(--muted); font-size: 0.78rem; padding: 0.25rem 0.4rem; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
@@ -638,9 +640,9 @@ public final class WebAdminServerContent {
             let live = null;            // EventSource
             let fallbackTimer = null;
             let peersAll = [];          // last peer list (pushed or fetched)
-            let gossipOnlyCount = 0;
-            let showGossip = false;
-            let gossipTimer = null;
+            let untestedCount = 0;       // addresses heard about but not yet test-connected (not in the pushed list)
+            let peerFilter = "connected"; // which bubble is selected: connected | available | unavailable | untested
+            let gossipTimer = null;      // refresh timer while the "untested" bubble is open
             let logLines = [];          // {seq,t,lvl,m}
             let logLastSeq = 0;
             let logPaused = false;
@@ -673,7 +675,10 @@ public final class WebAdminServerContent {
                 loadConfig();
                 $("config-form").addEventListener("submit", onSaveConfig);
                 $("stop-node-btn").addEventListener("click", onStopNode);
-                $("peers-toggle").addEventListener("click", onToggleGossip);
+                $("peers-chips").addEventListener("click", e => {
+                    const b = e.target.closest("[data-f]");
+                    if (b) onPeerFilter(b.dataset.f);
+                });
                 setupLogControls();
                 setupRpcPanel();
                 connectLive();
@@ -699,7 +704,7 @@ public final class WebAdminServerContent {
                     startFallback();     // keep the page current while the stream is down; EventSource retries by itself
                 };
                 live.addEventListener("status", e => onStatus(JSON.parse(e.data)));
-                live.addEventListener("peers", e => { const d = JSON.parse(e.data); gossipOnlyCount = d.gossipOnly; if (!showGossip) setPeers(d.peers); });
+                live.addEventListener("peers", e => { const d = JSON.parse(e.data); untestedCount = d.gossipOnly; if (peerFilter !== "untested") setPeers(d.peers); else renderPeers(); });
                 live.addEventListener("mempool", e => onMempool(JSON.parse(e.data)));
                 live.addEventListener("logs", e => { logLines = []; logLastSeq = 0; $("log").textContent = ""; JSON.parse(e.data).forEach(addLogLine); flushLog(true); });
                 live.addEventListener("log", e => addLogLine(JSON.parse(e.data)));
@@ -770,10 +775,10 @@ public final class WebAdminServerContent {
                         if (sd.phase) onShutdown(sd);
                         onStatus(await (await fetch("/api/status")).json());
                         onMempool(await (await fetch("/api/mempool")).json());
-                        if (!showGossip) {
+                        if (peerFilter !== "untested") {
                             const all = await (await fetch("/api/peertable")).json();
                             const split = splitPeers(all);
-                            gossipOnlyCount = split.gossip.length;
+                            untestedCount = split.gossip.length;
                             setPeers(split.shown);
                         }
                         const lines = await (await fetch("/api/log")).json();
@@ -915,7 +920,14 @@ public final class WebAdminServerContent {
             /* ---- peers ---------------------------------------------------------- */
 
             function isVerified(p) { return p.state === "connected" || p.successes > 0 || p.seed; }
-            function isGossipOnly(p) { return !isVerified(p) && p.state !== "backoff" && p.state !== "banned" && p.state !== "blacklisted"; }
+            /* Which bubble a peer belongs to. */
+            function classify(p) {
+                if (p.state === "connected") return "connected";
+                if (p.state === "banned" || p.state === "blacklisted" || p.state === "backoff") return "unavailable";
+                if (isVerified(p)) return p.score < 25 ? "unavailable" : "available";
+                return "untested";
+            }
+            function isGossipOnly(p) { return classify(p) === "untested"; }
             function splitPeers(all) {
                 return { shown: all.filter(p => !isGossipOnly(p)), gossip: all.filter(isGossipOnly) };
             }
@@ -925,24 +937,34 @@ public final class WebAdminServerContent {
                 renderPeers();
             }
 
+            const FILTER_INFO = {
+                connected:   { empty: "No connected peers right now.",
+                               text: "Peers connected to this node right now." },
+                available:   { empty: "No other good peers are known right now.",
+                               text: "Good peers we have connected to before (or seeds) that are not connected right now." },
+                unavailable: { empty: "No unavailable peers.",
+                               text: "Peers we cannot use right now: unreachable and waiting to be retried, blacklisted, banned or low score. Hover a row for the reason." },
+                untested:    { empty: "Nothing is waiting to be tested.",
+                               text: "Addresses other nodes told us about, waiting for their first test connection. Most are home or NAT'd machines that will turn out to be unreachable." }
+            };
+
             function renderPeers() {
                 const tbody = document.querySelector("#peertable tbody");
-                const count = st => peersAll.filter(p => p.state === st).length;
-                const chips = [];
-                chips.push('<span class="chip ok">' + count("connected") + ' connected</span>');
-                const failing = peersAll.filter(p => p.state === "backoff" || p.state === "blacklisted");
-                if (failing.length) {
-                    const kinds = {};
-                    failing.forEach(p => { const k = p.failureKind || "no reason recorded yet"; kinds[k] = (kinds[k] || 0) + 1; });
-                    const detail = Object.keys(kinds).sort((a, b) => kinds[b] - kinds[a]).map(k => kinds[k] + " " + k).join(", ");
-                    chips.push('<span class="chip warn" title="' + escapeHtml(detail) + '">' + failing.length + ' not reachable (' + escapeHtml(detail) + ')</span>');
-                }
-                if (count("banned")) chips.push('<span class="chip bad">' + count("banned") + ' banned</span>');
+                const counts = { connected: 0, available: 0, unavailable: 0, untested: 0 };
+                peersAll.forEach(p => counts[classify(p)]++);
+                if (peerFilter !== "untested") counts.untested = untestedCount;
+                const chip = (f, cls, label) =>
+                    '<button type="button" class="chip ' + cls + (peerFilter === f ? ' sel' : '') + '" data-f="' + f + '">'
+                    + fmtNum(counts[f]) + ' ' + label + '</button>';
+                const chips = [chip("connected", "ok", "connected"), chip("available", "warn", "available"),
+                               chip("unavailable", "bad", "unavailable")];
+                if (counts.untested > 0 || peerFilter === "untested") chips.push(chip("untested", "", "untested"));
                 $("peers-chips").innerHTML = chips.join("");
-                $("peers-summary").textContent = peersAll.filter(isVerified).length + " verified peers";
-                $("peers-toggle").textContent = (showGossip ? "Hide " : "Show ") + fmtNum(gossipOnlyCount) + " unverified addresses";
-                if (peersAll.length === 0) { tbody.innerHTML = '<tr><td colspan="3">No peers to show yet.</td></tr>'; return; }
-                const sorted = peersAll.slice().sort((a, b) => (b.score - a.score) || a.ip.localeCompare(b.ip));
+                const info = FILTER_INFO[peerFilter];
+                $("peers-summary").textContent = info.text;
+                const rows = peersAll.filter(p => classify(p) === peerFilter);
+                if (rows.length === 0) { tbody.innerHTML = '<tr><td colspan="3">' + info.empty + '</td></tr>'; return; }
+                const sorted = rows.slice().sort((a, b) => (b.score - a.score) || a.ip.localeCompare(b.ip));
                 tbody.innerHTML = sorted.map(p => `
                     <tr title="${escapeHtml(tooltipFor(p))}">
                         <td>${escapeHtml(p.ip)}${p.seed ? " &#9733;" : ""}
@@ -967,22 +989,23 @@ public final class WebAdminServerContent {
                 });
             }
 
-            async function onToggleGossip() {
-                showGossip = !showGossip;
-                if (showGossip) {
+            async function onPeerFilter(f) {
+                if (f === peerFilter) return;
+                peerFilter = f;
+                clearInterval(gossipTimer);
+                gossipTimer = null;
+                if (f === "untested") {
                     await refreshAllPeers();
                     gossipTimer = setInterval(refreshAllPeers, 5000);
                 } else {
-                    clearInterval(gossipTimer);
-                    gossipTimer = null;
-                    try { setPeers(splitPeers(await (await fetch("/api/peertable")).json()).shown); } catch (e) { /* next push fixes it */ }
+                    renderPeers();                   // the next push (a few seconds) replaces the list with the lighter one
                 }
             }
 
             async function refreshAllPeers() {
                 try {
                     const all = await (await fetch("/api/peertable")).json();
-                    gossipOnlyCount = all.filter(isGossipOnly).length;
+                    untestedCount = all.filter(isGossipOnly).length;
                     setPeers(all);
                 } catch (e) { /* retry on the next tick */ }
             }
@@ -1021,8 +1044,13 @@ public final class WebAdminServerContent {
                         return '<span class="pill backoff" data-label="' + lbl + '" data-until="' + (p.backoffUntil !== undefined ? p.backoffUntil : Date.now() + p.backoffMs)
                             + '">' + lbl + ' ' + fmtDur(backoffMsOf(p)) + '</span>' + failSub(p);
                     }
-                    case "plain": return '<span class="pill plain">Cleartext</span>';
-                    default: return '<span class="pill idle" title="Known peer with a key; no open connection right now">Not connected</span>';
+                    case "plain": return isVerified(p)
+                        ? '<span class="pill plain">Cleartext</span>'
+                        : '<span class="pill idle" title="Heard about from another node; waiting for its first test connection">Untested</span>';
+                    default:
+                        return isVerified(p)
+                            ? '<span class="pill idle" title="Worked before; not connected right now">Available</span>'
+                            : '<span class="pill idle" title="Heard about from another node; waiting for its first test connection">Untested</span>';
                 }
             }
 
@@ -1051,7 +1079,7 @@ public final class WebAdminServerContent {
             async function onUnban(ip) {
                 try {
                     await fetch("/api/bans/unban", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip }) });
-                    if (showGossip) refreshAllPeers();   // otherwise the next push shows the change
+                    if (peerFilter === "untested") refreshAllPeers();   // otherwise the next push shows the change
                 } catch (e) { /* the next update shows the real state */ }
             }
 

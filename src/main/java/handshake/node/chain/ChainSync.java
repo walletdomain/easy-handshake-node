@@ -322,17 +322,42 @@ public class ChainSync {
      * effort: failure here shouldn't tear down an otherwise-healthy
      * connection, so it's logged, not propagated.
      */
+    /** Service bits we advertise (NETWORK = we serve blocks), as in our VERSION message. */
+    private static final int SELF_SERVICES = 1;
+    /** True once an outside (public, non-loopback) peer has connected to us: proof our port is reachable. */
+    private volatile boolean inboundReachabilityProven = false;
+
+    private boolean selfAnnounceAllowed() {
+        String mode = config.getAnnounceSelfMode();
+        if ("true".equalsIgnoreCase(mode)) return true;
+        if ("false".equalsIgnoreCase(mode)) return false;
+        return inboundReachabilityProven;   // auto
+    }
+
+    private static boolean isPublicIpv4(String ip) {
+        if (ip == null || !ip.matches("\\d{1,3}(\\.\\d{1,3}){3}")) return false;
+        if (ip.startsWith("127.") || ip.startsWith("10.") || ip.startsWith("192.168.") || ip.startsWith("169.254.")
+                || ip.startsWith("0.")) return false;
+        String[] o = ip.split("\\.");
+        int a = Integer.parseInt(o[0]), b = Integer.parseInt(o[1]);
+        if (a == 172 && b >= 16 && b <= 31) return false;
+        if (a == 100 && b >= 64 && b <= 127) return false;
+        return a < 224;
+    }
+
     private void sendSelfAnnounce(PeerConnection conn) {
-        if (confirmedSelfIp == null) return;
+        if (confirmedSelfIp == null || !selfAnnounceAllowed()) return;
         try {
             boolean plainOn = config.isPlainP2pEnabled();
             int n = plainOn ? 2 : 1;
             byte[] payload = new byte[1 + n * NET_ADDRESS_SIZE];
             payload[0] = (byte) n;
-            int apos = writeNetAddressStatic(payload, 1, confirmedSelfIp, config.getP2pPort(), identity.getPublicKey());
+            long nowSec = System.currentTimeMillis() / 1000;
+            int apos = writeNetAddressStatic(payload, 1, confirmedSelfIp, config.getP2pPort(), identity.getPublicKey(),
+                    nowSec, SELF_SERVICES);
             // Second, keyless entry: our cleartext listener, so plain hsd peers
             // (which never dial Brontide entries they have no use for) can reach us too.
-            if (plainOn) writeNetAddressStatic(payload, apos, confirmedSelfIp, config.getPlainP2pPort(), null);
+            if (plainOn) writeNetAddressStatic(payload, apos, confirmedSelfIp, config.getPlainP2pPort(), null, nowSec, SELF_SERVICES);
             conn.sendMessage(MSG_ADDR, payload);
             // DIAGNOSTIC: previously only the failure path logged anything
             // here, so a successful self-announce and "this method was
@@ -487,11 +512,6 @@ public class ChainSync {
         byte[] txidBytes = fromHexStatic(txid);
         if (txidBytes == null || txidBytes.length != 32) return;
 
-        byte[] invPayload = new byte[1 + 36];
-        invPayload[0] = 1; // count = 1
-        writeLE32(invPayload, 1, 1); // item type = 1 = TX
-        System.arraycopy(txidBytes, 0, invPayload, 5, 32);
-
         long txRate = -1; // dollarydoos per kB, as hsd's getRate
         if (mempool != null) {
             Mempool.MempoolEntry me = mempool.getEntry(txid);
@@ -500,13 +520,42 @@ public class ChainSync {
 
         for (PeerInfo p : connectedPeers) {
             if (p.ip().equals(excludeIp)) continue;
-            long minRate = p.conn().feeRate;
+            PeerConnection c = p.conn();
+            if (c.knows(txid)) continue;                      // it already told us about this transaction
+            long minRate = c.feeRate;
             if (minRate != -1 && txRate != -1 && txRate < minRate) continue; // peer's FEEFILTER
+            synchronized (c.pendingTxInv) {
+                if (c.pendingTxInv.size() >= 5000) c.pendingTxInv.remove(0);   // bounded: drop the oldest
+                c.pendingTxInv.add(txidBytes);
+            }
+        }
+    }
+
+    /** Sends each peer its queued transaction announcements as ONE batched INV (up to 1000 ids), instead of one message
+     *  per transaction. Runs once a second; a transaction is announced to a peer at most once. */
+    private void flushTxAnnouncements() {
+        if (!running) return;
+        for (PeerInfo p : connectedPeers) {
+            PeerConnection c = p.conn();
+            List<byte[]> batch;
+            synchronized (c.pendingTxInv) {
+                if (c.pendingTxInv.isEmpty()) continue;
+                int n = Math.min(1000, c.pendingTxInv.size());
+                batch = new ArrayList<>(c.pendingTxInv.subList(0, n));
+                c.pendingTxInv.subList(0, n).clear();
+            }
+            List<P2pMessages.Item> items = new ArrayList<>();
+            for (byte[] h : batch) {
+                String hex = toHex(h);
+                if (c.knows(hex)) continue;
+                c.markKnown(hex);
+                items.add(new P2pMessages.Item(P2pMessages.INV_TX, h));
+            }
+            if (items.isEmpty()) continue;
             try {
-                p.conn().sendMessage(MSG_INV, invPayload);
+                c.sendMessage(MSG_INV, P2pMessages.encodeItems(items));
             } catch (Exception e) {
-                // best-effort -- a relay failure to one peer shouldn't
-                // affect any other peer or the mempool acceptance itself
+                // best-effort -- a relay failure to one peer shouldn't affect any other peer or the mempool
             }
         }
     }
@@ -558,9 +607,60 @@ public class ChainSync {
         // most of the time.
         poolScheduler.scheduleWithFixedDelay(
                 () -> PeerTable.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
+        // Answers pings (and reads announcements) on pooled connections the sync loop is not using right now.
+        keepAliveScheduler.scheduleWithFixedDelay(
+                this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_SEC, KEEPALIVE_INTERVAL_SEC, TimeUnit.SECONDS);
+        keepAliveScheduler.scheduleWithFixedDelay(
+                this::flushTxAnnouncements, 1, 1, TimeUnit.SECONDS);
         // Background reachability probe of never-verified addresses (see probeUnverifiedPeer()).
         probeScheduler.scheduleWithFixedDelay(
                 this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
+    }
+
+    /** Seconds between keep-alive passes over the idle pooled connections (hsd pings every 30 s). */
+    private static final int KEEPALIVE_INTERVAL_SEC = 5;
+    /** Its own thread, so a slow pool top-up (dials that time out) can never delay a PONG. */
+    private final ScheduledExecutorService keepAliveScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "chain-sync-keepalive");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * Pooled outbound connections used to have no reader at all unless the sync loop happened to pick that peer:
+     * a peer's PING sat unanswered, and hsd drops a connection it has not heard from in about 20 minutes (the
+     * pool code already noticed "idle pooled connections die"). This pass reads whatever has arrived on every idle
+     * pooled connection and answers it: PING gets a PONG, announcements are handled as usual. A connection is
+     * touched only when nothing else is using it (see PeerConnection.busy), and only when bytes are already waiting,
+     * so it never blocks and never competes with the sync loop for the same stream.
+     */
+    private void servicePoolKeepAlive() {
+        if (!running) return;
+        for (PeerInfo pi : connectedPeers) {
+            if (pi.inbound()) continue;                 // inbound connections have their own reader loop
+            PeerConnection c = pi.conn();
+            if (!c.busy.compareAndSet(false, true)) continue;
+            try {
+                int handled = 0;
+                while (running && handled < 100 && c.in.available() > 0) {
+                    byte[] msg = c.readMessage(5_000);
+                    if (msg == null) { c.close(); break; }   // unreadable frame: the stream cannot be trusted any more
+                    handled++;
+                    if (getMessageType(msg) == MSG_HEADERS) {
+                        if (noteAnnouncedHeaders(c, msg)) triggerSync("HEADERS from " + c.ip);
+                    } else {
+                        handleNonBlockMessage(msg, c);
+                    }
+                }
+            } catch (Exception e) {
+                System.out.printf("[ChainSync] Keep-alive: dropping %s (%s: %s)%n",
+                        c.ip, e.getClass().getSimpleName(), e.getMessage());
+                c.close();
+            } finally {
+                c.busy.set(false);
+            }
+        }
     }
 
     /** Seconds between background probes of never-verified addresses (one address per probe). */
@@ -753,6 +853,7 @@ public class ChainSync {
         scheduler.shutdown();
         poolScheduler.shutdown();
         probeScheduler.shutdownNow();
+        keepAliveScheduler.shutdownNow();
         try {
             if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.out.println("[ChainSync] Sync cycle did not stop within 30s -- "
@@ -994,6 +1095,7 @@ public class ChainSync {
                     if (peerBroken) {
                         peer.close();
                     }
+                    peer.busy.set(false);   // back to the keep-alive pass
                 }
 
                 // Fully caught up, or this round made no progress at all
@@ -1051,6 +1153,7 @@ public class ChainSync {
                     PeerConnection conn = connectPeer(cand);
                     if (conn == null) continue;
                     connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
+                    conn.busy.set(false);   // idle pool member now: the keep-alive pass may service it
                     alreadyConnected.add(cand.ip());
                     System.out.printf("[ChainSync] Pinned peer connected: %s (h=%d)%n",
                             conn.ip, conn.peerHeight);
@@ -1085,6 +1188,7 @@ public class ChainSync {
                     PeerConnection conn = connectPeer(cand);
                     if (conn == null) continue;
                     connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), false));
+                    conn.busy.set(false);   // idle pool member now: the keep-alive pass may service it
                     System.out.printf("[ChainSync] Outbound pool: added %s (h=%d) -- now %d/%d%n",
                             conn.ip, conn.peerHeight, countOutboundUnpinned(), target);
                 } catch (Exception e) {
@@ -1175,7 +1279,10 @@ public class ChainSync {
         List<String> order = PeerTable.get().weightedOrder(
                 usable.stream().map(PeerInfo::ip).toList());
         usable.sort(Comparator.comparingInt(p -> order.indexOf(p.ip())));
-        return usable.get(0).conn();
+        for (PeerInfo p : usable) {
+            if (p.conn().busy.compareAndSet(false, true)) return p.conn();   // claimed: the keep-alive pass leaves it alone
+        }
+        return null;
     }
 
     private PeerConnection acquireSyncPeer(List<PeerTable.ConnectTarget> candidates, int ourTip) {
@@ -2368,6 +2475,7 @@ public class ChainSync {
             if (!running || System.currentTimeMillis() > budgetEnd) break;
             if (p.inbound()) continue; // inbound peers push their own announcements
             PeerConnection c = p.conn();
+            if (!c.busy.compareAndSet(false, true)) continue;   // in use by the sync loop or the keep-alive pass
             try {
                 c.sendGetHeaders(locator);
                 byte[] msg = null;
@@ -2393,6 +2501,8 @@ public class ChainSync {
                 System.out.printf("[ChainSync] Dropping dead pooled connection to %s (%s).%n",
                         c.ip, e.getClass().getSimpleName());
                 try { c.close(); } catch (Exception ignored) {}
+            } finally {
+                c.busy.set(false);
             }
         }
     }
@@ -2527,6 +2637,7 @@ public class ChainSync {
             for (int i = 0; i < limit; i++) {
                 byte[] h = hs.get(i);
                 if (!HeaderUtil.checkPOW(h)) return false; // junk / spam: ignore entirely
+                conn.markKnown(toHex(HeaderUtil.hash(h)));
                 int prevHeight = db.getHeightByHash(HeaderUtil.prevBlock(h));
                 if (prevHeight >= 0 && prevHeight <= db.getHeaderTip()) {
                     raisePeerHeight(conn, prevHeight + 1);
@@ -2565,9 +2676,12 @@ public class ChainSync {
             PeerConnection c = p.conn();
             if (c.ip.equals(excludeIp)) continue;
             if (c.peerHeight >= height) continue;
+            String hashHex = toHex(hash);
+            if (c.knows(hashHex)) continue;
             try {
                 if (c.wantsHeaders) c.sendMessage(MSG_HEADERS, hdrPayload);
                 else c.sendMessage(MSG_INV, invPayload);
+                c.markKnown(hashHex);
                 sent++;
             } catch (Exception e) {
                 // best-effort, like transaction relay
@@ -3002,6 +3116,12 @@ public class ChainSync {
             socket.setSoTimeout(READ_TIMEOUT_MS);
 
             connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), true));
+            if (!inboundReachabilityProven && isPublicIpv4(ip) && !ip.equals(confirmedSelfIp)) {
+                inboundReachabilityProven = true;
+                System.out.printf("[ChainSync] %s connected to us from outside: our port is reachable, so this node now "
+                        + "announces its own address.%n", ip);
+                if (confirmedSelfIp != null && selfAnnounceAllowed()) broadcastSelfAnnounceToAll();
+            }
             PeerTable.get().recordSuccess(ip, conn.agent, conn.peerHeight, brontide != null);
 
             // Same unsolicited self-announce as the outbound side
@@ -3226,10 +3346,14 @@ public class ChainSync {
             if (itemType == 2) {
                 // Block announcement: we fetch blocks via headers, so just
                 // start a sync cycle if we don't have it yet.
+                conn.markKnown(toHex(hash));      // it has this block: never announce it back
+                int hh = db.getHeightByHash(hash);
+                if (hh >= 0) raisePeerHeight(conn, hh);
                 if (!haveHeader(hash)) triggerSync("INV from " + conn.ip);
                 continue;
             }
             if (itemType != 1) continue; // only TX and BLOCK announcements are handled here
+            conn.markKnown(toHex(hash));          // it has this transaction: never announce it back
             if (!chainSynced) continue;
             String txidHex = toHex(hash);
             if (mempool != null && mempool.getEntry(txidHex) == null && !mempool.hasReject(txidHex)) {
@@ -3591,44 +3715,50 @@ public class ChainSync {
      *  meaning every peer we told others about was reported as keyless
      *  regardless of whether we actually knew its brontide key. */
     private byte[] buildAddrMessage() {
-        // NEW: previously this only ever relayed OTHER peers' addresses --
-        // we never once included an entry for ourselves, no matter who
-        // asked. That meant there was no path, even in principle, for
-        // this node's address to ever enter anyone else's address book
-        // via gossip: we could complete a GETADDR/ADDR exchange countless
-        // times and never once tell anyone we exist. Now that a real,
-        // multi-peer-corroborated public IP is available (see
-        // confirmedSelfIp / recordSelfIpObservation()'s own comment),
-        // include a real, dialable self-entry -- but only once it's been
-        // confirmed by independent peers, never a guess.
-        boolean includeSelf = confirmedSelfIp != null;
+        long nowSec = System.currentTimeMillis() / 1000;
+        // Our own entries: only once the address is confirmed by independent peers AND an outside peer has reached us
+        // (see selfAnnounceAllowed()) -- a home node behind a router must not advertise a dead address.
+        boolean includeSelf = confirmedSelfIp != null && selfAnnounceAllowed();
         boolean plainOn = config.isPlainP2pEnabled();
-        // Collect (ip, port, key) entries first so the count byte is exact.
+        // Entries: {ip, port, key|null, timeSec, services}
         List<Object[]> entries = new ArrayList<>();
+        Set<String> listed = new HashSet<>();
         if (includeSelf) {
-            entries.add(new Object[]{confirmedSelfIp, config.getP2pPort(), identity.getPublicKey()});
+            entries.add(new Object[]{confirmedSelfIp, config.getP2pPort(), identity.getPublicKey(), nowSec, SELF_SERVICES});
             if (plainOn) {
-                entries.add(new Object[]{confirmedSelfIp, config.getPlainP2pPort(), null});
+                entries.add(new Object[]{confirmedSelfIp, config.getPlainP2pPort(), null, nowSec, SELF_SERVICES});
             }
+            listed.add(confirmedSelfIp);
         }
+        // Peers connected right now are alive by definition.
         for (PeerInfo p : connectedPeers) {
             if (entries.size() >= 200) break;
+            if (!listed.add(p.ip())) continue;
+            int svc = p.conn().services != 0 ? p.conn().services : 1;
             String knownKey = PeerTable.get().getBrontideKeyByIp(p.ip());
             if (knownKey != null) {
-                entries.add(new Object[]{p.ip(), 44806, NodeIdentity.base32Decode(knownKey)});
+                entries.add(new Object[]{p.ip(), 44806, NodeIdentity.base32Decode(knownKey), nowSec, svc});
             } else if (!p.inbound()) {
                 // Keyless peer we dialed ourselves: its real (cleartext) port is
                 // the one we connected to. An INBOUND keyless peer's listening
                 // port is unknown (only its ephemeral source port is), so it is
                 // not relayed.
-                entries.add(new Object[]{p.ip(), PeerTable.PLAIN_PORT, null});
+                entries.add(new Object[]{p.ip(), PeerTable.PLAIN_PORT, null, nowSec, svc});
             }
+        }
+        // Then verified peers we are not connected to right now (real last-success times), so a GETADDR reply
+        // actually helps the asker discover the network, not just repeat our current connections.
+        for (PeerTable.AnnouncePeer a : PeerTable.get().announceablePeers(24L * 3600_000L, 100)) {
+            if (entries.size() >= 200) break;
+            if (!listed.add(a.ip())) continue;
+            entries.add(new Object[]{a.ip(), a.port(), a.key(), a.timeSec(), SELF_SERVICES});
         }
         byte[] payload = new byte[1 + entries.size() * NET_ADDRESS_SIZE];
         int pos = 0;
         payload[pos++] = (byte) entries.size();
         for (Object[] e : entries) {
-            pos = writeNetAddressStatic(payload, pos, (String) e[0], (Integer) e[1], (byte[]) e[2]);
+            pos = writeNetAddressStatic(payload, pos, (String) e[0], (Integer) e[1], (byte[]) e[2],
+                    (Long) e[3], (Integer) e[4]);
         }
         return payload;
     }
@@ -3637,8 +3767,15 @@ public class ChainSync {
      *  PeerConnection (VERSION message) and here (ADDR message) without
      *  duplicating the field layout in two places. */
     private static int writeNetAddressStatic(byte[] buf, int pos, String ip, int port, byte[] brontideKey) {
-        pos = writeLE64(buf, pos, 0L);   // time = 0
-        pos = writeLE32(buf, pos, 0);    // services = 0
+        return writeNetAddressStatic(buf, pos, ip, port, brontideKey, 0L, 0);
+    }
+
+    /** ADDR entries need a real "last seen" time (seconds) and the NETWORK service bit: hsd's address handler skips
+     *  entries without the services it requires, and replaces an invalid time with "5 days ago". */
+    private static int writeNetAddressStatic(byte[] buf, int pos, String ip, int port, byte[] brontideKey,
+                                             long timeSec, int services) {
+        pos = writeLE64(buf, pos, timeSec);
+        pos = writeLE32(buf, pos, services);
         pos = writeLE32(buf, pos, 0);    // hi_services = 0
         buf[pos++] = 0; // addr type (0 = IPv4)
         // raw[16]: standard IPv4-mapped IPv6 -- 10 zero bytes + 0xFF 0xFF + 4 IPv4 bytes
@@ -3669,6 +3806,20 @@ public class ChainSync {
         final BrontideState brontide;   // null => cleartext transport
         final boolean       plain;
         final String        ip;
+        /** True while one thread owns this connection's input stream (the sync loop, or a fresh dial that has not
+         *  joined the pool yet). The keep-alive pass reads only connections where it can flip this false -> true. */
+        final java.util.concurrent.atomic.AtomicBoolean busy = new java.util.concurrent.atomic.AtomicBoolean(true);
+        /** Hashes (hex) this peer already has or has told us about, so we never announce them back to it. Bounded. */
+        private final java.util.LinkedHashSet<String> knownInv = new java.util.LinkedHashSet<>();
+        boolean knows(String hashHex) { synchronized (knownInv) { return knownInv.contains(hashHex); } }
+        void markKnown(String hashHex) {
+            synchronized (knownInv) {
+                knownInv.add(hashHex);
+                if (knownInv.size() > 4096) { var it = knownInv.iterator(); it.next(); it.remove(); }
+            }
+        }
+        /** Transaction ids waiting to be announced to this peer in one batched INV (see flushTxAnnouncements). */
+        private final List<byte[]> pendingTxInv = new ArrayList<>();
         volatile String     agent  = "";
         volatile int        peerHeight = 0;
         /** True once the peer has sent SENDHEADERS: it wants new blocks announced as HEADERS, not INV. */
