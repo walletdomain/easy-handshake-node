@@ -322,6 +322,46 @@ public class ChainSync {
      * effort: failure here shouldn't tear down an otherwise-healthy
      * connection, so it's logged, not propagated.
      */
+    // ── Network activity counters (reported by the 10-minute "[Network]" summary line) ──────────────────────────
+    private final java.util.concurrent.atomic.AtomicLong netInboundNew = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netGetAddr = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netAddrEntries = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netAddrWithSelf = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netSelfAnnounces = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netPings = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netTxAnnounced = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netTxBatches = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netBlocksAnnounced = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong netBlockPeers = new java.util.concurrent.atomic.AtomicLong();
+    private final Set<String> inboundDistinctToday = ConcurrentHashMap.newKeySet();
+    private volatile java.time.LocalDate inboundDistinctDay = java.time.LocalDate.now();
+    private volatile boolean selfHeldBackLogged = false;
+    private static final int NETWORK_SUMMARY_MIN = 10;
+
+    private void noteInboundAddress(String ip) {
+        java.time.LocalDate today = java.time.LocalDate.now();
+        if (!today.equals(inboundDistinctDay)) { inboundDistinctDay = today; inboundDistinctToday.clear(); }
+        inboundDistinctToday.add(ip);
+    }
+
+    /** One line every few minutes: what the node actually did on the network, so announcement problems can be
+     *  diagnosed from the log alone. */
+    private void printNetworkSummary() {
+        if (!running) return;
+        String mode = config.getAnnounceSelfMode();
+        String selfState = selfAnnounceAllowed() ? "on"
+                : ("false".equalsIgnoreCase(mode) ? "off (setting p2p.announce.self=false)"
+                : "held back (waiting for an outside peer to connect to us)");
+        if (confirmedSelfIp == null) selfState = "waiting (public address not confirmed yet)";
+        System.out.printf("[Network] last %d min: inbound new %d (distinct today %d) | GETADDR received %d, ADDR entries sent %d "
+                        + "(replies with our own address: %d) | self-announce: %s, sent %d | pings answered %d | "
+                        + "tx announced %d in %d batches | blocks announced %d (to %d peers)%n",
+                NETWORK_SUMMARY_MIN, netInboundNew.getAndSet(0), inboundDistinctToday.size(), netGetAddr.getAndSet(0),
+                netAddrEntries.getAndSet(0), netAddrWithSelf.getAndSet(0), selfState, netSelfAnnounces.getAndSet(0),
+                netPings.getAndSet(0), netTxAnnounced.getAndSet(0), netTxBatches.getAndSet(0),
+                netBlocksAnnounced.getAndSet(0), netBlockPeers.getAndSet(0));
+    }
+
     /** Service bits we advertise (NETWORK = we serve blocks), as in our VERSION message. */
     private static final int SELF_SERVICES = 1;
     /** True once an outside (public, non-loopback) peer has connected to us: proof our port is reachable. */
@@ -346,7 +386,18 @@ public class ChainSync {
     }
 
     private void sendSelfAnnounce(PeerConnection conn) {
-        if (confirmedSelfIp == null || !selfAnnounceAllowed()) return;
+        if (confirmedSelfIp == null) return;
+        if (!selfAnnounceAllowed()) {
+            if (!selfHeldBackLogged) {
+                selfHeldBackLogged = true;
+                System.out.printf("[ChainSync] Not announcing our own address yet: %s%n",
+                        "false".equalsIgnoreCase(config.getAnnounceSelfMode())
+                                ? "setting p2p.announce.self is false."
+                                : "it starts once an outside peer connects to us (proof our port is reachable). "
+                                + "Servers with open ports can set p2p.announce.self=true.");
+            }
+            return;
+        }
         try {
             boolean plainOn = config.isPlainP2pEnabled();
             int n = plainOn ? 2 : 1;
@@ -359,6 +410,7 @@ public class ChainSync {
             // (which never dial Brontide entries they have no use for) can reach us too.
             if (plainOn) writeNetAddressStatic(payload, apos, confirmedSelfIp, config.getPlainP2pPort(), null, nowSec, SELF_SERVICES);
             conn.sendMessage(MSG_ADDR, payload);
+            netSelfAnnounces.incrementAndGet();
             // DIAGNOSTIC: previously only the failure path logged anything
             // here, so a successful self-announce and "this method was
             // never even called" looked identical in the console --
@@ -554,6 +606,8 @@ public class ChainSync {
             if (items.isEmpty()) continue;
             try {
                 c.sendMessage(MSG_INV, P2pMessages.encodeItems(items));
+                netTxAnnounced.addAndGet(items.size());
+                netTxBatches.incrementAndGet();
             } catch (Exception e) {
                 // best-effort -- a relay failure to one peer shouldn't affect any other peer or the mempool
             }
@@ -612,6 +666,8 @@ public class ChainSync {
                 this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_SEC, KEEPALIVE_INTERVAL_SEC, TimeUnit.SECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::flushTxAnnouncements, 1, 1, TimeUnit.SECONDS);
+        keepAliveScheduler.scheduleWithFixedDelay(
+                this::printNetworkSummary, NETWORK_SUMMARY_MIN, NETWORK_SUMMARY_MIN, TimeUnit.MINUTES);
         // Background reachability probe of never-verified addresses (see probeUnverifiedPeer()).
         probeScheduler.scheduleWithFixedDelay(
                 this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
@@ -2688,6 +2744,8 @@ public class ChainSync {
             }
         }
         if (sent > 0) {
+            netBlocksAnnounced.incrementAndGet();
+            netBlockPeers.addAndGet(sent);
             System.out.printf("[ChainSync] Announced block %d to %d peer(s).%n", height, sent);
         }
     }
@@ -2988,6 +3046,7 @@ public class ChainSync {
         if (type == MSG_PING) {
             byte[] pingPayload = Arrays.copyOfRange(msg, 9, msg.length);
             peer.sendMessage(MSG_PONG, pingPayload);
+            netPings.incrementAndGet();
         } else if (type == MSG_TX && mempool != null) {
             byte[] raw = Arrays.copyOfRange(msg, 9, msg.length);
             sendTxRejectIfAny(peer, mempool.submitFromPeerChecked(raw, peer.ip));
@@ -2995,6 +3054,7 @@ public class ChainSync {
             PeerTable.get().onAddrMessage(
                     Arrays.copyOfRange(msg, 9, msg.length), peer.ip);
         } else if (type == MSG_GETADDR) {
+            netGetAddr.incrementAndGet();
             peer.sendMessage(MSG_ADDR, buildAddrMessage());
         } else if (type == MSG_INV) {
             handleInv(peer, Arrays.copyOfRange(msg, 9, msg.length));
@@ -3116,6 +3176,8 @@ public class ChainSync {
             socket.setSoTimeout(READ_TIMEOUT_MS);
 
             connectedPeers.add(new PeerInfo(conn, System.currentTimeMillis(), true));
+            netInboundNew.incrementAndGet();
+            noteInboundAddress(ip);
             if (!inboundReachabilityProven && isPublicIpv4(ip) && !ip.equals(confirmedSelfIp)) {
                 inboundReachabilityProven = true;
                 System.out.printf("[ChainSync] %s connected to us from outside: our port is reachable, so this node now "
@@ -3175,11 +3237,13 @@ public class ChainSync {
                 if (type == MSG_PING) {
                     byte[] pingPayload = Arrays.copyOfRange(msg, 9, msg.length);
                     conn.sendMessage(MSG_PONG, pingPayload);
+                    netPings.incrementAndGet();
                 } else if (type == MSG_TX) {
                     if (mempool != null) {
                         sendTxRejectIfAny(conn, mempool.submitFromPeerChecked(Arrays.copyOfRange(msg, 9, msg.length), conn.ip));
                     }
                 } else if (type == MSG_GETADDR) {
+                    netGetAddr.incrementAndGet();
                     conn.sendMessage(MSG_ADDR, buildAddrMessage());
                 } else if (type == MSG_ADDR) {
                     PeerTable.get().onAddrMessage(Arrays.copyOfRange(msg, 9, msg.length), conn.ip);
@@ -3760,6 +3824,8 @@ public class ChainSync {
             pos = writeNetAddressStatic(payload, pos, (String) e[0], (Integer) e[1], (byte[]) e[2],
                     (Long) e[3], (Integer) e[4]);
         }
+        netAddrEntries.addAndGet(entries.size());
+        if (includeSelf) netAddrWithSelf.incrementAndGet();
         return payload;
     }
 
