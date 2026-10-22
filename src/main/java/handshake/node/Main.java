@@ -65,6 +65,9 @@ public class Main {
     static void main(String[] args) throws Exception {
         // Keep a copy of everything printed, for the live log on the web admin page (the console output is unchanged).
         handshake.node.util.LogTap.install();
+        // The JDK's built-in HTTP server waits forever for a request that never finishes arriving (it defaults to no
+        // limit). Give reading one request 30 s. (Responses are untouched: the live event stream is long-lived.)
+        System.setProperty("sun.net.httpserver.maxReqTime", "30");
         System.out.println("╔══════════════════════════════════════╗");
         System.out.println("║   Easy Handshake Node  v" + NodeConfig.VERSION + "        ║");
         System.out.println("╚══════════════════════════════════════╝");
@@ -73,6 +76,8 @@ public class Main {
         String dataDir = args.length > 0 ? args[0] : defaultDataDir();
         boolean freshInstall = !Files.exists(Path.of(dataDir));
         Files.createDirectories(Path.of(dataDir));
+        // Everything printed from here on is also kept in <data dir>/logs/node-console.log (size-capped, rotated).
+        handshake.node.util.LogTap.startFile(Path.of(dataDir, "logs"));
         System.out.println("[Main] Data directory: " + Path.of(dataDir).toAbsolutePath()
                 + (freshInstall ? " (fresh install)" : ""));
 

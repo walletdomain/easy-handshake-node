@@ -64,6 +64,8 @@ public class WebSocketServer {
             } catch (IOException e) {
                 if (running) {
                     System.out.println("[WebSocketServer] Accept error: " + e.getMessage());
+                    // Retrying instantly on a persistent failure spun at 100% CPU and flooded the log.
+                    try { Thread.sleep(250); } catch (InterruptedException ie) { return; }
                 }
             }
         }
@@ -72,6 +74,8 @@ public class WebSocketServer {
     private void handleConnection(Socket socket) {
         try {
             socket.setTcpNoDelay(true);
+            // A client that connects and never sends its upgrade request must not hold this thread forever.
+            socket.setSoTimeout(10_000);
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
 
@@ -79,6 +83,9 @@ public class WebSocketServer {
                 socket.close();
                 return;
             }
+            // The upgrade is done: an established session may legitimately sit idle, so lift the timeout.
+            // (NodeSocketServer bounds its own Brontide handshake.)
+            socket.setSoTimeout(0);
 
             WebSocketConnection conn = new WebSocketConnection(socket, in, out);
             handler.onConnect(conn);

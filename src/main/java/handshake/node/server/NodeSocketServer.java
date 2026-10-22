@@ -105,6 +105,7 @@ public class NodeSocketServer {
             try {
                 BrontideState brontide = new BrontideState(identity.getPrivateKey());
 
+                conn.setReadTimeout(10_000);   // the Brontide handshake gets 10 s per step; the session itself may idle
                 byte[] actOne = conn.receiveBinary();
                 if (actOne == null || actOne.length != BrontideState.ACT_ONE_SIZE) {
                     conn.close();
@@ -127,6 +128,7 @@ public class NodeSocketServer {
                     return;
                 }
 
+                conn.setReadTimeout(0);
                 ClientSession session = new ClientSession(conn, brontide);
                 sessions.add(session);
                 System.out.println("[NodeSocketServer] Client connected: " + conn.remoteIp);

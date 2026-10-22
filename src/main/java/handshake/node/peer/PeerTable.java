@@ -348,6 +348,7 @@ public class PeerTable {
             if (!pinned.isEmpty()) System.out.println("[PeerTable] Pinned peers: " + new TreeSet<>(pinned));
         }
         applyRetiredSeeds();   // after the pinned set is loaded, before the prune below
+        liftStateDependentTxBans();
         pruneGossip(true);   // after the pinned set is loaded, so a pinned peer is never pruned
         dropNonPublicRows();
         forgetSelf();
@@ -1150,6 +1151,52 @@ public class PeerTable {
         r.score = 0;
         persist(r);
         System.out.printf("[PeerTable] BANNED %s: %s%n", ip, reason);
+    }
+
+    /**
+     * True for transaction rejections that depend on the chain state of the node doing the checking (name auction
+     * phases, ownership, spent or missing coins, locktimes). A node whose chain is behind or has a validation bug
+     * rejects perfectly valid transactions for these reasons, so they say nothing about the sender. They must never
+     * get a peer banned: when this node fell behind, every honest peer's name transactions looked invalid, every
+     * peer was banned, and with no peers left the node could never catch up.
+     */
+    public static boolean isStateDependentRejection(String reason) {
+        if (reason == null) return false;
+        String r = reason.toLowerCase(java.util.Locale.ROOT);
+        for (String k : new String[] { "-state", "-nonlocal", "bad-open", "bad-bid", "bad-reveal", "bad-redeem",
+                "bad-register", "bad-renewal", "bad-update", "bad-transfer", "bad-finalize", "bad-revoke",
+                "missingorspent", "inputs-spent", "nonfinal", "premature", "txns-covenants", "txns-opens",
+                "txns-updates", "txns-renewals", "txns-claims", "txn-mempool-conflict", "orphan" }) {
+            if (r.contains(k)) return true;
+        }
+        return false;
+    }
+
+    private static final String TX_BAN_PREFIX = "sent invalid transactions (";
+
+    /**
+     * Lifts bans that earlier versions put on peers for state-dependent transaction rejections (see
+     * isStateDependentRejection). Those bans were wrong, are stored in the database, and are the reason a node could
+     * end up with every good peer banned. Runs at startup; the peers get a clean slate (backoff cleared, score reset
+     * to the seed or discovered starting value at least).
+     */
+    private void liftStateDependentTxBans() {
+        int lifted = 0;
+        for (Peer r : peers.values()) {
+            if (!r.banned || r.banReason == null || !r.banReason.startsWith(TX_BAN_PREFIX)) continue;
+            String reason = r.banReason.substring(TX_BAN_PREFIX.length(), r.banReason.length() - (r.banReason.endsWith(")") ? 1 : 0));
+            if (!isStateDependentRejection(reason)) continue;
+            r.banned = false;
+            r.banReason = null;
+            r.backoffLevel = 0;
+            r.backoffUntil = 0;
+            r.score = Math.max(r.score, r.isSeed || r.successCount > 0 ? SCORE_INITIAL : SCORE_INITIAL_DISCOVERED);
+            persist(r);
+            lifted++;
+            System.out.printf("[PeerTable] Lifted the ban on %s: it was banned for \"%s\", which only means OUR chain state "
+                    + "disagreed, not that the peer misbehaved.%n", r.ip, reason);
+        }
+        if (lifted > 0 && peersMap != null) ConfigDB.get().commit();
     }
 
     public void unbanPeer(String ip) {

@@ -3539,6 +3539,11 @@ public class ChainSync {
         } catch (Exception ignored) {
             // best effort: the sender may already have gone
         }
+        // Never ban for a rejection that depends on chain state (name auction phases, ownership, spent or missing
+        // coins): when our chain is behind, every honest peer's name transactions fail those checks, and banning
+        // them for it cut the node off from the whole network. Other rejections only count while we are fully
+        // caught up, because a node that is behind cannot tell a bad transaction from one it is not ready for.
+        if (PeerTable.isStateDependentRejection(r.rejectReason) || !chainFullySynced()) return;
         if (r.score > 0) {
             int total = txBanScores.merge(conn.ip, r.score, Integer::sum);
             if (total >= 100) {
@@ -3820,6 +3825,12 @@ public class ChainSync {
 
     /** True once we are (nearly) caught up -- hsd's {@code chain.synced}. Serving getblocks/mempool before that
      *  would only hand out a half-built chain. */
+    /** Stricter than isChainSynced(): our tip is within 2 blocks of the best peer height we know. */
+    private boolean chainFullySynced() {
+        int peerTip = bestKnownPeerHeight;
+        return peerTip > 0 && db.getBlockTip() >= peerTip - 2;
+    }
+
     private boolean isChainSynced() {
         int peerTip = bestKnownPeerHeight;
         return peerTip <= 0 || db.getBlockTip() >= peerTip - 144;
@@ -4491,11 +4502,20 @@ public class ChainSync {
          * exactly how many bytes (if any) were received and their hex,
          * instead of silently collapsing a partial read into nothing.
          */
+        /** Longest a single frame may take from its first byte to its last. */
+        private static final long FRAME_DEADLINE_MS = 120_000L;
+
         private static byte[] readPartialDebug(InputStream in, int len, String ip, String label) {
             byte[] buf = new byte[len];
             int read = 0;
+            // Each read has its own socket timeout, so a peer dripping one byte every few seconds could hold a
+            // 4 MB frame open for days. The whole frame gets one overall deadline instead.
+            final long frameDeadline = System.currentTimeMillis() + FRAME_DEADLINE_MS;
             try {
                 while (read < len) {
+                    if (read > 0 && System.currentTimeMillis() > frameDeadline) {
+                        throw new java.net.SocketTimeoutException("frame not complete after " + (FRAME_DEADLINE_MS / 1000) + " s");
+                    }
                     int n = in.read(buf, read, len - read);
                     if (n < 0) break;
                     read += n;

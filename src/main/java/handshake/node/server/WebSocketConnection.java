@@ -27,6 +27,11 @@ public class WebSocketConnection {
     public final String remoteIp;
     private volatile boolean closed = false;
 
+    /** Read timeout in ms for this connection (0 = none). A timed-out read surfaces as an IOException. */
+    public void setReadTimeout(int ms) {
+        try { socket.setSoTimeout(ms); } catch (java.net.SocketException ignored) { }
+    }
+
     public WebSocketConnection(Socket socket, InputStream in, OutputStream out) {
         this.socket = socket;
         this.in = in;
@@ -77,6 +82,9 @@ public class WebSocketConnection {
      * automatically and transparently; CLOSE frames close the
      * connection and return null.
      */
+    /** Largest single frame accepted. The old limit (~2 GB) let one 10-byte header make the node allocate that much. */
+    private static final long MAX_FRAME_BYTES = 8L * 1024 * 1024;
+
     public byte[] receiveBinary() throws IOException {
         while (true) {
             int first = in.read();
@@ -101,7 +109,7 @@ public class WebSocketConnection {
                 readFully(maskKey);
             }
 
-            if (len > Integer.MAX_VALUE - 8) throw new IOException("WebSocket frame too large");
+            if (len < 0 || len > MAX_FRAME_BYTES) throw new IOException("WebSocket frame too large");
             byte[] payload = new byte[(int) len];
             readFully(payload);
 

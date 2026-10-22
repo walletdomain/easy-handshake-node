@@ -87,17 +87,42 @@ public class P2PServer {
         handshakeExecutor.shutdownNow();
     }
 
+    private static final int MAX_PENDING_HANDSHAKES = 128;
+    private static final int INBOUND_HANDSHAKE_TIMEOUT_MS = 15_000;
+    private final java.util.concurrent.atomic.AtomicInteger pendingHandshakes = new java.util.concurrent.atomic.AtomicInteger();
+
     private void acceptLoop(ServerSocket listener, boolean plain) {
         while (running.get()) {
             Socket socket;
             try {
                 socket = listener.accept();
             } catch (IOException e) {
-                if (running.get() && !listener.isClosed()) continue;
+                if (running.get() && !listener.isClosed()) {
+                    // A persistent accept failure (for example "Too many open files") used to retry instantly:
+                    // 100% CPU and a flood of errors. Pause briefly so the node stays alive and recovers.
+                    try { Thread.sleep(250); } catch (InterruptedException ie) { break; }
+                    continue;
+                }
                 break;
             }
+            // Bounded: connections still in their handshake each hold a thread and a file handle, so a flood of
+            // idle connects cannot use them all up. Established peers are limited separately (max inbound).
+            if (pendingHandshakes.incrementAndGet() > MAX_PENDING_HANDSHAKES) {
+                pendingHandshakes.decrementAndGet();
+                closeQuietly(socket);
+                continue;
+            }
+            final Socket accepted = socket;
             handshakeExecutor.submit(() -> {
-                if (plain) handleAcceptedPlain(socket); else handleAccepted(socket);
+                try {
+                    // A connection that sends nothing must not hold its thread forever.
+                    accepted.setSoTimeout(INBOUND_HANDSHAKE_TIMEOUT_MS);
+                    if (plain) handleAcceptedPlain(accepted); else handleAccepted(accepted);
+                } catch (Exception e) {
+                    closeQuietly(accepted);
+                } finally {
+                    pendingHandshakes.decrementAndGet();
+                }
             });
         }
     }
