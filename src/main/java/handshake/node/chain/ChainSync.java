@@ -1479,7 +1479,10 @@ public class ChainSync {
         for (PeerInfo p : connectedPeers) {
             if (p.inbound()) continue;
             if (skip != null && p.ip().equals(skip)) continue;
-            if (!PeerTable.get().isGood(p.ip())) continue;
+            // The score floor decides who we DIAL, not who we may use once connected. Filtering open connections by
+            // score left a node with three healthy peers (zeroed by a past ban) and nothing to sync from. Banned
+            // peers stay excluded; weightedOrder() below still prefers the better-scored ones.
+            if (PeerTable.get().isBanned(p.ip())) continue;
             usable.add(p);
         }
         if (usable.isEmpty()) return null;

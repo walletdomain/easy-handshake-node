@@ -349,6 +349,7 @@ public class PeerTable {
         }
         applyRetiredSeeds();   // after the pinned set is loaded, before the prune below
         liftStateDependentTxBans();
+        repairBanZeroedScores();
         pruneGossip(true);   // after the pinned set is loaded, so a pinned peer is never pruned
         dropNonPublicRows();
         forgetSelf();
@@ -1139,6 +1140,7 @@ public class PeerTable {
             System.out.printf("[PeerTable] Ban on %s expired (%s)%n", r.ip, r.banReason);
             r.banned = false;
             r.banReason = null;
+            r.score = Math.max(r.score, SCORE_BACKOFF_THRESHOLD);   // banPeer() zeroed it; an expired ban must not leave it unusable
             persist(r);
         }
     }
@@ -1197,6 +1199,28 @@ public class PeerTable {
                     + "disagreed, not that the peer misbehaved.%n", r.ip, reason);
         }
         if (lifted > 0 && peersMap != null) ConfigDB.get().commit();
+    }
+
+    /**
+     * Bans are kept in memory only, but banPeer() also persists score = 0. After a restart the ban is gone and the
+     * zero stays, so a peer that only ever behaved (many successes, no failure since its last success) sat below the
+     * dial floor and could not be used for an hour or more: a node whose peers had all been banned restarted with
+     * three good connections it was not allowed to sync from. Give such a peer its normal starting score back.
+     */
+    private void repairBanZeroedScores() {
+        int repaired = 0;
+        for (Peer r : peers.values()) {
+            if (r.banned || r.score >= SCORE_BACKOFF_THRESHOLD || r.successCount < 3) continue;
+            if (r.lastFailureTime > r.lastSuccessTime) continue;   // its latest news is bad: leave it to the normal recovery
+            r.score = SCORE_INITIAL;
+            r.backoffLevel = 0;
+            r.backoffUntil = 0;
+            persist(r);
+            repaired++;
+            System.out.printf("[PeerTable] %s: restored score to %d (it had %d successes and no failure since; a past ban had zeroed it).%n",
+                    r.ip, SCORE_INITIAL, r.successCount);
+        }
+        if (repaired > 0 && peersMap != null) ConfigDB.get().commit();
     }
 
     public void unbanPeer(String ip) {
