@@ -924,7 +924,13 @@ public final class WebAdminServerContent {
             function classify(p) {
                 if (p.state === "connected") return "connected";
                 if (p.state === "banned" || p.state === "blacklisted" || p.state === "backoff") return "unavailable";
-                if (isVerified(p)) return p.score < 25 ? "unavailable" : "available";
+                /* "Available" means we have actually connected to it before, its last attempt did not fail, and its score is
+                   above the 25 retry floor. A seed that has never worked (retired or dead seeds) is not available, and a
+                   score of exactly 25 is the "gets another chance" reset value, not an earned score. */
+                if (p.successes > 0) {
+                    return (p.score > 25 && !(p.lastFailure > p.lastSuccess)) ? "available" : "unavailable";
+                }
+                if (p.seed && p.failures > 0) return "unavailable";
                 return "untested";
             }
             function isGossipOnly(p) { return classify(p) === "untested"; }
@@ -941,7 +947,7 @@ public final class WebAdminServerContent {
                 connected:   { empty: "No connected peers right now.",
                                text: "Peers connected to this node right now." },
                 available:   { empty: "No other good peers are known right now.",
-                               text: "Good peers we have connected to before (or seeds) that are not connected right now." },
+                               text: "Good peers we have connected to before, whose last attempt worked and whose score is above 25, that are not connected right now." },
                 unavailable: { empty: "No unavailable peers.",
                                text: "Peers we cannot use right now: unreachable and waiting to be retried, blacklisted, banned or low score. Hover a row for the reason." },
                 untested:    { empty: "Nothing is waiting to be tested.",
@@ -1065,6 +1071,11 @@ public final class WebAdminServerContent {
                     "avg latency: " + (p.latencyMs >= 0 ? p.latencyMs + " ms" : "n/a"),
                     "last failure: " + fmtAgo(p.lastFailure) + (p.failure ? " -- " + p.failure : "")
                 ];
+                if (p.state === "idle" && p.successes > 0 && p.score <= 25) {
+                    lines.push("score " + p.score + " is the retry floor: it failed before and is waiting for another test connection");
+                } else if (p.state === "idle" && p.successes === 0 && p.seed) {
+                    lines.push("seed that has never connected successfully");
+                }
                 if (p.state === "idle" && p.score < 25) {
                     lines.push("not being dialed normally: score " + p.score + " is under the 25 dial floor (test dial every 10 min if it has worked before)");
                 }

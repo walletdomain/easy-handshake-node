@@ -33,15 +33,22 @@ apt4rf2dfyelbivg63u47wykvdjtsl4kxzfdylkaae5s5ydldlnwu|159.69.46.23|44806|seed-3
 anbwqus4a45bwiztei62lf2jiurzbsakzm7z2oz4oqug3ea5i3sac|74.208.31.75|44806|relay-validator
 altrbp2g6xjqwqe2xqdzbmk43vbo6dqmiis4ddgsgptdamh3kikii|144.91.81.19|44806|easy-handshake-node
 
-# ---- Retired 2026-10-18 (kept here, commented out, so they can be restored if they come back) ----
-# Connection refused on 44806 and 12038 (from the node and from a separate VPS):
-#   ap5vuwabzwyz6akhesanada4skhetd2jsvpkwuqxzuaoovn5ez4xg|45.79.134.225|44806|seed-1
-#   aoihqqagbhzz6wxg43itefqvmgda4uwtky362p22kbimcyg5fdp54|172.104.214.189|44806|seed-2
-#   am2lsmbzzxncaptqjo22jay3mztfwl33bxhkp7icfx7kmi5rvjaic|139.162.183.168|44806|seed-5
-# Connect timed out on both ports from both machines (down, or filtered):
-#   ai7dgiwueiiwber6uhoeqfjdujxph6ueqpnaml36sicakngmnm3am|103.152.197.114|44806|Nathan.Woodburn/3
-#   aokj73pefmtrc7ikoxqiz4nrhgrxeqnnjpv4wxekteup33duneih2|103.152.197.115|44806|Nathan.Woodburn/2
-#   ajd6wzdp34c32rymlljybvbosnx75aty4rwmtpkxshvfrqufq6vuk|103.152.197.116|44806|Nathan.Woodburn/1
-# Port open but the node closes our Brontide opening: the key below is stale (cleartext on 12038 still works,
-# and the node now falls back to it automatically). Restore with the node's current key.
+# ---- Retired seeds ----
+# Format: retired|ip|reason
+# A node that already stored one of these as a seed demotes it at startup (a seed that never worked is removed and
+# not re-added for a week; one that has worked stays as an ordinary peer). Without this line, removing a seed from
+# this file would never remove it from an existing install. To bring one back, delete its retired line and add
+# a normal seed line (brontideKey|ip|port|label) above.
+#
+# Retired 2026-10-18 -- connection refused on 44806 and 12038 (from the node and from a separate VPS):
+retired|45.79.134.225|seed-1: connection refused on both ports
+retired|172.104.214.189|seed-2: connection refused on both ports
+retired|139.162.183.168|seed-5: connection refused on both ports
+# Retired 2026-10-18 -- connect timed out on both ports from both machines (down, or filtered):
+retired|103.152.197.114|Nathan.Woodburn/3: connect timed out
+retired|103.152.197.115|Nathan.Woodburn/2: connect timed out
+retired|103.152.197.116|Nathan.Woodburn/1: connect timed out
+# Retired 2026-10-18 -- port open but the node closes our Brontide opening: the stored key is stale and cleartext on
+# 12038 also closes on us. Last known key, to restore it if the operator publishes the current one:
 #   aiwykdz37okry3pb2lzdsgbxeg72uky2zckxmiapzstpqqmb2hnge|35.154.209.88|44806|handshake-micro-grants
+retired|35.154.209.88|handshake-micro-grants: stale Brontide key, cleartext also refused

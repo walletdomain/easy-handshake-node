@@ -347,6 +347,7 @@ public class PeerTable {
             }
             if (!pinned.isEmpty()) System.out.println("[PeerTable] Pinned peers: " + new TreeSet<>(pinned));
         }
+        applyRetiredSeeds();   // after the pinned set is loaded, before the prune below
         pruneGossip(true);   // after the pinned set is loaded, so a pinned peer is never pruned
         dropNonPublicRows();
         forgetSelf();
@@ -496,6 +497,38 @@ public class PeerTable {
 
     private record SeedLine(String brontideKey, String ip, int port, String label) {}
 
+    /** ip -> reason, from the "retired|ip|reason" lines of seeds.txt (filled while the file is read). */
+    private static final Map<String, String> RETIRED_SEEDS = new java.util.LinkedHashMap<>();
+
+    /**
+     * Seeds are merged additively, so removing a line from seeds.txt never removed the seed from a node that already
+     * stored it: dead seeds kept coming back as "available". A "retired|ip|reason" line in seeds.txt fixes that. At
+     * startup each stored seed row for a retired address is demoted: a seed that never connected successfully is
+     * forgotten (removed, and not re-added from gossip for a week); one that has worked before stays as an ordinary
+     * peer (no longer a seed, score capped at the retry floor) and earns its way back or is pruned. A pinned peer is
+     * never touched. Runs after the pinned set is loaded.
+     */
+    private void applyRetiredSeeds() {
+        if (RETIRED_SEEDS.isEmpty() || peersMap == null) return;
+        int forgotten = 0, demoted = 0;
+        for (Map.Entry<String, String> e : RETIRED_SEEDS.entrySet()) {
+            Peer r = peers.get(e.getKey());
+            if (r == null || !r.isSeed || pinned.contains(r.ip)) continue;
+            if (r.successCount == 0) {
+                forget(r.ip);
+                forgotten++;
+                System.out.printf("[PeerTable] Retired seed %s (%s): never connected, removed.%n", r.ip, e.getValue());
+            } else {
+                r.isSeed = false;
+                r.score = Math.min(r.score, SCORE_BACKOFF_THRESHOLD);
+                peersMap.put(r.ip, r.toStorage());
+                demoted++;
+                System.out.printf("[PeerTable] Retired seed %s (%s): kept as an ordinary peer, no longer a seed.%n", r.ip, e.getValue());
+            }
+        }
+        if (forgotten > 0 || demoted > 0) ConfigDB.get().commit();
+    }
+
     private static List<SeedLine> loadSeedsFromResource() {
         List<SeedLine> loaded = new ArrayList<>();
         try (InputStream in = PeerTable.class.getResourceAsStream("/seeds.txt")) {
@@ -512,6 +545,15 @@ public class PeerTable {
                     String trimmed = line.trim();
                     if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
                     String[] p = trimmed.split("\\|", -1);
+                    if (p[0].trim().equalsIgnoreCase("retired")) {
+                        // retired|ip|reason : an address that must no longer be a seed (see applyRetiredSeeds)
+                        if (p.length >= 2 && !p[1].trim().isEmpty()) {
+                            RETIRED_SEEDS.put(p[1].trim(), p.length >= 3 ? p[2].trim() : "");
+                        } else {
+                            System.err.printf("[PeerTable] seeds.txt line %d: retired entry needs an ip -- skipping: %s%n", lineNum, line);
+                        }
+                        continue;
+                    }
                     if (p.length < 4) {
                         System.err.printf("[PeerTable] seeds.txt line %d malformed -- skipping: %s%n", lineNum, line);
                         continue;

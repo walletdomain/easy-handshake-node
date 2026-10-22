@@ -2955,6 +2955,9 @@ public class ChainSync {
      *         for a periodic rotation, defeating the point of adding
      *         one here at all.
      */
+    /** A block request gets this long to produce a block, however much other traffic the peer sends meanwhile. */
+    private static final long BLOCK_STALL_MS = 60_000L;
+
     private boolean downloadBlocks(PeerConnection peer) throws Exception {
         int headerTip = db.getHeaderTip();
         int blockTip  = db.getBlockTip();
@@ -2999,13 +3002,38 @@ public class ChainSync {
                 // since this one is banned -- naturally re-requests the
                 // correct height instead of skipping it.
                 boolean batchFailed = false;
+                // readMessage(60_000) times out only after 60 s of TOTAL silence. A peer that keeps sending pings,
+                // announcements or addresses but never the blocks we asked for resets that timeout on every
+                // message and kept this loop (and the whole sync thread, and with it the pool top-up) waiting
+                // forever -- the cause of a node that stopped syncing for days with one peer left. So the wait for
+                // blocks has its own deadline that other traffic does not extend.
+                long lastBlockAt = System.currentTimeMillis();
                 while (received < hashes.size() && running) {
                     byte[] msg = peer.readMessage(60_000);
                     if (msg == null) break;
                     if (getMessageType(msg) != MSG_BLOCK) {
+                        if (getMessageType(msg) == MSG_NOTFOUND) {
+                            try {
+                                for (P2pMessages.Item it : P2pMessages.parseItems(Arrays.copyOfRange(msg, 9, msg.length))) {
+                                    if (it.type == P2pMessages.INV_BLOCK || it.type == P2pMessages.INV_CMPCT_BLOCK) {
+                                        PeerTable.get().recordFailure(peer.ip, "NOTFOUND for requested blocks");
+                                        avoidPeerIp = peer.ip;
+                                        throw new java.io.IOException("peer " + peer.ip
+                                                + " answered our block request with NOTFOUND (it does not have those blocks)");
+                                    }
+                                }
+                            } catch (P2pMessages.MalformedPacket ignored) { /* handled as any other bad packet below */ }
+                        }
+                        if (System.currentTimeMillis() - lastBlockAt > BLOCK_STALL_MS) {
+                            PeerTable.get().recordFailure(peer.ip, "sent no block for " + (BLOCK_STALL_MS / 1000) + " s");
+                            avoidPeerIp = peer.ip;
+                            throw new java.io.IOException("peer " + peer.ip + " sent no block for "
+                                    + (BLOCK_STALL_MS / 1000) + " s while still sending other messages");
+                        }
                         handleNonBlockMessage(msg, peer);
                         continue;
                     }
+                    lastBlockAt = System.currentTimeMillis();
                     // FIX: caught separately from a normal processBlock()
                     // failure below -- an Urkel tree mismatch isn't a bad
                     // peer sending bad data (which is what a false return
