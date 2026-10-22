@@ -784,6 +784,8 @@ public class ChainSync {
                 this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::flushTxAnnouncements, 1, 1, TimeUnit.SECONDS);
+        // Its own thread: it must keep running even if the keep-alive thread is itself stuck in a write.
+        writeWatchdog.scheduleWithFixedDelay(this::closeStalledWrites, 5, 5, TimeUnit.SECONDS);
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::printNetworkSummary, NETWORK_SUMMARY_MIN, NETWORK_SUMMARY_MIN, TimeUnit.MINUTES);
         keepAliveScheduler.scheduleWithFixedDelay(
@@ -791,6 +793,32 @@ public class ChainSync {
         // Background reachability probe of never-verified addresses (see probeUnverifiedPeer()).
         probeScheduler.scheduleWithFixedDelay(
                 this::probeUnverifiedPeer, PROBE_INTERVAL_SEC * 2L, PROBE_INTERVAL_SEC, TimeUnit.SECONDS);
+    }
+
+    /** A socket write that has made no progress for this long means the peer stopped reading. */
+    private static final long WRITE_STALL_MS = 30_000L;
+    private final ScheduledExecutorService writeWatchdog =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "chain-sync-write-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private void closeStalledWrites() {
+        try {
+            long now = System.currentTimeMillis();
+            for (PeerInfo pi : connectedPeers) {
+                PeerConnection c = pi.conn();
+                long ws = c.writeStartedAt;
+                if (ws > 0 && now - ws > WRITE_STALL_MS) {
+                    System.out.printf("[ChainSync] A write to %s has been stuck for %d s (it stopped reading) -- closing the connection.%n",
+                            c.ip, (now - ws) / 1000);
+                    c.close();   // closes the socket: the blocked write throws and frees the lock
+                }
+            }
+        } catch (Throwable t) {
+            // the watchdog itself must never die
+        }
     }
 
     /** Milliseconds between keep-alive passes over the idle pooled connections. The pass only checks available(), so it is cheap;
@@ -1033,6 +1061,7 @@ public class ChainSync {
         poolScheduler.shutdown();
         probeScheduler.shutdownNow();
         keepAliveScheduler.shutdownNow();
+        writeWatchdog.shutdownNow();
         try {
             if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.out.println("[ChainSync] Sync cycle did not stop within 30s -- "
@@ -4364,6 +4393,9 @@ public class ChainSync {
          * before it hits the wire -- this project no longer has a
          * cleartext transport, so brontide is never null here.
          */
+        /** Start time of the socket write in progress, or 0. Read by the write watchdog. */
+        volatile long writeStartedAt;
+
         void sendMessage(int type, byte[] payload) throws Exception {
             byte[] frame = new byte[9 + payload.length];
             writeLE32(frame, 0, MAGIC_MAINNET);
@@ -4385,8 +4417,17 @@ public class ChainSync {
                     System.out.printf("[Handshake] -> %s encrypted wire (%d bytes): %s%n",
                             ip, encrypted.length, toHex(encrypted));
                 }
-                out.write(encrypted);
-                out.flush();
+                // Java sockets have no write timeout: a peer that stops reading fills the TCP buffer and out.write()
+                // then blocks forever, taking this lock and every thread that sends to the peer with it (including
+                // the shared keep-alive thread). The watchdog closes a connection whose write has been stuck this
+                // long, which makes the write throw.
+                writeStartedAt = System.currentTimeMillis();
+                try {
+                    out.write(encrypted);
+                    out.flush();
+                } finally {
+                    writeStartedAt = 0;
+                }
             }
             totalBytesSent.addAndGet(encrypted.length);
             bytesSent += encrypted.length;

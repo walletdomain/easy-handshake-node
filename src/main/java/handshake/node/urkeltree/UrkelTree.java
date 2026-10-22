@@ -166,6 +166,9 @@ public class UrkelTree {
     private byte[] get(UrkelNode node, byte[] key) {
         int depth = 0;
         for (;;) {
+            // Keys are 256 bits, so no valid path is deeper than that. A longer one means the stored tree is
+            // corrupted (a cycle would otherwise loop here forever).
+            if (depth > 257) throw new IllegalStateException("Urkel tree path deeper than the key length: tree is corrupted");
             node = resolve(node);
             if (node.isNull()) {
                 return null;
@@ -1225,6 +1228,7 @@ public class UrkelTree {
         int depth = 0;
 
         for (;;) {
+            if (depth > 257) throw new IllegalStateException("Urkel tree path deeper than the key length: tree is corrupted");
             node = resolve(node);
             if (node.isNull()) {
                 proof.type = UrkelProof.TYPE_DEADEND;
