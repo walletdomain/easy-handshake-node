@@ -39,10 +39,17 @@ public class WebSocketConnection {
         this.remoteIp = socket.getInetAddress().getHostAddress();
     }
 
+    private volatile Runnable closeHook;
+
+    /** Runs once when this connection closes (used by the server to release its per-IP / total slots). */
+    public void setCloseHook(Runnable hook) { this.closeHook = hook; }
+
     public void close() {
         if (closed) return;
         closed = true;
         try { socket.close(); } catch (IOException ignored) {}
+        Runnable h = closeHook;
+        if (h != null) { try { h.run(); } catch (RuntimeException ignored) { } }
     }
 
     public boolean isClosed() { return closed; }
@@ -83,7 +90,7 @@ public class WebSocketConnection {
      * connection and return null.
      */
     /** Largest single frame accepted. The old limit (~2 GB) let one 10-byte header make the node allocate that much. */
-    private static final long MAX_FRAME_BYTES = 8L * 1024 * 1024;
+    private static final long MAX_FRAME_BYTES = 1L * 1024 * 1024;
 
     public byte[] receiveBinary() throws IOException {
         while (true) {

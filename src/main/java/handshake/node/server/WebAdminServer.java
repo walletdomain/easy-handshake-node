@@ -86,7 +86,7 @@ public class WebAdminServer {
      *  occasionally useful setting, e.g. binding somewhere other than
      *  loopback for a deliberate remote-RPC setup). */
     private static final Set<String> EDITABLE_KEYS = Set.of(
-            "rpc.host", "miner.address"
+            "rpc.host", "miner.address", "socket.public"
     );
 
     private static final Set<String> REQUIRES_RESTART = Set.of(
@@ -787,6 +787,7 @@ public class WebAdminServer {
                 StringBuilder sb = new StringBuilder("{");
                 sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\"");
                 sb.append(",\"miner.address\":\"").append(jsonEscape(config.getMinerAddress())).append("\"");
+                sb.append(",\"socket.public\":").append(config.isSocketPublic());
                 sb.append("}");
                 respondJson(ex, 200, sb.toString());
                 return;
@@ -848,6 +849,7 @@ public class WebAdminServer {
         // Removed as part of the project's dead-code cleanup pass.
         return switch (key) {
             case "rpc.host" -> value.isBlank() ? "Host cannot be empty" : null;
+            case "socket.public" -> (value.equals("true") || value.equals("false")) ? null : "socket.public must be true or false";
             case "miner.address" -> {
                 String v = value.trim();
                 if (v.isEmpty()) yield null;                       // empty = mining disabled

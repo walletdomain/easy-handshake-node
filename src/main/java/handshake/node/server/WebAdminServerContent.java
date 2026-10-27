@@ -117,7 +117,12 @@ public final class WebAdminServerContent {
                             <h2>Live log</h2>
                             <div class="log-tools">
                                 <input id="log-filter" type="search" placeholder="Filter" aria-label="Filter log lines" spellcheck="false">
-                                <label class="check"><input type="checkbox" id="log-errors"> Errors only</label>
+                                <span class="lvl" role="radiogroup" aria-label="Log level">
+                                    <span class="lvl-lab">Log level:</span>
+                                    <label class="lvl-opt lvl-err"><input type="radio" name="log-level" value="err"> Errors</label>
+                                    <label class="lvl-opt lvl-warn"><input type="radio" name="log-level" value="warn"> Warnings</label>
+                                    <label class="lvl-opt lvl-info"><input type="radio" name="log-level" value="info" checked> Info</label>
+                                </span>
                                 <button id="log-pause" type="button" class="ghost">Pause</button>
                                 <button id="log-copy" type="button" class="ghost">Copy</button>
                             </div>
@@ -137,6 +142,12 @@ public final class WebAdminServerContent {
                                     <input type="text" name="rpc.host"></label>
                                 <label>Mining reward address (hs1...)
                                     <input type="text" name="miner.address" placeholder="Leave empty to disable mining" spellcheck="false"></label>
+                                <label>Require API key for wallets to connect?
+                                    <select name="socket.requireKey">
+                                        <option value="no">No</option>
+                                        <option value="yes">Yes</option>
+                                    </select></label>
+                                <p class="hint">No: any wallet can connect to this node's wallet port (12040) without a key. Yes: wallets must send this node's API key (shown under Access). Applies to new wallet connections right away; wallets already connected stay connected.</p>
                                 <p class="hint">Changing the RPC host needs a restart. Miners that connect (getwork) are paid to the reward address; that applies immediately.</p>
                                 <button type="submit">Save changes</button>
                             </form>
@@ -344,6 +355,13 @@ public final class WebAdminServerContent {
             /* log */
             .log-tools { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
             .log-tools input[type="search"] { width: 150px; }
+            .lvl { display: inline-flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82rem; }
+            .lvl-lab { color: var(--muted); }
+            .lvl-opt { display: inline-flex; align-items: center; gap: 0.25rem; font-weight: 600; cursor: pointer; }
+            .lvl-opt input { margin: 0; width: auto; }
+            .lvl-err { color: var(--bad); } .lvl-err input { accent-color: var(--bad); }
+            .lvl-warn { color: var(--warn); } .lvl-warn input { accent-color: var(--warn); }
+            .lvl-info { color: var(--ok); } .lvl-info input { accent-color: var(--ok); }
             .check { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.82rem; color: var(--muted); }
             .log { flex: 1; min-height: 0; overflow-y: auto; background: var(--log-bg); border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.6rem; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; }
             .log .ln { white-space: pre-wrap; word-break: break-word; color: var(--body); }
@@ -351,6 +369,8 @@ public final class WebAdminServerContent {
             .log .ln .tg { color: var(--accent); }
             .log .ln.err { color: var(--log-err); }
             .log .ln.err .tg { color: inherit; }
+            .log .ln.warn { color: var(--warn); }
+            .log .ln.warn .tg { color: inherit; }
             .jump { position: absolute; right: 1.5rem; bottom: 1.4rem; box-shadow: 0 2px 8px rgba(0,0,0,0.25); }
 
             /* controls */
@@ -1099,7 +1119,7 @@ public final class WebAdminServerContent {
             function setupLogControls() {
                 const log = $("log");
                 $("log-filter").addEventListener("input", () => renderLog());
-                $("log-errors").addEventListener("change", () => renderLog());
+                document.querySelectorAll('input[name="log-level"]').forEach(r => r.addEventListener("change", () => renderLog()));
                 $("log-pause").addEventListener("click", () => {
                     logPaused = !logPaused;
                     $("log-pause").textContent = logPaused ? "Resume" : "Pause";
@@ -1141,8 +1161,21 @@ public final class WebAdminServerContent {
 
             function visibleLines() {
                 const q = $("log-filter").value.trim().toLowerCase();
-                const errOnly = $("log-errors").checked;
-                return logLines.filter(l => (!errOnly || l.lvl === "err") && (q === "" || l.m.toLowerCase().indexOf(q) >= 0));
+                const sel = document.querySelector('input[name="log-level"]:checked');
+                const maxRank = LOG_RANK[sel ? sel.value : "info"];
+                return logLines.filter(l => LOG_RANK[lineLevel(l)] <= maxRank && (q === "" || l.m.toLowerCase().indexOf(q) >= 0));
+            }
+
+            /* The node prints plain lines with no level, so the level is judged from the line itself:
+               anything on stderr, or naming an exception/fatal/corruption, is an error; lines about a refused,
+               failed, dropped, banned or timed-out connection are warnings; everything else is info. */
+            const LOG_RANK = { err: 0, warn: 1, info: 2 };
+            const LOG_ERR_RE = /exception|\\bfatal\\b|\\bsevere\\b|corrupt|halted|\\berror:|out of memory/i;
+            const LOG_WARN_RE = /\\bwarn|fail|reject|refus|dropp|timed out|timeout|stall|banned|denied|invalid|mismatch|retry|could not|cannot|unable|lost connection|too many/i;
+            function lineLevel(l) {
+                if (l._lv) return l._lv;
+                l._lv = (l.lvl === "err" || LOG_ERR_RE.test(l.m)) ? "err" : (LOG_WARN_RE.test(l.m) ? "warn" : "info");
+                return l._lv;
             }
 
             function fmtLogLine(l) {
@@ -1160,7 +1193,8 @@ public final class WebAdminServerContent {
                         const end = l.m.indexOf("]");
                         if (end > 0 && end < 40) { tag = escapeHtml(l.m.slice(0, end + 1)); m = escapeHtml(l.m.slice(end + 1)); }
                     }
-                    return '<div class="ln' + (l.lvl === "err" ? " err" : "") + '"><time>' + new Date(l.t).toTimeString().slice(0, 8)
+                    const lv = lineLevel(l);
+                    return '<div class="ln' + (lv === "err" ? " err" : lv === "warn" ? " warn" : "") + '"><time>' + new Date(l.t).toTimeString().slice(0, 8)
                         + '</time>' + (tag ? '<span class="tg">' + tag + '</span>' : "") + m + '</div>';
                 }).join("");
                 const prevTop = log.scrollTop;
@@ -1217,6 +1251,7 @@ public final class WebAdminServerContent {
                     const data = await (await fetch("/api/config")).json();
                     form.elements["rpc.host"].value = data["rpc.host"];
                     form.elements["miner.address"].value = data["miner.address"] || "";
+                    form.elements["socket.requireKey"].value = data["socket.public"] === false ? "yes" : "no";
                 } catch (e) {
                     $("config-message").textContent = "Failed to load current configuration.";
                     $("config-message").className = "error";
@@ -1319,7 +1354,8 @@ public final class WebAdminServerContent {
 
                 const payload = {
                     "rpc.host": form.elements["rpc.host"].value,
-                    "miner.address": form.elements["miner.address"].value
+                    "miner.address": form.elements["miner.address"].value,
+                    "socket.public": form.elements["socket.requireKey"].value === "no"
                 };
 
                 try {

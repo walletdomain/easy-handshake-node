@@ -20,7 +20,10 @@ import handshake.node.chain.TxParser;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The real-time event/call server for wallet clients -- a WebSocket
@@ -74,9 +77,12 @@ public class NodeSocketServer {
     }
 
     public void start() throws IOException {
-        wsServer = new WebSocketServer(config.getSocketPort(), this::onConnect);
+        wsServer = new WebSocketServer(config.getSocketPort(), this::onConnect,
+                config.getSocketMaxClients(), config.getSocketMaxPerIp());
         wsServer.start();
-        System.out.println("[NodeSocketServer] Listening on port " + config.getSocketPort());
+        System.out.printf("[NodeSocketServer] Listening on port %d (%s, max %d clients, %d per IP)%n",
+                config.getSocketPort(), config.isSocketPublic() ? "public: no API key" : "API key required if one is set",
+                config.getSocketMaxClients(), config.getSocketMaxPerIp());
     }
 
     public void stop() {
@@ -94,11 +100,28 @@ public class NodeSocketServer {
         boolean watchingMempool = false;
         volatile BloomFilter filter = null;
 
+        /** Outgoing messages. One writer thread drains it, so a client that stops reading can never block the
+         *  thread that announces a new block, and encryption nonces are used in send order. */
+        final ArrayBlockingQueue<String> outQ = new ArrayBlockingQueue<>(512);
+        final AtomicLong queuedBytes = new AtomicLong();
+        // Call rate limit (token bucket).
+        double tokens = RATE_BURST;
+        long lastRefillNs = System.nanoTime();
+
         ClientSession(WebSocketConnection conn, BrontideState brontide) {
             this.conn = conn;
             this.brontide = brontide;
         }
     }
+
+    /** At most this many bytes may sit unsent for one client before it is disconnected. */
+    private static final long MAX_QUEUED_BYTES = 8L * 1024 * 1024;
+    /** Calls per second a client may sustain, and the burst it may spend at once. */
+    private static final double RATE_PER_SEC = 20, RATE_BURST = 100;
+    /** Most heights one "get hashes" call may return. */
+    private static final int MAX_HASHES_PER_CALL = 50_000;
+    /** BIP37 limit on bloom filter size. */
+    private static final int MAX_FILTER_BYTES = 36_000;
 
     private void onConnect(WebSocketConnection conn) {
         new Thread(() -> {
@@ -130,7 +153,11 @@ public class NodeSocketServer {
 
                 conn.setReadTimeout(0);
                 ClientSession session = new ClientSession(conn, brontide);
+                if (config.isSocketPublic()) session.authenticated = true;   // public service: no API key
                 sessions.add(session);
+                Thread writer = new Thread(() -> writerLoop(session), "socket-writer-" + conn.remoteIp);
+                writer.setDaemon(true);
+                writer.start();
                 System.out.println("[NodeSocketServer] Client connected: " + conn.remoteIp);
 
                 messageLoop(session);
@@ -145,8 +172,14 @@ public class NodeSocketServer {
     private void messageLoop(ClientSession session) {
         try {
             while (!session.conn.isClosed()) {
+                // A client that never authenticates may not hold a slot: 30 s to send "auth", then no limit.
+                session.conn.setReadTimeout(session.authenticated ? 0 : 30_000);
                 byte[] encrypted = session.conn.receiveBinary();
                 if (encrypted == null) break;
+                if (!takeToken(session)) {
+                    System.out.println("[NodeSocketServer] Dropping " + session.conn.remoteIp + ": too many calls");
+                    break;
+                }
 
                 byte[] plaintext;
                 try {
@@ -166,13 +199,38 @@ public class NodeSocketServer {
         }
     }
 
+    /** Queues a message for the client's writer thread; never blocks. A client that falls too far behind is dropped. */
     private void sendJson(ClientSession session, String json) {
+        if (session.conn.isClosed()) return;
+        long size = json.length();
+        long queued = session.queuedBytes.addAndGet(size);
+        if ((queued > MAX_QUEUED_BYTES && session.outQ.size() > 0) || !session.outQ.offer(json)) {
+            System.out.println("[NodeSocketServer] Dropping slow client " + session.conn.remoteIp);
+            session.conn.close();
+        }
+    }
+
+    private void writerLoop(ClientSession session) {
         try {
-            byte[] encrypted = session.brontide.encryptMessage(json.getBytes(StandardCharsets.UTF_8));
-            session.conn.sendBinary(encrypted);
+            while (!session.conn.isClosed()) {
+                String json = session.outQ.poll(1, TimeUnit.SECONDS);
+                if (json == null) continue;
+                session.queuedBytes.addAndGet(-json.length());
+                byte[] encrypted = session.brontide.encryptMessage(json.getBytes(StandardCharsets.UTF_8));
+                session.conn.sendBinary(encrypted);
+            }
         } catch (Exception e) {
             session.conn.close();
         }
+    }
+
+    private boolean takeToken(ClientSession s) {
+        long now = System.nanoTime();
+        s.tokens = Math.min(RATE_BURST, s.tokens + (now - s.lastRefillNs) / 1e9 * RATE_PER_SEC);
+        s.lastRefillNs = now;
+        if (s.tokens < 1) return false;
+        s.tokens -= 1;
+        return true;
     }
 
     // ── Call dispatch ────────────────────────────────────────────────────────
@@ -197,7 +255,7 @@ public class NodeSocketServer {
                 case "auth" -> {
                     String key = firstStringParam(params);
                     String expected = config.getApiKey();
-                    boolean ok = expected == null || expected.isBlank() || expected.equals(key);
+                    boolean ok = config.isSocketPublic() || expected == null || expected.isBlank() || expected.equals(key);
                     if (!ok) {
                         sendResponse(session, id, null, "Invalid API key");
                         return;
@@ -252,6 +310,8 @@ public class NodeSocketServer {
                     List<String> args = parseArrayOfInts(params);
                     int start = args.size() > 0 ? Integer.parseInt(args.get(0)) : 0;
                     int end = args.size() > 1 ? Integer.parseInt(args.get(1)) : db.getHeaderTip();
+                    if (start < 0) start = 0;
+                    if ((long) end - start >= MAX_HASHES_PER_CALL) end = start + MAX_HASHES_PER_CALL - 1;
                     sendResponse(session, id, hashesJson(start, end), null);
                 }
                 case "estimate fee" -> {
@@ -285,24 +345,47 @@ public class NodeSocketServer {
 
     private void onNewBlock(int height, byte[] hash, byte[] rawBlock) {
         List<TxParser.ParsedTx> txs = null;
+        List<byte[]> leaves = null;
+        List<String> txids = null;
         for (ClientSession s : sessions) {
-            if (!s.authenticated || !s.watchingChain) continue;
-            if (s.filter == null) {
-                sendJson(s, "{\"event\":\"chain connect\",\"data\":" + chainEntryJson(height, null) + "}");
-                continue;
+            try {
+                if (!s.authenticated || !s.watchingChain) continue;
+                BloomFilter f = s.filter;
+                if (f == null) {
+                    sendJson(s, "{\"event\":\"chain connect\",\"data\":" + chainEntryJson(height, null) + "}");
+                    continue;
+                }
+                if (txs == null) {
+                    txs = BlockProcessor.parseBlockTxs(rawBlock);
+                    // Hashed once per block, not once per connected client.
+                    txids = new ArrayList<>(txs.size());
+                    leaves = new ArrayList<>(txs.size());
+                    for (TxParser.ParsedTx tx : txs) {
+                        String id = TxParser.computeTxid(tx.raw);
+                        txids.add(id);
+                        leaves.add(hexToBytes(id));
+                    }
+                }
+                sendJson(s, "{\"event\":\"chain connect\",\"data\":" + chainEntryJson(height, matchFilterInBlock(f, txs, txids, leaves)) + "}");
+            } catch (RuntimeException e) {
+                // One client's problem must never stop the others from hearing about the block.
+                System.out.println("[NodeSocketServer] Event for " + s.conn.remoteIp + " failed: " + e);
             }
-            if (txs == null) txs = BlockProcessor.parseBlockTxs(rawBlock);
-            sendJson(s, "{\"event\":\"chain connect\",\"data\":" + chainEntryJson(height, matchFilterInBlock(s.filter, txs)) + "}");
         }
     }
 
     private void onNewMempoolTx(Mempool.MempoolEntry entry) {
         for (ClientSession s : sessions) {
-            if (!s.authenticated || !s.watchingMempool) continue;
-            if (s.filter != null && !matches(s.filter, entry)) continue;
-            String event = "{\"event\":\"tx\",\"data\":{\"hash\":\"" + entry.txid + "\",\"size\":"
-                    + entry.size + ",\"fee\":" + entry.fee + "}}";
-            sendJson(s, event);
+            try {
+                if (!s.authenticated || !s.watchingMempool) continue;
+                BloomFilter f = s.filter;
+                if (f != null && !matches(f, entry)) continue;
+                String event = "{\"event\":\"tx\",\"data\":{\"hash\":\"" + entry.txid + "\",\"size\":"
+                        + entry.size + ",\"fee\":" + entry.fee + "}}";
+                sendJson(s, event);
+            } catch (RuntimeException e) {
+                System.out.println("[NodeSocketServer] Mempool event for " + s.conn.remoteIp + " failed: " + e);
+            }
         }
     }
 
@@ -329,15 +412,14 @@ public class NodeSocketServer {
         MerkleProof.BuiltProof proof;
     }
 
-    private FilterMatch matchFilterInBlock(BloomFilter filter, List<TxParser.ParsedTx> txs) {
+    private FilterMatch matchFilterInBlock(BloomFilter filter, List<TxParser.ParsedTx> txs,
+                                           List<String> txids, List<byte[]> leaves) {
         FilterMatch result = new FilterMatch();
-        List<byte[]> leaves = new ArrayList<>();
         boolean[] matchFlags = new boolean[txs.size()];
 
         for (int i = 0; i < txs.size(); i++) {
             TxParser.ParsedTx tx = txs.get(i);
-            String txid = TxParser.computeTxid(tx.raw);
-            leaves.add(hexToBytes(txid));
+            String txid = txids.get(i);
             if (matchesParsedTx(filter, tx, txid)) {
                 matchFlags[i] = true;
                 result.matchedTxs.add(tx);
@@ -510,6 +592,7 @@ public class NodeSocketServer {
             throw new IllegalArgumentException("set filter requires {data, hashFuncs, tweak}");
         }
         byte[] data = hexToBytes(dataM.group(1));
+        if (data.length > MAX_FILTER_BYTES) throw new IllegalArgumentException("filter too large (max " + MAX_FILTER_BYTES + " bytes)");
         int hashFuncs = Integer.parseInt(hashFuncsM.group(1));
         int tweak = (int) Long.parseLong(tweakM.group(1));
         return new BloomFilter(data, hashFuncs, tweak);

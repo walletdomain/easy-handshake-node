@@ -135,6 +135,8 @@ public class NodeConfig {
      *  us, which proves our port is reachable -- so a home node behind a router never advertises a dead address;
      *  "true" always announces (a server with open ports); "false" never does. */
     public String  getAnnounceSelfMode() { return get("p2p.announce.self", "auto"); }
+    /** Minutes between repeated self-announcements to all connected peers (0 = only announce on connect). */
+    public int     getAnnounceSelfIntervalMin() { return Math.max(0, getInt("p2p.announce.self.interval.min", 45)); }
     /** Ping/pong logging: "all" prints every PING and PONG in both directions (for diagnosing connections), "slow"
      *  prints only problems (starved or backlogged connections, slow or missing replies), "off" prints nothing. */
     public String  getPingLogMode() { return get("p2p.log.ping", "all"); }
@@ -144,6 +146,15 @@ public class NodeConfig {
      *  server has no clean way to intercept a raw socket for a
      *  protocol-upgrade path alongside its own normal request handling. */
     public int     getSocketPort()  { return getInt("socket.port", DEFAULT_SOCKET_PORT); }
+    /** Public wallet service: when true, wallets connect to the socket port without an API key (the Brontide
+     *  channel is still encrypted and the node still authenticates itself to them). The RPC key is then never
+     *  needed by, or shared with, wallets. When false, the socket requires rpc.api.key (if one is set).
+     *  Default true; the web admin shows it inverted, as "Require API key for wallets to connect?" (No = true). */
+    public boolean isSocketPublic() { return getBool("socket.public", true); }
+    /** Most simultaneous wallet connections (handshaking plus established). */
+    public int     getSocketMaxClients() { return Math.max(1, getInt("socket.max.clients", 200)); }
+    /** Most simultaneous wallet connections from a single IP address. */
+    public int     getSocketMaxPerIp() { return Math.max(1, getInt("socket.max.per.ip", 8)); }
     /** Always bound to the loopback interface only, regardless of this
      *  port's value -- there's no legitimate case for this admin
      *  interface to be reachable remotely, so making the bind address

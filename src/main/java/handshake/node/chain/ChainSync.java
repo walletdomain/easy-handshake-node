@@ -548,6 +548,16 @@ public class ChainSync {
      *  caller, recordSelfIpObservation(), for why this is needed in
      *  addition to (not instead of) sendSelfAnnounce() on each new
      *  connection. */
+    private void periodicSelfAnnounce() {
+        try {
+            if (confirmedSelfIp == null || !selfAnnounceAllowed()) return;
+            System.out.printf("[ChainSync] Periodic self-announce to %d connected peers%n", connectedPeers.size());
+            broadcastSelfAnnounceToAll();
+        } catch (Throwable t) {
+            System.out.println("[ChainSync] Periodic self-announce failed: " + t);
+        }
+    }
+
     private void broadcastSelfAnnounceToAll() {
         for (PeerInfo p : connectedPeers) {
             sendSelfAnnounce(p.conn());
@@ -779,6 +789,12 @@ public class ChainSync {
         // most of the time.
         poolScheduler.scheduleWithFixedDelay(
                 () -> PeerTable.get().applyDecay(), 5, 5, TimeUnit.MINUTES);
+        // Re-announce our own address periodically: hsd relays an ADDR once, to two random peers, and only if it is
+        // fresh, so a single announcement is easily lost. Re-sending refreshes the time hsd stores for us as well.
+        int reannounceMin = config.getAnnounceSelfIntervalMin();
+        if (reannounceMin > 0) {
+            poolScheduler.scheduleWithFixedDelay(this::periodicSelfAnnounce, reannounceMin, reannounceMin, TimeUnit.MINUTES);
+        }
         // Answers pings (and reads announcements) on pooled connections the sync loop is not using right now.
         keepAliveScheduler.scheduleWithFixedDelay(
                 this::servicePoolKeepAlive, KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS);
