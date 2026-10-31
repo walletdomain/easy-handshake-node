@@ -871,9 +871,22 @@ public class WebAdminServer {
     private boolean originMatchesSelf(HttpExchange ex) {
         String origin = ex.getRequestHeaders().getFirst("Origin");
         if (origin == null) return true;
-        String expected = "http://127.0.0.1:" + config.getWebAdminPort();
-        String expectedAlt = "http://localhost:" + config.getWebAdminPort();
-        return origin.equals(expected) || origin.equals(expectedAlt);
+        // Reached through an SSH tunnel the browser's port is often not the node's own (for example
+        // http://localhost:8080 forwarded to 12080), so the port may not be compared with our own. A page is
+        // same-origin when its Origin names a loopback host and is exactly the Host the request was sent to;
+        // a page on another site can never satisfy both.
+        try {
+            java.net.URI u = java.net.URI.create(origin);
+            String scheme = u.getScheme(), host = u.getHost();
+            if (!"http".equals(scheme) || host == null) return false;
+            boolean loopback = host.equals("localhost") || host.equals("127.0.0.1") || host.equals("[::1]");
+            if (!loopback) return false;
+            String reqHost = ex.getRequestHeaders().getFirst("Host");
+            String originAuthority = u.getPort() >= 0 ? host + ":" + u.getPort() : host;
+            return reqHost != null && reqHost.equalsIgnoreCase(originAuthority);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
     }
 
     private String readBody(HttpExchange ex) throws IOException {
