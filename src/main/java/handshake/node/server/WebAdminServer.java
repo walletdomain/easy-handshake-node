@@ -815,7 +815,8 @@ public class WebAdminServer {
                         respondJson(ex, 400, "{\"error\":\"" + jsonEscape(validationError) + "\"}");
                         return;
                     }
-                    if (REQUIRES_RESTART.contains(key)) restartRequired = true;
+                    // The form always sends every field, so only a value that actually differs needs a restart.
+                    if (REQUIRES_RESTART.contains(key) && !value.equals(config.getRpcHost())) restartRequired = true;
                 }
 
                 // Only write once every field has validated successfully
