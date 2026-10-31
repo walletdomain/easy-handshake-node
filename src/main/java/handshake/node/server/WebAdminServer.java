@@ -86,7 +86,7 @@ public class WebAdminServer {
      *  occasionally useful setting, e.g. binding somewhere other than
      *  loopback for a deliberate remote-RPC setup). */
     private static final Set<String> EDITABLE_KEYS = Set.of(
-            "rpc.host", "miner.address", "socket.public"
+            "rpc.host", "miner.address", "socket.public", "p2p.log.pings"
     );
 
     private static final Set<String> REQUIRES_RESTART = Set.of(
@@ -788,6 +788,7 @@ public class WebAdminServer {
                 sb.append("\"rpc.host\":\"").append(jsonEscape(config.getRpcHost())).append("\"");
                 sb.append(",\"miner.address\":\"").append(jsonEscape(config.getMinerAddress())).append("\"");
                 sb.append(",\"socket.public\":").append(config.isSocketPublic());
+                sb.append(",\"p2p.log.pings\":\"").append(config.getPingLogMode()).append("\"");
                 sb.append("}");
                 respondJson(ex, 200, sb.toString());
                 return;
@@ -850,6 +851,7 @@ public class WebAdminServer {
         // Removed as part of the project's dead-code cleanup pass.
         return switch (key) {
             case "rpc.host" -> value.isBlank() ? "Host cannot be empty" : null;
+            case "p2p.log.pings" -> (value.equals("slow") || value.equals("all") || value.equals("off")) ? null : "Ping logging must be slow, all or off";
             case "socket.public" -> (value.equals("true") || value.equals("false")) ? null : "socket.public must be true or false";
             case "miner.address" -> {
                 String v = value.trim();

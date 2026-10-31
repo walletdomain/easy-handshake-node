@@ -139,7 +139,12 @@ public class NodeConfig {
     public int     getAnnounceSelfIntervalMin() { return Math.max(0, getInt("p2p.announce.self.interval.min", 45)); }
     /** Ping/pong logging: "all" prints every PING and PONG in both directions (for diagnosing connections), "slow"
      *  prints only problems (starved or backlogged connections, slow or missing replies), "off" prints nothing. */
-    public String  getPingLogMode() { return get("p2p.log.ping", "all"); }
+    /** "slow" (default): only slow, missing or out-of-order ping/pong traffic is logged. "all": every ping and pong.
+     *  "off": none. New key name on purpose: the old "p2p.log.ping" was saved as "all" on existing nodes. */
+    public String  getPingLogMode() {
+        String m = get("p2p.log.pings", "slow");
+        return ("all".equalsIgnoreCase(m) || "off".equalsIgnoreCase(m)) ? m.toLowerCase() : "slow";
+    }
     public int     getRpcPort()     { return getInt("rpc.port",    DEFAULT_RPC_PORT); }
     /** Dedicated port for the Brontide-encrypted WebSocket event/call
      *  server -- separate from RPC's port since Java's built-in HTTP

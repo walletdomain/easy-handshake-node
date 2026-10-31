@@ -148,6 +148,13 @@ public final class WebAdminServerContent {
                                         <option value="yes">Yes</option>
                                     </select></label>
                                 <p class="hint">No: any wallet can connect to this node's wallet port (12040) without a key. Yes: wallets must send this node's API key (shown under Access). Applies to new wallet connections right away; wallets already connected stay connected.</p>
+                                <label>Ping and pong logging
+                                    <select name="p2p.log.pings">
+                                        <option value="slow">Problems only</option>
+                                        <option value="all">Every ping and pong</option>
+                                        <option value="off">Nothing</option>
+                                    </select></label>
+                                <p class="hint">Pings keep connections alive and happen every 30 seconds per peer. "Problems only" logs only slow, missing or out-of-order replies. Applies immediately.</p>
                                 <p class="hint">Changing the RPC host needs a restart. Miners that connect (getwork) are paid to the reward address; that applies immediately.</p>
                                 <button type="submit">Save changes</button>
                             </form>
@@ -1252,6 +1259,7 @@ public final class WebAdminServerContent {
                     form.elements["rpc.host"].value = data["rpc.host"];
                     form.elements["miner.address"].value = data["miner.address"] || "";
                     form.elements["socket.requireKey"].value = data["socket.public"] === false ? "yes" : "no";
+                    form.elements["p2p.log.pings"].value = data["p2p.log.pings"] || "slow";
                 } catch (e) {
                     $("config-message").textContent = "Failed to load current configuration.";
                     $("config-message").className = "error";
@@ -1355,7 +1363,8 @@ public final class WebAdminServerContent {
                 const payload = {
                     "rpc.host": form.elements["rpc.host"].value,
                     "miner.address": form.elements["miner.address"].value,
-                    "socket.public": form.elements["socket.requireKey"].value === "no"
+                    "socket.public": form.elements["socket.requireKey"].value === "no",
+                    "p2p.log.pings": form.elements["p2p.log.pings"].value
                 };
 
                 try {
